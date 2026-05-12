@@ -1,0 +1,25 @@
+# compiled files
+/target/
+**/*.rs.bk
+.env
+# cargo stuff
+/Cargo.lock
+
+# build artifacts
+**/*.rlib
+**/*.dSYM/
+**/*.so
+**/*.dll
+**/*.exe
+**/*.out
+**/*.app
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db

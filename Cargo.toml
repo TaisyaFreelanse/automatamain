@@ -1,0 +1,35 @@
+[workspace]
+members = [".", "dashboard", "sips"]
+resolver = "2"
+
+[package]
+name = "loggaper"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = { version = "0.8.8", features = ["ws"] }
+futures = "0.3.32"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+solana-rpc-client-types = "3.1.9"
+thiserror = "2.0.18"
+tokio = { version = "1.50.0", features = ["full"] }
+rustls = { version = "0.23", features = ["ring"] }
+borsh = { version = "1.6.0", features = ["derive"] }
+base64 = "0.22.1"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.22"
+solana-address = { version = "2.3.0", features = ["borsh", "curve25519"] }
+bs58 = "0.5.1"
+solana-pubsub-client = "3.1.10"
+sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio-rustls"] }
+solana-instruction = "3.3.0"
+async-trait = "0.1.89"
+dotenvy = "0.15"
+serde_yaml = "0.9.34"
+tokio-tungstenite = "0.29.0"
+solana-client = "3.1.14"
+solana-keypair = "3.1.2"
+solana-transaction = "4.1.1"
+sips = { path = "./sips", features = ["solana_sdk", "pump"]}
