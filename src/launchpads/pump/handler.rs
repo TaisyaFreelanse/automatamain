@@ -22,12 +22,13 @@ impl PumpLaunchpadSenderExt for tokio::sync::mpsc::Sender<PumpLaunchpadCommand> 
     async fn get_mint(&self, amm_pool: AmmPoolAddress) -> Option<Address> {
         let (tx, rx) = oneshot::channel();
 
-        if let Err(_) = self
+        if self
             .send(PumpLaunchpadCommand::GetMint {
                 amm_pool,
                 respond_to: tx,
             })
             .await
+            .is_err()
         {
             return None;
         }

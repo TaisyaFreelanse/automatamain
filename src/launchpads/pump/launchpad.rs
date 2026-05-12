@@ -1,31 +1,28 @@
 use crate::{
-    feed::logs::pump::{PumpEvent, TradeEvent},
+    feed::logs::pump::PumpEvent,
     general::Slot,
-    generalize::general_commands::{Action, TradeAction},
+    generalize::general_commands::TradeAction,
     helper::Amount,
     launchpads::{
         pump::{
             general::{PRECISION, pool_pda},
-            pool::{Bonding, Migrated, PumpPool},
+            pool::{Bonding, PumpPool},
         },
         token_bucket::TokenBucket,
     },
-    trading::{
-        offer::Offer,
-        swarm::{Swarm, SwarmActor, SwarmHandler},
-        trader::TraderType,
-    },
+    trading::trader::TraderType,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use solana_address::Address;
-use tokio::sync::{RwLock, oneshot};
+use tokio::sync::oneshot;
 
 use tokio::sync::mpsc;
 
 //trying not to fuck up everything
 pub type AmmPoolAddress = solana_address::Address;
 
+#[allow(clippy::large_enum_variant)]
 pub enum PumpLaunchpadCommand {
     GetMint {
         // ^ weird right? why would we...
@@ -103,7 +100,7 @@ impl PumpLaunchpadStorage {
                 // println!("------------------------------------")
             }
         }
-        finish.send(());
+        let _ = finish.send(());
     }
 }
 

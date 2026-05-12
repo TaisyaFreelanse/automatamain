@@ -1,31 +1,10 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::Arc,
-    thread::sleep,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
+use std::collections::HashMap;
 
 use crate::{
-    autobuy::manager::{PositionManagerActor, PositionMessage},
-    feed::{feed::Feed, logs::pump::PumpEvent},
-    generalize::{
-        general_commands::{Action, Currency, GeneralBuy, GeneralSell},
-        generalizer::generalize,
-    },
+    generalize::general_commands::Currency,
     helper::Amount,
-    persistence::{
-        creators::{CreatorRepository, CreatorStatistics},
-        postgres::tokens::TokenRepositoryPostgres,
-        tokens::TokenRepository,
-        traders::{TraderEntry, TraderRepository},
-    },
-    pipelines::pump::PumpPipeline,
-    setup::{
-        load_config, setup_crypto, setup_logging, setup_postgres_pool, setup_repositories,
-        setup_solana_rpc, waiter::DatabaseCreateWaiter,
-    },
+    persistence::creators::CreatorStatistics,
 };
-use dotenvy::dotenv;
 use tokio::sync::{mpsc, oneshot};
 
 type Address = solana_address::Address;
@@ -296,6 +275,12 @@ pub enum RegistryMessage {
 #[derive(Clone)]
 pub struct CreatorRegistryHandle {
     sender: mpsc::Sender<RegistryMessage>,
+}
+
+impl Default for CreatorRegistryHandle {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CreatorRegistryHandle {

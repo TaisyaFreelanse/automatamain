@@ -1,5 +1,4 @@
 use crate::address::Address;
-use crate::helper::ata;
 use crate::instructions::account::{AccountMeta, IntoAccountMetaArray};
 use crate::instructions::raw_instruction::{
     Instruction, InstructionArgs, ProgramAddress, RawInstruction,

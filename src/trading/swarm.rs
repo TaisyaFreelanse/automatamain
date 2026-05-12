@@ -17,6 +17,7 @@ pub type TraderAddress = Address;
 #[derive(Clone)]
 pub struct Swarm {
     traders: Vec<(TraderAddress, Trader)>,
+    #[allow(dead_code)]
     max_token_supply: Amount,
     decimals: u8,
     decimals_quote: u8,

@@ -1,5 +1,5 @@
 use proc_macro::TokenStream;
-use quote::{format_ident, quote};
+use quote::quote;
 use syn::{Data, DeriveInput, Fields, parse_macro_input};
 
 #[derive(deluxe::ExtractAttributes)]
@@ -16,7 +16,7 @@ fn derive_instruction2(
 
     let ix_data: InstructionData = deluxe::extract_attributes(&mut ast)?;
 
-    let accounts = ix_data.accounts;
+    let _accounts = ix_data.accounts;
     let discriminator = ix_data.discriminator;
 
     let name = ast.ident;

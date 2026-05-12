@@ -2,10 +2,7 @@ use crate::instructions::raw_instruction::RawInstruction;
 use crate::{
     address::Address,
     helper::{Amount, NATIVE_SOL_PRECISION},
-    instructions::{
-        error::Error,
-        raw_instruction::{Instruction, InstructionArgs, ProgramAddress},
-    },
+    instructions::raw_instruction::{Instruction, InstructionArgs, ProgramAddress},
 };
 use borsh::{BorshDeserialize, BorshSerialize};
 use ix_macros::{Instruction, Instructions};

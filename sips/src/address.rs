@@ -1,10 +1,5 @@
-use core::u8;
-
 use borsh::{BorshDeserialize, BorshSerialize};
-use sha2::{
-    Digest, Sha256,
-    digest::{DynDigest as _, Update},
-};
+use sha2::{Digest, Sha256};
 
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct Address(pub [u8; 32]);
@@ -17,6 +12,7 @@ impl Address {
         self.0
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn as_ref(&self) -> &[u8; 32] {
         &self.0
     }
@@ -75,7 +71,7 @@ pub fn create_program_address(
         return Err(AddressError::InvalidSeeds);
     }
 
-    Ok(Address::from(Address(hash.into())))
+    Ok(Address(hash))
 }
 
 pub enum AddressError {

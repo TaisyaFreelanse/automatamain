@@ -7,9 +7,9 @@ use crate::{
     launchpads::pump::general::PRECISION,
 };
 
-impl Into<Action> for PumpEvent {
-    fn into(self) -> Action {
-        match self {
+impl From<PumpEvent> for Action {
+    fn from(val: PumpEvent) -> Self {
+        match val {
             PumpEvent::Create(create_event) => Action::Create(GeneralCreate {
                 mint: create_event.mint,
                 user: create_event.user,
@@ -24,20 +24,20 @@ impl Into<Action> for PumpEvent {
     }
 }
 
-impl Into<TradeAction> for TradeEvent {
-    fn into(self) -> TradeAction {
-        match self.is_buy {
+impl From<TradeEvent> for TradeAction {
+    fn from(val: TradeEvent) -> Self {
+        match val.is_buy {
             true => TradeAction::Buy(GeneralBuy {
-                mint: self.mint,
-                user: self.user,
-                bought: Amount::from_raw(self.token_amount, PRECISION),
-                spent: Currency::Native(Amount::from_raw_native(self.sol_amount)),
+                mint: val.mint,
+                user: val.user,
+                bought: Amount::from_raw(val.token_amount, PRECISION),
+                spent: Currency::Native(Amount::from_raw_native(val.sol_amount)),
             }),
             false => TradeAction::Sell(GeneralSell {
-                mint: self.mint,
-                user: self.user,
-                sold: Amount::from_raw(self.token_amount, PRECISION),
-                received: Currency::Native(Amount::from_raw_native(self.sol_amount)),
+                mint: val.mint,
+                user: val.user,
+                sold: Amount::from_raw(val.token_amount, PRECISION),
+                received: Currency::Native(Amount::from_raw_native(val.sol_amount)),
             }),
         }
     }

@@ -2,7 +2,7 @@ use crate::{
     address::Address,
     instructions::{
         account::{AccountMeta, IntoAccountMetaArray},
-        raw_instruction::{Instruction, InstructionArgs, ProgramAddress, RawInstruction},
+        raw_instruction::{Instruction, InstructionArgs, ProgramAddress},
     },
 };
 

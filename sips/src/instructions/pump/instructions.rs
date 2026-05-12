@@ -5,7 +5,6 @@ use crate::{
     address::Address,
     helper::{Amount, Link, NATIVE_SOL_PRECISION},
     instructions::{
-        error::Error,
         pump::accounts::{
             BuyAccounts, CloseUserVolumeAccumulatorAccounts, CreateAccounts, CreateV2Accounts,
             SellAccounts,
@@ -92,7 +91,7 @@ impl PumpInstruction {
         Instruction {
             data: PumpBuyExactSolInInstruction {
                 sol_amount: sol,
-                minimum_token_output: minimum_token_output,
+                minimum_token_output,
                 track_volume: OptionBool(false),
             },
             accounts: BuyAccounts::new(mint, user, creator, token_program),

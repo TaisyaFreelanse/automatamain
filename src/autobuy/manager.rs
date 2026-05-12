@@ -470,11 +470,10 @@ impl PositionManagerActor {
                     // convention used in the stop-loss check above.
                     pos.exit_profit_floor = 35.0;
                 }
-            } else if profit >= 50.0 {
-                if pos.exit_profit_floor < 5.0 {
+            } else if profit >= 50.0
+                && pos.exit_profit_floor < 5.0 {
                     pos.exit_profit_floor = 5.0; // Smart Stop: lock in at least +5%
                 }
-            }
 
             // FIX Bug 5: only queue one partial sell at a time.
             // If a partial sell is already in-flight, skip TP checks this tick.
@@ -524,6 +523,7 @@ impl PositionManagerActor {
         });
     }
 
+    #[allow(dead_code)]
     fn print_dashboard(&self, current_time: u64) {
         print!("{}[2J{}[1;1H", 27 as char, 27 as char);
 

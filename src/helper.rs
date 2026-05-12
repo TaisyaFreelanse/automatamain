@@ -219,7 +219,7 @@ impl Div for SignedAmount {
 impl core::fmt::Display for SignedAmount {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let scale = 10u64.pow(self.decimals as u32);
-        let abs_value = self.value.abs() as u64;
+        let abs_value = self.value.unsigned_abs();
         let int_part = abs_value / scale;
         let frac_part = abs_value % scale;
 
@@ -235,18 +235,16 @@ impl core::fmt::Display for SignedAmount {
                     width = self.decimals as usize
                 )
             }
+        } else if self.decimals == 0 {
+            write!(f, "{}", int_part)
         } else {
-            if self.decimals == 0 {
-                write!(f, "{}", int_part)
-            } else {
-                write!(
-                    f,
-                    "{}.{:0width$}",
-                    int_part,
-                    frac_part,
-                    width = self.decimals as usize
-                )
-            }
+            write!(
+                f,
+                "{}.{:0width$}",
+                int_part,
+                frac_part,
+                width = self.decimals as usize
+            )
         }
     }
 }

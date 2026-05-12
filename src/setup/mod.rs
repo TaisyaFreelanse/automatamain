@@ -1,7 +1,7 @@
 pub mod waiter;
 
 use solana_rpc_client_types::config::RpcTransactionLogsConfig;
-use sqlx::{PgPool, Pool, Postgres};
+use sqlx::{Pool, Postgres};
 
 use crate::{
     autobuy::filters::config::Config,
@@ -29,9 +29,12 @@ pub fn setup_logging() {
 pub fn setup_solana_rpc() -> (String, RpcTransactionLogsConfig) {
     let ws_url = std::env::var("SOLANA_WEBSOCKET").expect("SOLANA_WEBSOCKET must be set");
 
+    // `confirmed` drops forked blocks and is the recommended level for
+    // Helius logsSubscribe billing efficiency: ~25-40% fewer messages
+    // compared to `processed` without losing any genuinely landed tx.
     let commitment_config = solana_rpc_client_types::config::RpcTransactionLogsConfig {
         commitment: Some(solana_rpc_client_types::config::CommitmentConfig {
-            commitment: solana_rpc_client_types::config::CommitmentLevel::Processed,
+            commitment: solana_rpc_client_types::config::CommitmentLevel::Confirmed,
         }),
     };
 
@@ -39,13 +42,13 @@ pub fn setup_solana_rpc() -> (String, RpcTransactionLogsConfig) {
 }
 
 pub async fn setup_postgres_pool(max_connections: u32) -> Pool<Postgres> {
-    let pool = sqlx::postgres::PgPoolOptions::new()
+    
+
+    sqlx::postgres::PgPoolOptions::new()
         .max_connections(max_connections)
         .connect(&std::env::var("DATABASE_URL").expect("DATABASE_URL must be set"))
         .await
-        .unwrap();
-
-    pool
+        .unwrap()
 }
 
 pub async fn setup_repositories(

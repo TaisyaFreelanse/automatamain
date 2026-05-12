@@ -64,7 +64,7 @@ pub trait InstructionArgs: Sized + BorshSerialize + BorshDeserialize {
             .get(discriminator_size..)
             .ok_or(Error::InvalidInstructionSize)?;
 
-        let instruction = from_slice::<Self>(&data).map_err(|_| Error::InvalidInstructionData)?;
+        let instruction = from_slice::<Self>(data).map_err(|_| Error::InvalidInstructionData)?;
 
         Ok(instruction)
     }

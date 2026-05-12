@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use solana_rpc_client_types::config::RpcTransactionLogsConfig;
 use tokio::sync::{mpsc::Sender, oneshot};
 
@@ -5,21 +7,17 @@ use crate::{
     feed::{
         feed::Feed,
         logs::{
-            pump::{CreateEvent, PumpEvent},
+            pump::PumpEvent,
             pump_amm::PumpAmmEvent,
         },
+        metrics::{FeedMetrics, SharedDedup},
     },
     general::Slot,
     generalize::general_commands::Action,
     launchpads::{
-        pump::{
-            handler::PumpLaunchpadSenderExt,
-            launchpad::{PumpLaunchpadCommand, PumpLaunchpadStorageActor},
-            pool::{Bonding, PumpPool},
-        },
+        pump::launchpad::{PumpLaunchpadCommand, PumpLaunchpadStorageActor},
         token_bucket::TokenBucket,
     },
-    trading::swarm::SwarmHandler,
 };
 
 pub struct PumpPipeline {
@@ -29,15 +27,25 @@ pub struct PumpPipeline {
 
     sniper_threshold: u64,
     mayhem: bool,
+
+    pump_metrics: Arc<FeedMetrics>,
+    pumpswap_metrics: Arc<FeedMetrics>,
+    dedup: SharedDedup,
+    enable_pumpswap: bool,
 }
 
 impl PumpPipeline {
+    #[allow(clippy::too_many_arguments)]
     pub fn init(
         ws_url: String,
         config: RpcTransactionLogsConfig,
         general_tx: Sender<(Slot, Action, TokenBucket)>,
         sniper_threshold: u64,
         mayhem: bool,
+        pump_metrics: Arc<FeedMetrics>,
+        pumpswap_metrics: Arc<FeedMetrics>,
+        dedup: SharedDedup,
+        enable_pumpswap: bool,
     ) -> Self {
         Self {
             ws_url,
@@ -45,21 +53,43 @@ impl PumpPipeline {
             general_tx,
             sniper_threshold,
             mayhem,
+            pump_metrics,
+            pumpswap_metrics,
+            dedup,
+            enable_pumpswap,
         }
     }
 
     pub fn run(&mut self) {
         let (mut actor, handler) = PumpLaunchpadStorageActor::new(self.sniper_threshold);
 
-        let (pump_feed, mut pump_rx) = Feed::<PumpEvent>::new();
-        let (pumpswap_feed, mut pumpswap_rx) = Feed::<PumpAmmEvent>::new();
+        let (pump_feed, mut pump_rx) = Feed::<PumpEvent>::with_metrics(self.pump_metrics.clone());
+        let (pumpswap_feed, _pumpswap_rx) =
+            Feed::<PumpAmmEvent>::with_metrics(self.pumpswap_metrics.clone());
 
         tokio::spawn(async move {
             actor.listen().await;
         });
 
-        tokio::spawn(pump_feed.subscribe(self.ws_url.clone(), self.config.clone()));
-        tokio::spawn(pumpswap_feed.subscribe(self.ws_url.clone(), self.config.clone()));
+        tokio::spawn(pump_feed.subscribe(
+            self.ws_url.clone(),
+            self.config.clone(),
+            self.dedup.clone(),
+        ));
+
+        // The PumpSwap consumer below is intentionally disabled (commented
+        // out). Subscribing to PumpSwap logs while nothing reads them just
+        // burns Helius credits, so we gate the subscription behind a flag.
+        if self.enable_pumpswap {
+            tokio::spawn(pumpswap_feed.subscribe(
+                self.ws_url.clone(),
+                self.config.clone(),
+                self.dedup.clone(),
+            ));
+        } else {
+            drop(pumpswap_feed);
+            println!("[pipeline] pumpswap feed disabled (no consumer)");
+        }
 
         tokio::spawn({
             let handler = handler.clone();
@@ -70,11 +100,10 @@ impl PumpPipeline {
                 while let Some((slot, event)) = pump_rx.recv().await {
                     let mint = event.mint();
 
-                    if let PumpEvent::Create(ref create) = event {
-                        if create.is_mayhem_mode != mayhem {
+                    if let PumpEvent::Create(ref create) = event
+                        && create.is_mayhem_mode != mayhem {
                             continue;
                         }
-                    }
 
                     let (waittx, waitrx) = oneshot::channel();
                     if handler
@@ -90,18 +119,15 @@ impl PumpPipeline {
                     }
 
                     let (etx, exists) = oneshot::channel();
-                    let _ = handler
+                    handler
                         .send(PumpLaunchpadCommand::TokenExists {
-                            mint: mint,
+                            mint,
                             respond_to: etx,
                         })
                         .await
                         .unwrap();
 
-                    let token_exists = match exists.await {
-                        Ok(exists) => exists,
-                        Err(_) => false,
-                    };
+                    let token_exists: bool = exists.await.unwrap_or_default();
 
                     if !token_exists {
                         println!("token wasnt found");

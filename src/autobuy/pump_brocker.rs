@@ -11,12 +11,8 @@ use solana_address::Address as SolAddress;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_keypair::Keypair;
 // Use the modular solana crate instead of the monolithic solana_sdk
-use solana_transaction::Transaction;
 
-use crate::{
-    generalize::{general_commands::TradeAction, general_pool::Pool},
-    helper::Amount,
-};
+use crate::generalize::{general_commands::TradeAction, general_pool::Pool};
 
 use super::broker::{Broker, BrokerError, BuyReceipt, SellReceipt};
 
@@ -100,7 +96,7 @@ impl SolanaBroker {
                 let tokens_received = buy.bought.to_float();
 
                 // Insert or add to existing position
-                let pos = positions.entry(mint.clone()).or_insert(Position {
+                let pos = positions.entry(mint).or_insert(Position {
                     tokens: 0.0,
                     entry_mcap,
                 });
@@ -160,9 +156,9 @@ impl Broker for SolanaBroker {
 
         // 2. Build the exact instruction using the provided PumpFun SDK
         let ix = PumpInstruction::buy_exact_in(
-            mint.clone().into(),
-            self.wallet_address.clone().into(),
-            pool.creators()[0].clone().into(), // pool.creator_address(),
+            mint.into(),
+            self.wallet_address.into(),
+            pool.creators()[0].into(), // pool.creator_address(),
             TokenProgram2022::PROGRAM,         // spl_token::id() mapped to your Address type
             sol_amount_in,
             min_token_out,
@@ -213,7 +209,7 @@ impl Broker for SolanaBroker {
             let positions = self.positions.lock().unwrap();
             let pos = positions
                 .get(&mint)
-                .ok_or(BrokerError::PositionNotFound(mint.clone()))?;
+                .ok_or(BrokerError::PositionNotFound(mint))?;
 
             // If the manager passed 0.0 (because of our optimistic BuyReceipt),
             // use the actual balance we observed from the websocket stream!
@@ -250,9 +246,9 @@ impl Broker for SolanaBroker {
 
         // 3. Build Instruction
         let ix = PumpInstruction::sell(
-            mint.clone().into(),
-            self.wallet_address.clone().into(),
-            pool.creators()[0].clone().into(), // pool.creator_address(),
+            mint.into(),
+            self.wallet_address.into(),
+            pool.creators()[0].into(), // pool.creator_address(),
             TokenProgram2022::PROGRAM,         // spl_token::id(),
             token_amount_in,
             min_sol_out,

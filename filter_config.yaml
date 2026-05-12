@@ -2,18 +2,18 @@ creator_config:
   min_total_coins: 0
   max_total_coins: 1000
 
-  min_median_market_cap: 0
-  min_trader_pnl_average: 10
-  min_total_holders_average: 0
-  min_average_volume: 0
-  min_median_total_trades: 0
+  min_median_market_cap: 90.0
+  min_trader_pnl_average: 10.0
+  min_total_holders_average: 50.0
+  min_average_volume: 90.0
+  min_median_total_trades: 50.0
 
   min_average_unique_buy_to_sell_ratio: 0
   min_average_buy_trader_size: 0
 
 ws_port: 1661
 http_port: 1662
-start_balance_sol: 12321.0
+start_balance_sol: 10.0
 
 buy_config:
   amount_sol: 0.6

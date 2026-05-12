@@ -1,5 +1,5 @@
 use crate::{
-    general::Slot, generalize::general_commands::Currency, helper::Amount,
+    general::Slot, generalize::general_commands::Currency,
     persistence::error::Error, trading::trader::TraderType,
 };
 

@@ -6,18 +6,13 @@ use loggaper::{
         broker_mock::MockBroker,
         manager::{OpenReason, PositionManagerActor, PositionMessage, WsCommand, WsFeedMessage},
         performance_tracker::{CreatorRegistryHandle, PerformanceTrackerHandle},
-        pump_brocker::SolanaBroker,
     },
-    feed::{feed::Feed, logs::pump::PumpEvent},
-    generalize::{
-        general_commands::{Action, Currency, GeneralBuy, GeneralSell},
-        generalizer::generalize,
-    },
-    helper::Amount,
+    feed::metrics::{FeedMetrics, FeedSnapshot, new_dedup},
+    generalize::general_commands::Action,
     persistence::{
         bot_trades::BotTradeRow,
         creators::CreatorRepository,
-        postgres::{creators::CreatorsRepositoryPostgres, tokens::TokenRepositoryPostgres},
+        postgres::creators::CreatorsRepositoryPostgres,
         tokens::TokenRepository,
         traders::{TraderEntry, TraderRepository},
     },
@@ -28,12 +23,7 @@ use loggaper::{
     },
 };
 use solana_keypair::{Keypair, Signer};
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    thread::sleep,
-    time::{Duration, UNIX_EPOCH},
-};
+use std::sync::Arc;
 use std::{
     sync::atomic::Ordering,
     time::{Instant, SystemTime},
@@ -67,6 +57,7 @@ async fn main() {
         balance: std::sync::Arc<std::sync::atomic::AtomicU64>,
         buy_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
         pubkey: String,
+        feed_metrics: Arc<Vec<Arc<FeedMetrics>>>,
     }
 
     let (waiter_actor, waiter_handle) = DatabaseCreateWaiter::new();
@@ -82,7 +73,10 @@ async fn main() {
     let keypair = Arc::new(Keypair::from_base58_string(&private_key));
     let pubkey_string = keypair.pubkey().to_string();
 
-    let broker = Arc::new(MockBroker::new(100f64));
+    // Mock broker starts at the configured start balance (SOL). Keep this
+    // in sync with `start_balance_sol` in filter_config.yaml so the manager
+    // and the broker report the same initial balance.
+    let broker = Arc::new(MockBroker::new(config.start_balance_sol));
 
     let (mut manager_actor, manager_tx, mut event_rx, paused_state, balance_state) =
         PositionManagerActor::new(
@@ -115,8 +109,86 @@ async fn main() {
         }
     });
 
-    let mut pump = PumpPipeline::init(ws_url, commitment_config.clone(), general_tx, 3, false);
+    // Build feed-metrics infrastructure before starting the pipeline so that
+    // both the pipeline and the HTTP /metrics route observe the same Arc.
+    let pump_metrics = FeedMetrics::new("pump");
+    let pumpswap_metrics = FeedMetrics::new("pumpswap");
+    let feed_metrics_vec: Arc<Vec<Arc<FeedMetrics>>> =
+        Arc::new(vec![pump_metrics.clone(), pumpswap_metrics.clone()]);
+    let dedup = new_dedup(10_000);
+
+    // PumpSwap consumer is currently disabled (see src/pipelines/pump.rs),
+    // so we also disable the WS subscription to stop wasting Helius credits
+    // on a feed nothing reads. Flip the last argument to `true` to re-enable.
+    let mut pump = PumpPipeline::init(
+        ws_url,
+        commitment_config.clone(),
+        general_tx,
+        3,
+        false,
+        pump_metrics.clone(),
+        pumpswap_metrics.clone(),
+        dedup.clone(),
+        false,
+    );
     tokio::spawn(async move { pump.run() });
+
+    // Periodic feed-metrics logger with simple anomaly alerting: EMA of
+    // messages/sec per feed, and an [ALERT] line if the latest interval is
+    // more than 3x the EMA. Keeps a single log line per feed every 30s.
+    {
+        let metrics_for_logger = feed_metrics_vec.clone();
+        tokio::spawn(async move {
+            let interval_secs: u64 = 30;
+            let mut last_messages: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
+            let mut ema_msgs: std::collections::HashMap<String, f64> =
+                std::collections::HashMap::new();
+            let alpha = 0.3_f64;
+
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            ticker.tick().await; // skip first immediate tick
+            loop {
+                ticker.tick().await;
+                for m in metrics_for_logger.iter() {
+                    let snap = m.snapshot();
+                    let prev = *last_messages.get(&snap.name).unwrap_or(&0);
+                    let delta = snap.messages.saturating_sub(prev);
+                    let rate = delta as f64 / interval_secs as f64;
+                    last_messages.insert(snap.name.clone(), snap.messages);
+
+                    let ema = ema_msgs.entry(snap.name.clone()).or_insert(rate);
+                    let prior = *ema;
+                    *ema = alpha * rate + (1.0 - alpha) * prior;
+
+                    println!(
+                        "[metrics:{}] msgs/s={:.1} ema={:.1} events/s_avg={:.1} \
+                         bytes/s_avg={:.0} reconnects={} stream_err={} parse_err={} \
+                         err_logs={} cross_dup={} subs={}",
+                        snap.name,
+                        rate,
+                        *ema,
+                        snap.events_per_sec_avg,
+                        snap.bytes_per_sec_avg,
+                        snap.reconnects,
+                        snap.stream_errors,
+                        snap.parse_errors,
+                        snap.err_logs,
+                        snap.duplicates_cross_feed,
+                        snap.subscribed,
+                    );
+
+                    if prior > 1.0 && rate > prior * 3.0 {
+                        println!(
+                            "[ALERT:{}] message rate spike: {:.1}/s (ema {:.1}/s)",
+                            snap.name, rate, prior
+                        );
+                    }
+                }
+            }
+        });
+    }
 
     let registry = CreatorRegistryHandle::new();
     let tracker = PerformanceTrackerHandle::new(0.8);
@@ -148,6 +220,7 @@ async fn main() {
         balance: balance_state,
         buy_size: buy_size_state.clone(),
         pubkey: pubkey_string,
+        feed_metrics: feed_metrics_vec.clone(),
     };
 
     let http_addr = format!("0.0.0.0:{}", config.http_port);
@@ -156,7 +229,7 @@ async fn main() {
             Json, Router,
             extract::{Path, State},
             response::IntoResponse,
-            routing::{get, put},
+            routing::get,
         };
 
         async fn get_pubkey(State(state): State<ApiState>) -> impl IntoResponse {
@@ -320,6 +393,12 @@ async fn main() {
             })
         }
 
+        async fn get_metrics(State(state): State<ApiState>) -> impl IntoResponse {
+            let snaps: Vec<FeedSnapshot> =
+                state.feed_metrics.iter().map(|m| m.snapshot()).collect();
+            Json(snaps)
+        }
+
         async fn set_buy_size(
             State(state): State<ApiState>,
             Json(body): Json<serde_json::Value>,
@@ -345,6 +424,7 @@ async fn main() {
             .route("/dev-stats/{mint}", get(get_dev_stats))
             .route("/chart/{mint}", get(get_chart))
             .route("/buy-size", get(get_buy_size).put(set_buy_size))
+            .route("/metrics", get(get_metrics))
             .with_state(api_state);
 
         let listener = tokio::net::TcpListener::bind(&http_addr)
@@ -402,7 +482,17 @@ async fn main() {
                                 }
                                 OpenReason::DevStats(stats)
                             }
-                            None => OpenReason::TraderStats,
+                            None => {
+                                // No creator history → do NOT open. We
+                                // intentionally disable the TraderStats
+                                // fallback so positions are only opened on
+                                // developers with proven track record.
+                                eprintln!(
+                                    "[FILTER] {} skipped: no creator history",
+                                    general_create.mint
+                                );
+                                return;
+                            }
                         };
 
                         let amount_sol =
@@ -430,8 +520,8 @@ async fn main() {
                             dbg!(err);
                         }
                         waiter.notify_created(general_create.mint).await;
-                        let duration = start.elapsed();
-                        let now = SystemTime::now();
+                        let _duration = start.elapsed();
+                        let _now = SystemTime::now();
                     }
                 });
             }
@@ -455,29 +545,28 @@ async fn main() {
 
                     async move {
                         let current_mc = bucket.pool().market_cap().amount().to_float();
-                        let best_mc = tracker.get_best_market_cap().await;
+                        let _best_mc = tracker.get_best_market_cap().await;
                         let trader_pnl = bucket
                             .swarm()
                             .get_pnl(loggaper::trading::trader::TraderType::Regular)
                             .await;
 
-                        if trader_pnl > 0.0 {
-                            if let Some(dev_stats) = registry.get(trade_action.mint()).await {
-                                let cloned = dev_stats.clone();
+                        if trader_pnl > 0.0
+                            && let Some(dev_stats) = registry.get(trade_action.mint()).await {
+                                let _cloned = dev_stats.clone();
                                 let updated = tracker.try_update_ath(current_mc, dev_stats).await;
                                 if updated {
                                     // println!("{} {:?}", trade_action.mint(), &cloned);
                                 }
                             }
-                        }
 
                         let start = Instant::now();
-                        let trader_stats =
+                        let _trader_stats =
                             match trades.get_trader_stats(trade_action.trader()).await {
                                 Ok(stats) => stats,
                                 Err(_) => return,
                             };
-                        let duration = start.elapsed();
+                        let _duration = start.elapsed();
 
                         let trader_type =
                             match bucket.swarm().get_trader(trade_action.trader()).await {
@@ -485,11 +574,8 @@ async fn main() {
                                 None => return,
                             };
 
-                        let sol = trade_action.size().amount();
-                        match trader_type {
-                            loggaper::trading::trader::TraderType::Regular => {}
-                            _ => (),
-                        }
+                        let _sol = trade_action.size().amount();
+                        if trader_type == loggaper::trading::trader::TraderType::Regular {}
                     }
                 });
 
@@ -498,7 +584,7 @@ async fn main() {
                     let trades = trades.clone();
                     let waiter = waiter_handle.clone();
                     let bucket = bucket.clone();
-                    let tx = manager_tx.clone();
+                    let _tx = manager_tx.clone();
 
                     async move {
                         waiter.wait_for(trade_action.mint()).await;
@@ -508,7 +594,7 @@ async fn main() {
                             None => return,
                         };
 
-                        let now = SystemTime::now();
+                        let _now = SystemTime::now();
                         let entry = TraderEntry {
                             trader_address: trade_action.trader().to_string(),
                             coin_address: trade_action.mint().to_string(),
@@ -520,7 +606,7 @@ async fn main() {
                             role: trader.trader_type(),
                         };
 
-                        if let Err(err) = trades.save_trade(entry).await {
+                        if let Err(_err) = trades.save_trade(entry).await {
                             println!("error while saving {}", bucket.pool().mint());
                         }
                     }
@@ -559,11 +645,10 @@ pub async fn run_ws_server(
                     msg = rx.recv() => {
                         match msg {
                             Ok(feed_msg) => {
-                                if let Ok(json) = serde_json::to_string(&feed_msg) {
-                                    if sink.send(Message::Text(json.into())).await.is_err() {
+                                if let Ok(json) = serde_json::to_string(&feed_msg)
+                                    && sink.send(Message::Text(json.into())).await.is_err() {
                                         break;
                                     }
-                                }
                             }
                             Err(_) => break,
                         }

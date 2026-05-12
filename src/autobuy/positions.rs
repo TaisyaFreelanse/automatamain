@@ -1,6 +1,4 @@
 use crate::{generalize::general_pool::Pool, helper::Amount};
-use solana_address::Address;
-use std::collections::HashMap;
 
 pub struct Position {
     pub pool: Box<dyn Pool>,

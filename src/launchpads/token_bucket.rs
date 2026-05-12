@@ -8,8 +8,8 @@ use crate::{
     helper::Amount,
     trading::{
         offer::Offer,
-        swarm::{Swarm, SwarmActor, SwarmHandler},
-        trader::{Trader, TraderType},
+        swarm::{SwarmActor, SwarmHandler},
+        trader::TraderType,
     },
 };
 

@@ -168,7 +168,6 @@ struct Position {
     holdings: f64,
     market_cap: f64,
     enter_mcap: f64,
-    close_reason: Option<String>,
 }
 
 // ── Config panel ──────────────────────────────────────────────────────────────
@@ -305,7 +304,6 @@ impl Dashboard {
                                 holdings: 0.0,
                                 market_cap: 0.0,
                                 enter_mcap,
-                                close_reason: None,
                             },
                         );
                     }
@@ -450,10 +448,12 @@ impl eframe::App for Dashboard {
                                     .prices
                                     .iter()
                                     .enumerate()
-                                    .min_by(|(_, a), (_, b)| {
-                                        (a.clone() - marker.entry_mcap)
+                                    .min_by(|x, y| {
+                                        let a = *x.1;
+                                        let b = *y.1;
+                                        (a - marker.entry_mcap)
                                             .abs()
-                                            .partial_cmp(&(b.clone() - marker.entry_mcap).abs())
+                                            .partial_cmp(&(b - marker.entry_mcap).abs())
                                             .unwrap()
                                     })
                                     .map(|(i, _)| i)
@@ -462,10 +462,12 @@ impl eframe::App for Dashboard {
                                 let exit_idx = chart.prices[entry_idx..]
                                     .iter()
                                     .enumerate()
-                                    .min_by(|(_, a), (_, b)| {
-                                        (a.clone() - marker.exit_mcap)
+                                    .min_by(|x, y| {
+                                        let a = *x.1;
+                                        let b = *y.1;
+                                        (a - marker.exit_mcap)
                                             .abs()
-                                            .partial_cmp(&(b.clone() - marker.exit_mcap).abs())
+                                            .partial_cmp(&(b - marker.exit_mcap).abs())
                                             .unwrap()
                                     })
                                     .map(|(i, _)| entry_idx + i)

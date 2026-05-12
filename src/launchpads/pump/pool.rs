@@ -53,7 +53,7 @@ impl Pool for Migrated {
         self.pool
     }
 
-    fn update(&mut self, event: &dyn Any) {}
+    fn update(&mut self, _event: &dyn Any) {}
 
     fn token_decimals(&self) -> u8 {
         6
@@ -74,7 +74,7 @@ impl Pool for Migrated {
         Currency::Native(Amount::from_raw_native(market_cap as u64))
     }
 
-    fn instruction(&self, action: Action) -> solana_instruction::Instruction {
+    fn instruction(&self, _action: Action) -> solana_instruction::Instruction {
         todo!()
     }
 }
@@ -137,7 +137,7 @@ impl Pool for Bonding {
         Currency::Native(Amount::from_raw_native(market_cap as u64))
     }
 
-    fn instruction(&self, action: Action) -> solana_instruction::Instruction {
+    fn instruction(&self, _action: Action) -> solana_instruction::Instruction {
         todo!()
     }
 }
@@ -213,7 +213,7 @@ impl Pool for PumpPool<Bonding> {
     fn market_cap(&self) -> Currency {
         self.state.market_cap()
     }
-    fn instruction(&self, action: Action) -> solana_instruction::Instruction {
+    fn instruction(&self, _action: Action) -> solana_instruction::Instruction {
         todo!()
     }
 }
@@ -257,7 +257,7 @@ impl Pool for PumpPool<Migrated> {
         self.state.market_cap()
     }
 
-    fn instruction(&self, action: Action) -> solana_instruction::Instruction {
+    fn instruction(&self, _action: Action) -> solana_instruction::Instruction {
         todo!()
     }
 }

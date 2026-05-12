@@ -52,8 +52,8 @@ impl TradeAction {
 
     pub fn is_buy(&self) -> bool {
         match self {
-            TradeAction::Buy(general_buy) => true,
-            TradeAction::Sell(general_sell) => false,
+            TradeAction::Buy(_general_buy) => true,
+            TradeAction::Sell(_general_sell) => false,
         }
     }
 }
