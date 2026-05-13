@@ -13,7 +13,7 @@ use tokio::time::timeout;
 use crate::feed::{
     feed::Feed,
     logs::log::HasLogsFilter,
-    metrics::SharedDedup,
+    metrics::{SelfDedup, SharedDedup},
 };
 
 pub type Result<T> = core::result::Result<T, Error>;
@@ -22,6 +22,8 @@ const RECONNECT_BACKOFF_INITIAL_MS: u64 = 1_000;
 const RECONNECT_BACKOFF_MAX_MS: u64 = 60_000;
 const STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
 const RECONNECT_LOG_EVERY: u64 = 25;
+const SELF_DEDUP_CAPACITY: usize = 4096;
+const PROGRAM_DATA_PREFIX: &str = "Program data: ";
 
 impl<T> Feed<T>
 where
@@ -36,6 +38,9 @@ where
         let feed_name: &'static str = self.metrics.name;
         let mut backoff_ms = RECONNECT_BACKOFF_INITIAL_MS;
         let failure_counter = AtomicU64::new(0);
+        // Self-feed dedup persists across re-subscriptions to catch the
+        // common case where the same tx is re-broadcast after a reconnect.
+        let mut self_dedup = SelfDedup::new(SELF_DEDUP_CAPACITY);
 
         loop {
             let res = async {
@@ -56,7 +61,8 @@ where
                     .await
                     {
                         Ok(Some(log_info)) => {
-                            // Approximate payload size: sum of all log string lengths.
+                            // Approximate payload size: sum of all log string
+                            // lengths plus the signature.
                             let bytes: u64 = log_info
                                 .value
                                 .logs
@@ -66,21 +72,64 @@ where
                                 + log_info.value.signature.len() as u64;
                             self.metrics.note_message(bytes);
 
-                            // Cross-feed signature dedup. We don't drop the
-                            // event (the other feed may emit a different
-                            // event type for the same tx), we just count it.
-                            if !log_info.value.signature.is_empty()
-                                && let Ok(mut guard) = dedup.lock()
-                                    && guard.observe(&log_info.value.signature, feed_name) {
-                                        self.metrics.note_cross_dup();
-                                    }
-
+                            // 1) Drop failed transactions immediately. They
+                            //    cannot contain a successful event we'd act
+                            //    on, but they DO consume Helius credits.
                             if log_info.value.err.is_some() {
                                 self.metrics.note_err_log();
+                                self.metrics.note_dropped_failed_tx();
                                 continue;
                             }
 
+                            // 2) Self-feed signature dedup. Same tx delivered
+                            //    twice on the same stream (e.g. after a
+                            //    re-subscription) is dropped without parsing
+                            //    or downstream work.
+                            if !log_info.value.signature.is_empty()
+                                && self_dedup.check_and_remember(&log_info.value.signature)
+                            {
+                                self.metrics.note_dropped_self_dup();
+                                continue;
+                            }
+
+                            // 3) Cross-feed signature observability. We don't
+                            //    drop here because the other feed may emit a
+                            //    different event type for the same tx; we
+                            //    just count overlap.
+                            if !log_info.value.signature.is_empty()
+                                && let Ok(mut guard) = dedup.lock()
+                                && guard.observe(&log_info.value.signature, feed_name)
+                            {
+                                self.metrics.note_cross_dup();
+                            }
+
+                            // 4) Prefilter before parse: count program-data
+                            //    lines. If there are none, drop the whole
+                            //    message — there is nothing for the parser
+                            //    to do.
+                            let total_lines = log_info.value.logs.len() as u64;
+                            let mut program_data_lines: u64 = 0;
+                            for log in log_info.value.logs.iter() {
+                                if log.starts_with(PROGRAM_DATA_PREFIX) {
+                                    program_data_lines += 1;
+                                }
+                            }
+                            self.metrics.add_lines(total_lines, program_data_lines);
+
+                            if program_data_lines == 0 {
+                                self.metrics.note_dropped_no_program_data();
+                                continue;
+                            }
+
+                            // 5) Per-line cheap guard: skip non-program-data
+                            //    lines without invoking the parser at all
+                            //    (this used to inflate parse_errors and burn
+                            //    base64-decode CPU on every "Program log:"
+                            //    line of every tx).
                             for log in log_info.value.logs {
+                                if !log.starts_with(PROGRAM_DATA_PREFIX) {
+                                    continue;
+                                }
                                 match T::from_str(&log) {
                                     Ok(event) => {
                                         self.metrics.note_event();
@@ -96,6 +145,9 @@ where
                                         }
                                     }
                                     Err(_) => {
+                                        // Real parse error: line had the
+                                        // Program data: prefix but failed
+                                        // base64/borsh decode.
                                         self.metrics.note_parse_error();
                                     }
                                 }
@@ -114,7 +166,7 @@ where
 
             let failures = failure_counter.fetch_add(1, Ordering::Relaxed) + 1;
             self.metrics.note_reconnect();
-            let should_log = failures == 1 || failures.is_multiple_of(RECONNECT_LOG_EVERY);
+            let should_log = failures == 1 || failures % RECONNECT_LOG_EVERY == 0;
 
             match res {
                 Ok(_) => {

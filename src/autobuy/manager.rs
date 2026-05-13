@@ -9,7 +9,14 @@ use crate::{
         bot_trades::{BotTradeEntry, BotTradeRepository},
         creators::CreatorStatistics,
     },
+    scoring::{
+        config::StrategyConfig,
+        dev_ranker::{DevRankerHandle, TokenOutcome},
+        smart_money::SmartMoneyHandle,
+        strategy_controller::{BuyDecision, StrategyController, StrategySnapshot},
+    },
 };
+use solana_address::Address;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::{
@@ -89,12 +96,23 @@ pub enum PositionMessage {
         pool: Box<dyn Pool>,
         amount_sol: f64,
         open_reason: OpenReason,
+        /// Token developer (used for dev_ranker on close).
+        dev_address: Option<Address>,
+        /// Snapshot of early buyers (used for smart_money on close).
+        early_buyers: Vec<Address>,
     },
     /// Internal: actual buy after delay
     ExecuteBuy {
         mint: solana_address::Address,
         amount_sol: f64,
         open_reason: OpenReason,
+        dev_address: Option<Address>,
+        early_buyers: Vec<Address>,
+    },
+    /// Snapshot the current strategy state (caps, loss-streak, regime).
+    /// Used by the HTTP /metrics endpoint.
+    GetStrategySnapshot {
+        responder: oneshot::Sender<StrategySnapshot>,
     },
     /// Internal: actual sell after delay
     ExecuteSell {
@@ -148,6 +166,9 @@ pub struct PositionManagerActor {
     paused: bool,
     paused_state: StdArc<AtomicBool>,
     balance_state: StdArc<std::sync::atomic::AtomicU64>,
+    strategy: StrategyController,
+    dev_ranker: Option<DevRankerHandle>,
+    smart_money: Option<SmartMoneyHandle>,
 }
 
 impl PositionManagerActor {
@@ -156,6 +177,9 @@ impl PositionManagerActor {
         initial_balance_sol: f64,
         config: SmartBuyConfig,
         bot_trades: Arc<dyn BotTradeRepository + Send + Sync>,
+        strategy_cfg: StrategyConfig,
+        dev_ranker: Option<DevRankerHandle>,
+        smart_money: Option<SmartMoneyHandle>,
     ) -> (
         Self,
         mpsc::Sender<PositionMessage>,
@@ -182,6 +206,9 @@ impl PositionManagerActor {
             paused: false,
             paused_state: paused_state.clone(),
             balance_state: balance_state.clone(),
+            strategy: StrategyController::new(strategy_cfg),
+            dev_ranker,
+            smart_money,
         };
         (actor, tx, event_rx, paused_state, balance_state)
     }
@@ -214,6 +241,8 @@ impl PositionManagerActor {
                     pool,
                     amount_sol,
                     open_reason,
+                    dev_address,
+                    early_buyers,
                 } => {
                     if self.paused {
                         continue;
@@ -232,6 +261,16 @@ impl PositionManagerActor {
                         continue;
                     }
 
+                    // --- Strategy controller gate -----------------------------------
+                    let open_now = (self.positions.len() + self.pending_buys.len()) as u32;
+                    match self.strategy.can_open(open_now) {
+                        BuyDecision::Allow => {}
+                        block => {
+                            eprintln!("[STRATEGY] {mint} blocked: {:?}", block);
+                            continue;
+                        }
+                    }
+
                     self.pending_buys.insert(mint);
                     self.pool_cache.insert(mint, pool);
                     let tx_clone = self.tx.clone();
@@ -242,9 +281,16 @@ impl PositionManagerActor {
                                 mint,
                                 amount_sol,
                                 open_reason,
+                                dev_address,
+                                early_buyers,
                             })
                             .await;
                     });
+                }
+
+                // ----------------------------------------------------------------
+                PositionMessage::GetStrategySnapshot { responder } => {
+                    let _ = responder.send(self.strategy.snapshot());
                 }
 
                 // ----------------------------------------------------------------
@@ -252,6 +298,8 @@ impl PositionManagerActor {
                     mint,
                     amount_sol,
                     open_reason,
+                    dev_address,
+                    early_buyers,
                 } => {
                     self.pending_buys.remove(&mint);
 
@@ -285,9 +333,13 @@ impl PositionManagerActor {
                     let tokens = Amount::from_float_native(receipt.tokens_received);
                     let mut position = Position::new(latest_pool, tokens, current_time);
                     position.exit_profit_floor = self.config.exit_profit_floor;
+                    position.spent_sol = amount_sol;
+                    position.dev_address = dev_address;
+                    position.early_buyers = early_buyers;
                     let enter_mcap = position.enter_mcap.to_float();
                     eprintln!("[BUY] Opened {mint} | mcap={enter_mcap:.1} SOL | spent={amount_sol:.4} SOL");
                     self.positions.insert(mint, position);
+                    self.strategy.note_position_opened();
 
                     if let Ok(bal) = self.broker.balance_sol().await {
                         self.balance_state.store(bal.to_bits(), Ordering::Relaxed);
@@ -331,6 +383,17 @@ impl PositionManagerActor {
                         pos.total_returned += return_value;
                         let total_returned = pos.total_returned;
 
+                        // Snapshot fields needed in the close branch BEFORE
+                        // potentially moving `pos` back into the map for
+                        // partial sells.
+                        let close_dev_address = pos.dev_address;
+                        let close_spent_sol = pos.spent_sol;
+                        let close_early_buyers = if percent >= 100.0 {
+                            std::mem::take(&mut pos.early_buyers)
+                        } else {
+                            Vec::new()
+                        };
+
                         if percent < 100.0 {
                             pos.holdings = Amount::from_float_native(pos.holdings.to_float() - sell_qty);
                             pos.pending_partial_sell = false;
@@ -344,9 +407,47 @@ impl PositionManagerActor {
 
                         if percent >= 100.0 {
                             self.closed_mints.insert(mint);
-                            self.pool_cache.remove(&mint);
+                            let _ = self.pool_cache.remove(&mint);
 
                             let overall_pnl_pct = (total_returned / invested_sol - 1.0) * 100.0;
+
+                            // Real SOL PnL of the whole position. The
+                            // historical `invested_sol = initial_holdings.to_float()`
+                            // field above is in tokens, not SOL — so we
+                            // recompute against the actual SOL spent on
+                            // entry, captured on Position at ExecuteBuy.
+                            let pnl_sol = if close_spent_sol > 0.0 {
+                                total_returned - close_spent_sol
+                            } else {
+                                0.0
+                            };
+                            let pnl_pct_sol = if close_spent_sol > 0.0 {
+                                (total_returned / close_spent_sol - 1.0) * 100.0
+                            } else {
+                                overall_pnl_pct
+                            };
+
+                            // Strategy controller bookkeeping (loss streak,
+                            // daily caps, regime pause).
+                            self.strategy.note_position_closed(pnl_sol);
+
+                            // Dev ranker / smart money updates. Both async,
+                            // spawned so the actor loop doesn't block.
+                            if let Some(dev) = close_dev_address
+                                && let Some(handle) = self.dev_ranker.clone() {
+                                    let outcome = TokenOutcome::classify(pnl_pct_sol);
+                                    tokio::spawn(async move {
+                                        handle.note_outcome(dev, outcome).await;
+                                    });
+                                }
+                            if !close_early_buyers.is_empty()
+                                && let Some(handle) = self.smart_money.clone() {
+                                    let buyers = close_early_buyers;
+                                    let pnl = pnl_pct_sol;
+                                    tokio::spawn(async move {
+                                        handle.note_trade_outcome(buyers, pnl).await;
+                                    });
+                                }
 
                             let _ = self.event_tx.try_send(WsFeedMessage::PositionClose {
                                 address: mint.to_string(),
@@ -617,6 +718,8 @@ impl PositionManagerHandler {
         pool: Box<dyn Pool>,
         amount_sol: f64,
         open_reason: OpenReason,
+        dev_address: Option<Address>,
+        early_buyers: Vec<Address>,
     ) {
         let _ = self
             .tx
@@ -624,6 +727,8 @@ impl PositionManagerHandler {
                 pool,
                 amount_sol,
                 open_reason,
+                dev_address,
+                early_buyers,
             })
             .await;
     }

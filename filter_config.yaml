@@ -25,3 +25,67 @@ buy_config:
   time_kill_secs: 25
   time_kill_min_profit_pct: 10.0
   trailing_stop_drawdown_pct: 30.0
+
+# Score Engine A+/A/SKIP. The bot computes a combined score from dev quality,
+# liquidity, buyers, momentum, volume, smart wallets, and anti-bundle signals
+# after a short scoring window, then chooses a tier-based buy size.
+scoring:
+  scoring_window_ms: 1500
+  a_plus_threshold: 9
+  a_threshold: 6
+  weights:
+    dev_history_strong: 4
+    dev_history_weak: 2
+    dev_ranker_a_plus: 3
+    dev_ranker_a: 1
+    dev_ranker_bad: -3
+    smart_wallets_3plus: 3
+    smart_wallets_1plus: 1
+    buyers_10plus: 2
+    buyers_6plus: 1
+    buyers_below_3: -2
+    buy_to_sell_ratio_high: 1
+    momentum_good: 2
+    momentum_overheated: -3
+    volume_ok: 1
+    bundle_similar: -4
+    bundle_identical: -5
+  thresholds:
+    dev_strong_min_coins: 5
+    dev_strong_min_pnl_pct: 20.0
+    buyers_high: 10
+    buyers_mid: 6
+    buyers_low: 3
+    buy_to_sell_high: 1.5
+    momentum_good_low_pct: 12.0
+    momentum_good_high_pct: 30.0
+    momentum_overheated_pct: 60.0
+    volume_ok_sol: 10.0
+    bundle_similar_ratio: 0.7
+    bundle_identical_ratio: 0.5
+    bundle_similar_tolerance: 0.05
+  size:
+    a_plus_sol: 1.0
+    a_sol: 0.6
+
+# Strategy controller — risk caps applied at the InitiateBuy gate inside the
+# position manager. None of these touch open positions.
+strategy:
+  max_open_positions: 3
+  max_trades_per_day: 25
+  max_daily_loss_sol: -2.0
+  daily_profit_lock_sol: 4.0
+  loss_streak_limit: 5
+  loss_streak_pause_secs: 1800
+  market_regime_pause: true
+  market_regime_window: 10
+  market_regime_loss_ratio: 0.8
+  market_regime_pause_secs: 1800
+
+# Persistent JSON state for dev_ranker and smart_money. Both are flushed
+# atomically via tmp+rename every flush_every_secs.
+persistence:
+  dev_ranker_path: "/home/automata/state/dev_ranker.json"
+  smart_money_path: "/home/automata/state/smart_money.json"
+  flush_every_secs: 30
+  entity_ttl_secs: 172800

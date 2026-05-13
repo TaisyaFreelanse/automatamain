@@ -1,3 +1,5 @@
+use solana_address::Address;
+
 use crate::{generalize::general_pool::Pool, helper::Amount};
 
 pub struct Position {
@@ -19,6 +21,13 @@ pub struct Position {
     pub entry_time: u64,
     /// Cumulative SOL returned across all partial and final sells.
     pub total_returned: f64,
+    /// Actual SOL we spent to enter (used by strategy controller and dev/wallet ranking).
+    pub spent_sol: f64,
+    /// Token developer at entry time (None for legacy callers).
+    pub dev_address: Option<Address>,
+    /// Snapshot of early buyers, captured at scoring time. Used on close to
+    /// credit/debit the smart-money registry.
+    pub early_buyers: Vec<Address>,
 }
 
 impl Position {
@@ -30,7 +39,7 @@ impl Position {
             pool,
             initial_holdings: buy_amount,
             holdings: buy_amount,
-            exit_profit_floor: -16.0, // overwritten by SmartBuyConfig on open
+            exit_profit_floor: -16.0,
             tp1_triggered: false,
             tp2_triggered: false,
             trailing_active: false,
@@ -38,6 +47,9 @@ impl Position {
             pending_partial_sell: false,
             entry_time: current_time,
             total_returned: 0.0,
+            spent_sol: 0.0,
+            dev_address: None,
+            early_buyers: Vec::new(),
         }
     }
 

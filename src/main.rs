@@ -7,7 +7,7 @@ use loggaper::{
         manager::{OpenReason, PositionManagerActor, PositionMessage, WsCommand, WsFeedMessage},
         performance_tracker::{CreatorRegistryHandle, PerformanceTrackerHandle},
     },
-    feed::metrics::{FeedMetrics, FeedSnapshot, new_dedup},
+    feed::metrics::{BotMetrics, BotSnapshot, FeedMetrics, FeedSnapshot, new_dedup},
     generalize::general_commands::Action,
     persistence::{
         bot_trades::BotTradeRow,
@@ -17,6 +17,13 @@ use loggaper::{
         traders::{TraderEntry, TraderRepository},
     },
     pipelines::pump::PumpPipeline,
+    scoring::{
+        dev_ranker::{self, DevRankerHandle, DevRankerSnapshot},
+        features,
+        score_engine::{ScoreEngine, Tier},
+        smart_money::{self, SmartMoneyHandle, SmartMoneySnapshot},
+        strategy_controller::StrategySnapshot,
+    },
     setup::{
         load_config, setup_crypto, setup_logging, setup_postgres_pool, setup_repositories,
         setup_solana_rpc, waiter::DatabaseCreateWaiter,
@@ -58,6 +65,10 @@ async fn main() {
         buy_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
         pubkey: String,
         feed_metrics: Arc<Vec<Arc<FeedMetrics>>>,
+        bot_metrics: Arc<BotMetrics>,
+        manager_tx: mpsc::Sender<PositionMessage>,
+        dev_ranker: DevRankerHandle,
+        smart_money: SmartMoneyHandle,
     }
 
     let (waiter_actor, waiter_handle) = DatabaseCreateWaiter::new();
@@ -78,12 +89,20 @@ async fn main() {
     // and the broker report the same initial balance.
     let broker = Arc::new(MockBroker::new(config.start_balance_sol));
 
+    // Persistent dev ranking + smart-money registries. Both are actors that
+    // own their own state and flush JSON to disk every N seconds.
+    let dev_ranker_handle = dev_ranker::spawn(config.persistence.clone());
+    let smart_money_handle = smart_money::spawn(config.persistence.clone());
+
     let (mut manager_actor, manager_tx, mut event_rx, paused_state, balance_state) =
         PositionManagerActor::new(
             broker.clone(),
             config.start_balance_sol,
             config.buy_config.clone(),
             bot_trades,
+            config.strategy.clone(),
+            Some(dev_ranker_handle.clone()),
+            Some(smart_money_handle.clone()),
         );
 
     // Default buy size of 0.6 SOL, stored as f64 bits in an AtomicU64
@@ -116,6 +135,7 @@ async fn main() {
     let feed_metrics_vec: Arc<Vec<Arc<FeedMetrics>>> =
         Arc::new(vec![pump_metrics.clone(), pumpswap_metrics.clone()]);
     let dedup = new_dedup(10_000);
+    let bot_metrics = BotMetrics::new();
 
     // PumpSwap consumer is currently disabled (see src/pipelines/pump.rs),
     // so we also disable the WS subscription to stop wasting Helius credits
@@ -138,6 +158,7 @@ async fn main() {
     // more than 3x the EMA. Keeps a single log line per feed every 30s.
     {
         let metrics_for_logger = feed_metrics_vec.clone();
+        let bot_for_logger = bot_metrics.clone();
         tokio::spawn(async move {
             let interval_secs: u64 = 30;
             let mut last_messages: std::collections::HashMap<String, u64> =
@@ -163,20 +184,22 @@ async fn main() {
                     *ema = alpha * rate + (1.0 - alpha) * prior;
 
                     println!(
-                        "[metrics:{}] msgs/s={:.1} ema={:.1} events/s_avg={:.1} \
-                         bytes/s_avg={:.0} reconnects={} stream_err={} parse_err={} \
-                         err_logs={} cross_dup={} subs={}",
+                        "[metrics:{}] msgs/s={:.1} ema={:.1} ev/s={:.1} \
+                         bytes/s={:.0} drop_failed={} drop_npd={} drop_self_dup={} \
+                         cross_dup={} parse_err={} useful={:.3} subs={} reconn={}",
                         snap.name,
                         rate,
                         *ema,
                         snap.events_per_sec_avg,
                         snap.bytes_per_sec_avg,
-                        snap.reconnects,
-                        snap.stream_errors,
-                        snap.parse_errors,
-                        snap.err_logs,
+                        snap.dropped_failed_tx,
+                        snap.dropped_no_program_data,
+                        snap.dropped_self_dup,
                         snap.duplicates_cross_feed,
+                        snap.parse_errors,
+                        snap.useful_msg_ratio,
                         snap.subscribed,
+                        snap.reconnects,
                     );
 
                     if prior > 1.0 && rate > prior * 3.0 {
@@ -186,6 +209,22 @@ async fn main() {
                         );
                     }
                 }
+
+                let b = bot_for_logger.snapshot();
+                println!(
+                    "[metrics:bot] creates={} no_history={} filter_rejected={} \
+                     passed_filter={} score_skip={} score_a={} score_a_plus={} \
+                     strategy_blocked={} positions_initiated={}",
+                    b.creates_total,
+                    b.creates_no_history,
+                    b.creates_filter_rejected,
+                    b.creates_passed_filter,
+                    b.score_skipped,
+                    b.score_a,
+                    b.score_a_plus,
+                    b.strategy_blocked,
+                    b.positions_initiated,
+                );
             }
         });
     }
@@ -221,6 +260,10 @@ async fn main() {
         buy_size: buy_size_state.clone(),
         pubkey: pubkey_string,
         feed_metrics: feed_metrics_vec.clone(),
+        bot_metrics: bot_metrics.clone(),
+        manager_tx: manager_tx.clone(),
+        dev_ranker: dev_ranker_handle.clone(),
+        smart_money: smart_money_handle.clone(),
     };
 
     let http_addr = format!("0.0.0.0:{}", config.http_port);
@@ -394,9 +437,40 @@ async fn main() {
         }
 
         async fn get_metrics(State(state): State<ApiState>) -> impl IntoResponse {
-            let snaps: Vec<FeedSnapshot> =
+            #[derive(serde::Serialize)]
+            struct MetricsResponse {
+                feeds: Vec<FeedSnapshot>,
+                bot: BotSnapshot,
+                strategy: Option<StrategySnapshot>,
+                dev_ranker: DevRankerSnapshot,
+                smart_money: SmartMoneySnapshot,
+            }
+            let feeds: Vec<FeedSnapshot> =
                 state.feed_metrics.iter().map(|m| m.snapshot()).collect();
-            Json(snaps)
+            let bot = state.bot_metrics.snapshot();
+
+            let strategy = {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                if state
+                    .manager_tx
+                    .send(PositionMessage::GetStrategySnapshot { responder: tx })
+                    .await
+                    .is_ok()
+                {
+                    rx.await.ok()
+                } else {
+                    None
+                }
+            };
+            let dev_ranker = state.dev_ranker.snapshot().await;
+            let smart_money = state.smart_money.snapshot().await;
+            Json(MetricsResponse {
+                feeds,
+                bot,
+                strategy,
+                dev_ranker,
+                smart_money,
+            })
         }
 
         async fn set_buy_size(
@@ -438,16 +512,24 @@ async fn main() {
         match event {
             Action::Create(general_create) => {
                 println!("created {}", general_create.mint);
+                bot_metrics.note_create();
                 let creators = creators.clone();
                 let tx = manager_tx.clone();
                 let filter_config = config.clone();
                 let registry = registry.clone();
                 let mint_address = general_create.mint;
-                let buy_size = buy_size_state.clone();
+                let bot_metrics_create = bot_metrics.clone();
+                let dev_ranker_for_create = dev_ranker_handle.clone();
+                let smart_money_for_create = smart_money_handle.clone();
+                let bucket_for_score = bucket.clone();
 
                 tokio::spawn({
                     let creators = creators.clone();
                     async move {
+                        // --- Stage 1: cheap pre-gate on dev history ---------
+                        // Operator-tuned creator_config still acts as the
+                        // hard pre-filter. Score Engine runs *after* this so
+                        // we don't burn a scoring window on hopeless devs.
                         let dev_stats_opt =
                             match creators.get_creator_stats_in_sol(general_create.user).await {
                                 Ok(stats) => stats,
@@ -457,54 +539,122 @@ async fn main() {
                                 }
                             };
 
-                        match &dev_stats_opt {
-                            Some(s) => eprintln!(
-                                "[FILTER] {} stats: coins={} pnl={:.1}% holders={}",
-                                general_create.mint,
-                                s.total_coins,
-                                s.trader_pnl_average,
-                                s.total_holders_average,
-                            ),
+                        let dev_stats = match dev_stats_opt {
+                            Some(s) => s,
                             None => {
-                                eprintln!("[FILTER] {} no creator history", general_create.mint)
-                            }
-                        }
-
-                        let open_reason = match dev_stats_opt {
-                            Some(stats) => {
-                                registry.save(mint_address, stats.clone()).await;
-                                if !filter_config.creator_config.filter(&stats) {
-                                    eprintln!(
-                                        "[FILTER] {} rejected by filter",
-                                        general_create.mint
-                                    );
-                                    return;
-                                }
-                                OpenReason::DevStats(stats)
-                            }
-                            None => {
-                                // No creator history → do NOT open. We
-                                // intentionally disable the TraderStats
-                                // fallback so positions are only opened on
-                                // developers with proven track record.
                                 eprintln!(
                                     "[FILTER] {} skipped: no creator history",
                                     general_create.mint
                                 );
+                                bot_metrics_create.note_no_history();
                                 return;
                             }
                         };
 
-                        let amount_sol =
-                            f64::from_bits(buy_size.load(std::sync::atomic::Ordering::Relaxed));
+                        if !filter_config.creator_config.filter(&dev_stats) {
+                            eprintln!(
+                                "[FILTER] {} rejected by creator_config",
+                                general_create.mint
+                            );
+                            bot_metrics_create.note_filter_rejected();
+                            return;
+                        }
+                        registry.save(mint_address, dev_stats.clone()).await;
+                        bot_metrics_create.note_passed_filter();
 
-                        let _ = tx
+                        // --- Stage 2: scoring window ------------------------
+                        let initial_mcap_sol =
+                            bucket_for_score.pool().market_cap().amount().to_float();
+                        let window_ms = filter_config.scoring.scoring_window_ms;
+                        tokio::time::sleep(std::time::Duration::from_millis(window_ms)).await;
+
+                        // --- Stage 3: snapshot features ---------------------
+                        let (early_buyers, _buy_sizes_sol, buy_volume_sol, still_long, sold, bundle) =
+                            features::snapshot_early_buyers(
+                                &bucket_for_score,
+                                &filter_config.scoring.thresholds,
+                            )
+                            .await;
+
+                        let (dev_category, dev_record) =
+                            dev_ranker_for_create.category(general_create.user).await;
+                        let smart_count = smart_money_for_create
+                            .count_smart(early_buyers.all())
+                            .await;
+                        let current_mcap_sol =
+                            bucket_for_score.pool().market_cap().amount().to_float();
+
+                        let regular_buyer_count = early_buyers.regulars.len() as u64;
+                        let sniper_count = early_buyers.snipers.len() as u64;
+                        let buyers_for_position = early_buyers.all();
+
+                        let token_features = features::assemble(
+                            general_create.mint,
+                            general_create.user,
+                            Some(&dev_stats),
+                            dev_category,
+                            dev_record,
+                            initial_mcap_sol,
+                            current_mcap_sol,
+                            early_buyers,
+                            regular_buyer_count,
+                            sniper_count,
+                            buy_volume_sol,
+                            still_long,
+                            sold,
+                            bundle,
+                            smart_count,
+                        );
+
+                        let engine = ScoreEngine::new(&filter_config.scoring);
+                        let breakdown = engine.score(&token_features);
+
+                        eprintln!(
+                            "[SCORE] {} tier={:?} score={} buyers={}+{} vol={:.2} \
+                             mcap_init={:.1} mcap_now={:.1} bundle_sim={:.2} \
+                             bundle_id={:.2} dev_cat={:?} smart={} items={:?}",
+                            general_create.mint,
+                            breakdown.tier,
+                            breakdown.total,
+                            regular_buyer_count,
+                            sniper_count,
+                            buy_volume_sol,
+                            initial_mcap_sol,
+                            current_mcap_sol,
+                            token_features.bundle.similar_size_ratio,
+                            token_features.bundle.identical_size_ratio,
+                            dev_category,
+                            smart_count,
+                            breakdown.items,
+                        );
+
+                        match breakdown.tier {
+                            Tier::Skip => {
+                                bot_metrics_create.note_score_skip();
+                                return;
+                            }
+                            Tier::A => bot_metrics_create.note_score_a(),
+                            Tier::APlus => bot_metrics_create.note_score_a_plus(),
+                        }
+
+                        // --- Stage 4: dispatch to manager (which still
+                        // applies the StrategyController gate) -------------
+                        let amount_sol = breakdown.recommended_size_sol;
+                        let open_reason = OpenReason::DevStats(dev_stats);
+
+                        if tx
                             .send(PositionMessage::InitiateBuy {
-                                pool: bucket.pool().clone_box(),
+                                pool: bucket_for_score.pool().clone_box(),
                                 amount_sol,
                                 open_reason,
+                                dev_address: Some(general_create.user),
+                                early_buyers: buyers_for_position,
                             })
-                            .await;
+                            .await
+                            .is_ok()
+                        {
+                            bot_metrics_create.note_position_initiated();
+                        }
                     }
                 });
 
