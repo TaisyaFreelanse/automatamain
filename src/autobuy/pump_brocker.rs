@@ -316,11 +316,33 @@ impl Broker for SolanaBroker {
             ));
         }
 
-        // Slippage-aware min_sol_out.
+        // pump.fun's `Sell` ix uses Anchor error `TooLittleSolReceived`
+        // (6003 / 0x1773) when the actual SOL out is below `min_sol_out`.
+        // The "moment price" we get from `pool.price()` is the tangent of
+        // the bonding curve at the current reserves — it *overstates* the
+        // SOL we'll actually receive once curve slippage + pump's ~1% fee
+        // are applied. Pair that with the 5% `slippage_bps` from config and
+        // every sell of a small fresh position fails preflight.
+        //
+        // For a bot, every `sell()` is an exit decision (take-profit,
+        // stop-loss, time-kill, regime pause). Slippage protection that
+        // prevents the exit is worse than the exit at any price, so we set
+        // `min_sol_out = 0` and rely on the curve to give us what it gives.
+        // Pump's bonding-curve has no router / MEV sandwich vector on a
+        // single ix, so the practical risk is just the natural curve impact.
+        // We still log the *expected* SOL (using the configured slippage
+        // pad) so audit/PnL tooling sees what we'd have wanted.
         let price_sol_per_token = pool.price().amount().to_float().max(0.0);
         let expected_sol = actual_token_amount * price_sol_per_token;
         let slip = self.exec_cfg.slippage_bps as f64 / 10_000.0;
-        let min_sol_out_f = (expected_sol * (1.0 - slip)).max(0.0);
+        let expected_sol_after_slip = (expected_sol * (1.0 - slip)).max(0.0);
+        let min_sol_out_f = 0.0_f64;
+
+        eprintln!(
+            "[BROKER SELL] mint={} tokens={:.2} expected={:.6} SOL (price={:.9}) \
+             min_out=0 (slippage waived for guaranteed exit)",
+            mint, actual_token_amount, expected_sol, price_sol_per_token,
+        );
 
         let token_amount_in = sips::helper::Amount::<6>::from_float(actual_token_amount);
         let min_sol_out = sips::helper::Amount::<9>::from_float(min_sol_out_f);
@@ -344,8 +366,11 @@ impl Broker for SolanaBroker {
         // `balance_sol()` reflects the proceeds before the WS event arrives.
         // Optimistic credit at the *expected* price is fine here — the real
         // value is reconciled on `on_trade` / `refresh_onchain_balance`.
+        // Note: we report `expected_sol_after_slip` (not the on-chain
+        // `min_sol_out=0`) so PnL tooling doesn't think every sell was a
+        // total loss while we wait for the WS event.
         Ok(SellReceipt {
-            sol_received: min_sol_out_f,
+            sol_received: expected_sol_after_slip,
             signature: Some(sig_str),
         })
     }
