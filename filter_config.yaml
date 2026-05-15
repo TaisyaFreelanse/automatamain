@@ -21,7 +21,13 @@ buy_config:
   tp1_sell_pct: 30.0
   tp2_pct: 50.0
   tp2_sell_pct: 50.0
-  exit_profit_floor: -20.0
+  tp3_pct: 100.0
+  tp3_sell_pct: 10.0
+  tp4_pct: 150.0
+  tp4_sell_pct: 10.0
+  tp5_pct: 200.0
+  tp5_sell_pct: 10.0
+  exit_profit_floor: -16.0
   time_kill_secs: 25
   time_kill_min_profit_pct: 10.0
   trailing_stop_drawdown_pct: 30.0

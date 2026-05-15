@@ -34,6 +34,25 @@ use tokio::{
 
 // --- КОНФИГУРАЦИЯ ---
 
+fn default_tp3_pct() -> f64 {
+    100.0
+}
+fn default_tp3_sell_pct() -> f64 {
+    10.0
+}
+fn default_tp4_pct() -> f64 {
+    150.0
+}
+fn default_tp4_sell_pct() -> f64 {
+    10.0
+}
+fn default_tp5_pct() -> f64 {
+    200.0
+}
+fn default_tp5_sell_pct() -> f64 {
+    10.0
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SmartBuyConfig {
     /// SOL amount to spend per buy
@@ -46,6 +65,21 @@ pub struct SmartBuyConfig {
     pub tp2_pct: f64,
     /// Take Profit 2 sell size (% of current holdings)
     pub tp2_sell_pct: f64,
+    /// Take Profit 3 — partial at high mcap PnL (default +100%)
+    #[serde(default = "default_tp3_pct")]
+    pub tp3_pct: f64,
+    #[serde(default = "default_tp3_sell_pct")]
+    pub tp3_sell_pct: f64,
+    /// Take Profit 4 (default +150%)
+    #[serde(default = "default_tp4_pct")]
+    pub tp4_pct: f64,
+    #[serde(default = "default_tp4_sell_pct")]
+    pub tp4_sell_pct: f64,
+    /// Take Profit 5 (default +200%)
+    #[serde(default = "default_tp5_pct")]
+    pub tp5_pct: f64,
+    #[serde(default = "default_tp5_sell_pct")]
+    pub tp5_sell_pct: f64,
     /// Initial stop loss — stored as profit floor, always use negative for a loss
     /// (e.g. -25.0 means "exit if profit drops below -25%").
     /// After smart-stop / trailing activation this floor is raised to a positive value
@@ -67,6 +101,12 @@ impl Default for SmartBuyConfig {
             tp1_sell_pct: 30.0,
             tp2_pct: 50.0,
             tp2_sell_pct: 15.0,
+            tp3_pct: default_tp3_pct(),
+            tp3_sell_pct: default_tp3_sell_pct(),
+            tp4_pct: default_tp4_pct(),
+            tp4_sell_pct: default_tp4_sell_pct(),
+            tp5_pct: default_tp5_pct(),
+            tp5_sell_pct: default_tp5_sell_pct(),
             exit_profit_floor: -40.0, // lose at most 25%
             time_kill_secs: 25,
             time_kill_min_profit_pct: 10.0,
@@ -595,6 +635,27 @@ impl PositionManagerActor {
                 pos.tp2_triggered = true;
                 pos.pending_partial_sell = true;
                 actions.push((*mint, self.config.tp2_sell_pct, "TP2".to_string()));
+                continue;
+            }
+
+            if profit >= self.config.tp3_pct && !pos.tp3_triggered {
+                pos.tp3_triggered = true;
+                pos.pending_partial_sell = true;
+                actions.push((*mint, self.config.tp3_sell_pct, "TP3 +100%".to_string()));
+                continue;
+            }
+
+            if profit >= self.config.tp4_pct && !pos.tp4_triggered {
+                pos.tp4_triggered = true;
+                pos.pending_partial_sell = true;
+                actions.push((*mint, self.config.tp4_sell_pct, "TP4 +150%".to_string()));
+                continue;
+            }
+
+            if profit >= self.config.tp5_pct && !pos.tp5_triggered {
+                pos.tp5_triggered = true;
+                pos.pending_partial_sell = true;
+                actions.push((*mint, self.config.tp5_sell_pct, "TP5 +200%".to_string()));
             }
         }
 
@@ -679,6 +740,15 @@ impl PositionManagerActor {
             }
             if pos.tp2_triggered {
                 status.push_str(" [TP2]");
+            }
+            if pos.tp3_triggered {
+                status.push_str(" [TP3]");
+            }
+            if pos.tp4_triggered {
+                status.push_str(" [TP4]");
+            }
+            if pos.tp5_triggered {
+                status.push_str(" [TP5]");
             }
             if pos.pending_partial_sell {
                 status.push_str(" [PARTIAL]");
