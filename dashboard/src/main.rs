@@ -1465,6 +1465,8 @@ async fn ws_loop(
                         balance_sol: f64,
                         #[serde(default)]
                         mode: Option<String>,
+                        #[serde(default)]
+                        wallet: Option<String>,
                     }
                     let url = format!("{}/status", http_url);
                     let tx2 = tx.clone();
@@ -1476,6 +1478,9 @@ async fn ws_loop(
                                     paused: s.paused,
                                     mode: s.mode,
                                 });
+                                if let Some(pk) = s.wallet {
+                                    let _ = tx2.send(AppEvent::Pubkey(pk));
+                                }
                                 let _ = tx2.send(AppEvent::Msg(WsMsg::BalanceUpdate {
                                     balance: s.balance_sol,
                                 }));

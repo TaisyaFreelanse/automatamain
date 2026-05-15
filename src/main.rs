@@ -462,6 +462,7 @@ async fn main() {
                 paused: bool,
                 balance_sol: f64,
                 mode: &'static str,
+                wallet: String,
             }
             Json(Status {
                 paused: state.paused.load(std::sync::atomic::Ordering::Relaxed),
@@ -469,6 +470,7 @@ async fn main() {
                     state.balance.load(std::sync::atomic::Ordering::Relaxed),
                 ),
                 mode: state.mode,
+                wallet: state.pubkey.clone(),
             })
         }
 
