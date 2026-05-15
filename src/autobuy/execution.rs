@@ -106,7 +106,10 @@ pub struct ExecutionConfig {
 ///   (matches the existing `start_balance_sol` yaml setting).
 /// * In Live mode, expects `PRIVATE_KEY` and `SOLANA_HTTP` (overridable via
 ///   `SOLANA_RPC_URL`) env vars. Falls back to a clear error message if not
-///   set so we never silently start a live bot without a wallet.
+///   set so we never silently start a live bot without a wallet. If the RPC
+///   returns only transient errors while fetching the initial balance (e.g.
+///   HTTP 429), the broker starts with `demo_start_balance_sol` from yaml as a
+///   placeholder until the background balance refresh succeeds.
 pub async fn build_broker(
     cfg: &ExecutionConfig,
     demo_start_balance_sol: f64,
@@ -147,9 +150,15 @@ pub async fn build_broker(
                 cfg.live.balance_refresh_secs,
             );
 
-            let broker = SolanaBroker::new(rpc_url, wallet_address, keypair, cfg.live.clone())
-                .await
-                .map_err(|e| format!("SolanaBroker init failed: {e}"))?;
+            let broker = SolanaBroker::new(
+                rpc_url,
+                wallet_address,
+                keypair,
+                cfg.live.clone(),
+                demo_start_balance_sol,
+            )
+            .await
+            .map_err(|e| format!("SolanaBroker init failed: {e}"))?;
             Ok(Arc::new(broker))
         }
     }

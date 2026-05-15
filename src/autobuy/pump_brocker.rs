@@ -51,16 +51,27 @@ pub struct SolanaBroker {
 
 impl SolanaBroker {
     /// Initializes the broker and fetches the actual SOL balance from the blockchain.
+    ///
+    /// `balance_init_placeholder_sol` — from yaml `start_balance_sol`; used **only** if RPC
+    /// keeps returning transient errors (e.g. HTTP 429) so the process can still boot and
+    /// expose `/status` + WS; the refresh task will replace this with the real on-chain
+    /// balance as soon as RPC responds.
     pub async fn new(
         rpc_url: String,
         wallet_address: SolAddress,
         keypair: Arc<Keypair>,
         exec_cfg: LiveExecutionConfig,
+        balance_init_placeholder_sol: f64,
     ) -> Result<Self, BrokerError> {
         let rpc_client = Arc::new(RpcClient::new(rpc_url));
 
-        let initial_balance_sol =
-            fetch_balance_sol_with_retry(&rpc_client, &wallet_address, "init").await?;
+        let initial_balance_sol = fetch_balance_sol_with_retry(
+            &rpc_client,
+            &wallet_address,
+            "init",
+            Some(balance_init_placeholder_sol),
+        )
+        .await?;
 
         println!(
             "[BROKER INIT] Starting SOL Balance: {:.6}",
@@ -302,8 +313,13 @@ impl Broker for SolanaBroker {
 
     async fn refresh_onchain_balance(&self) -> Result<(), BrokerError> {
         let onchain =
-            fetch_balance_sol_with_retry(&self.rpc_client, &self.wallet_address, "refresh")
-                .await?;
+            fetch_balance_sol_with_retry(
+                &self.rpc_client,
+                &self.wallet_address,
+                "refresh",
+                None,
+            )
+            .await?;
         *self.balance.lock().unwrap() = onchain;
         Ok(())
     }
@@ -408,35 +424,64 @@ async fn fetch_balance_sol_with_retry(
     rpc: &RpcClient,
     wallet: &SolAddress,
     label: &str,
+    transient_exhausted_placeholder: Option<f64>,
 ) -> Result<f64, BrokerError> {
-    const MAX_ATTEMPTS: u32 = 24;
+    // Boot: fewer attempts then yaml placeholder so `/status` comes up under RPC 429 storms.
+    // Refresh: keep trying longer — no placeholder.
+    let max_attempts = if transient_exhausted_placeholder.is_some() {
+        8u32
+    } else {
+        24u32
+    };
 
-    for attempt in 1..=MAX_ATTEMPTS {
+    let mut last_err: Option<BrokerError> = None;
+    for attempt in 1..=max_attempts {
         match fetch_balance_sol(rpc, wallet).await {
             Ok(v) => return Ok(v),
             Err(e) => {
                 let msg = e.to_string();
-                if attempt >= MAX_ATTEMPTS || !is_transient_balance_error(&msg) {
-                    return Err(e);
+                last_err = Some(e);
+                if !is_transient_balance_error(&msg) {
+                    return Err(last_err.expect("last_err set"));
+                }
+                if attempt >= max_attempts {
+                    break;
                 }
                 eprintln!(
                     "[BROKER] get_balance ({label}) transient error attempt {}/{}: {}",
-                    attempt, MAX_ATTEMPTS, msg
+                    attempt, max_attempts, msg
                 );
-                backoff_balance(attempt).await;
+                backoff_balance(attempt, &msg).await;
             }
         }
     }
-    Err(BrokerError::Custom(
-        "get_balance: exhausted retries (unexpected)".into(),
-    ))
+
+    let e = last_err.expect("retry loop must have produced an error");
+    let msg = e.to_string();
+    if let Some(fallback) = transient_exhausted_placeholder {
+        if is_transient_balance_error(&msg) {
+            eprintln!(
+                "[BROKER] get_balance ({label}): RPC still failing after {max_attempts} attempts; \
+                 using placeholder balance {fallback:.6} SOL until refresh succeeds. Last: {msg}"
+            );
+            return Ok(fallback);
+        }
+    }
+    Err(e)
 }
 
-async fn backoff_balance(attempt: u32) {
-    // Slower than tx backoff — avoids hammering Helius when returning 429.
-    let shift = attempt.saturating_sub(1).min(7);
-    let ms = (500u64.saturating_mul(1u64 << shift)).min(15_000);
-    tokio::time::sleep(Duration::from_millis(ms)).await;
+async fn backoff_balance(attempt: u32, err_msg: &str) {
+    let m = err_msg.to_lowercase();
+    let is_429 = m.contains("429") || m.contains("too many requests");
+    if is_429 {
+        // Helius rate limits: short exponential backoff in seconds (cap 90s).
+        let secs = (5u64 + u64::from(attempt).saturating_mul(7)).min(90);
+        tokio::time::sleep(Duration::from_secs(secs)).await;
+    } else {
+        let shift = attempt.saturating_sub(1).min(7);
+        let ms = (500u64.saturating_mul(1u64 << shift)).min(15_000);
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
 }
 
 async fn backoff(attempt: u32) {
