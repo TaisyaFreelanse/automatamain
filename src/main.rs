@@ -813,6 +813,14 @@ async fn main() {
                             );
                             return;
                         }
+                        eprintln!(
+                            "[BUY GATE] {} tier={:?} tier_sol={:.6} operator_cap={:.6} final_amount_sol={:.6}",
+                            general_create.mint,
+                            breakdown.tier,
+                            breakdown.recommended_size_sol,
+                            operator_cap,
+                            amount_sol,
+                        );
                         let open_reason = OpenReason::DevStats(dev_stats);
 
                         if tx
