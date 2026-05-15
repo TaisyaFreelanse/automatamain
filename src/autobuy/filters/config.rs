@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    autobuy::{filters::creator::CreatorStatisticsFilter, manager::SmartBuyConfig},
+    autobuy::{
+        execution::ExecutionConfig, filters::creator::CreatorStatisticsFilter,
+        manager::SmartBuyConfig,
+    },
     scoring::config::{PersistenceConfig, ScoringConfig, StrategyConfig},
 };
 
@@ -25,4 +28,9 @@ pub struct Config {
     /// New: where to persist dev_ranker / smart_money json.
     #[serde(default)]
     pub persistence: PersistenceConfig,
+
+    /// New: demo (MockBroker) vs live (SolanaBroker) execution + live knobs.
+    /// Default is demo, so existing yaml files keep running in simulation.
+    #[serde(default)]
+    pub execution: ExecutionConfig,
 }

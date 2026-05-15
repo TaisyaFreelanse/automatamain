@@ -3,7 +3,7 @@ use futures::{SinkExt, StreamExt};
 use loggaper::{
     autobuy::{
         broker::Broker,
-        broker_mock::MockBroker,
+        execution::build_broker,
         manager::{OpenReason, PositionManagerActor, PositionMessage, WsCommand, WsFeedMessage},
         performance_tracker::{CreatorRegistryHandle, PerformanceTrackerHandle},
     },
@@ -64,11 +64,15 @@ async fn main() {
         balance: std::sync::Arc<std::sync::atomic::AtomicU64>,
         buy_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
         pubkey: String,
+        mode: &'static str,
         feed_metrics: Arc<Vec<Arc<FeedMetrics>>>,
         bot_metrics: Arc<BotMetrics>,
         manager_tx: mpsc::Sender<PositionMessage>,
         dev_ranker: DevRankerHandle,
         smart_money: SmartMoneyHandle,
+        tx_log: Arc<std::sync::Mutex<std::collections::VecDeque<WsFeedMessage>>>,
+        config_path: String,
+        live_cfg: loggaper::autobuy::execution::LiveExecutionConfig,
     }
 
     let (waiter_actor, waiter_handle) = DatabaseCreateWaiter::new();
@@ -80,14 +84,22 @@ async fn main() {
     let (general_tx, mut general_rx) = mpsc::channel(2048);
     let (broadcast_tx, _) = broadcast::channel::<WsFeedMessage>(4096);
 
-    let private_key = std::env::var("PRIVATE_KEY").unwrap();
-    let keypair = Arc::new(Keypair::from_base58_string(&private_key));
-    let pubkey_string = keypair.pubkey().to_string();
+    // Wallet pubkey is only displayed by `/pubkey` — derived lazily so demo
+    // mode does not require a `PRIVATE_KEY` env to be set.
+    let pubkey_string = std::env::var("PRIVATE_KEY")
+        .ok()
+        .map(|sk| Keypair::from_base58_string(&sk).pubkey().to_string())
+        .unwrap_or_else(|| "demo-no-wallet".to_string());
 
-    // Mock broker starts at the configured start balance (SOL). Keep this
-    // in sync with `start_balance_sol` in filter_config.yaml so the manager
-    // and the broker report the same initial balance.
-    let broker = Arc::new(MockBroker::new(config.start_balance_sol));
+    // Broker is chosen based on `execution.mode` in `filter_config.yaml`:
+    //   demo -> MockBroker (start_balance_sol)
+    //   live -> SolanaBroker (real wallet + mainnet RPC, slippage/priority/retries)
+    // The rest of the bot uses the `Broker` trait, so PositionManagerActor
+    // and the scoring/strategy pipeline are unchanged.
+    let broker: Arc<dyn Broker> = build_broker(&config.execution, config.start_balance_sol)
+        .await
+        .expect("Failed to build broker");
+    println!("[BOOT] Broker active: {}", broker.mode_label());
 
     // Persistent dev ranking + smart-money registries. Both are actors that
     // own their own state and flush JSON to disk every N seconds.
@@ -108,9 +120,25 @@ async fn main() {
     // Default buy size of 0.6 SOL, stored as f64 bits in an AtomicU64
     let buy_size_state = Arc::new(std::sync::atomic::AtomicU64::new(f64::to_bits(0.6_f64)));
 
+    // Bounded ring buffer of recent tx events (buy / sell / failed) — both
+    // demo and live. Surfaced via `GET /tx-log` and used by the dashboard.
+    const TX_LOG_CAPACITY: usize = 200;
+    let tx_log: Arc<std::sync::Mutex<std::collections::VecDeque<WsFeedMessage>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
+            TX_LOG_CAPACITY,
+        )));
+
     let broadcast_tx_bridge = broadcast_tx.clone();
+    let tx_log_bridge = tx_log.clone();
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
+            if matches!(event, WsFeedMessage::TxEvent { .. })
+                && let Ok(mut log) = tx_log_bridge.lock() {
+                if log.len() >= TX_LOG_CAPACITY {
+                    log.pop_front();
+                }
+                log.push_back(event.clone());
+            }
             let _ = broadcast_tx_bridge.send(event);
         }
     });
@@ -238,12 +266,24 @@ async fn main() {
         run_ws_server(&ws_addr, broadcast_tx, ws_manager_tx).await;
     });
 
+    let balance_refresh_secs = config.execution.live.balance_refresh_secs.max(1);
     tokio::spawn({
         let broker = broker.clone();
         let balance_state = balance_state.clone();
 
         async move {
+            let mut tick_count: u64 = 0;
             loop {
+                tick_count = tick_count.wrapping_add(1);
+
+                // Pull a fresh value from RPC on the configured cadence; on
+                // the other ticks reuse the broker's cached value. For the
+                // mock broker `refresh_onchain_balance` is a no-op.
+                if tick_count.is_multiple_of(balance_refresh_secs)
+                    && let Err(e) = broker.refresh_onchain_balance().await {
+                    eprintln!("[BROKER] balance refresh failed: {e}");
+                }
+
                 if let Ok(bal) = broker.balance_sol().await {
                     balance_state.store(f64::to_bits(bal), Ordering::Relaxed);
                 }
@@ -259,11 +299,15 @@ async fn main() {
         balance: balance_state,
         buy_size: buy_size_state.clone(),
         pubkey: pubkey_string,
+        mode: broker.mode_label(),
         feed_metrics: feed_metrics_vec.clone(),
         bot_metrics: bot_metrics.clone(),
         manager_tx: manager_tx.clone(),
         dev_ranker: dev_ranker_handle.clone(),
         smart_money: smart_money_handle.clone(),
+        tx_log: tx_log.clone(),
+        config_path: "filter_config.yaml".to_string(),
+        live_cfg: config.execution.live.clone(),
     };
 
     let http_addr = format!("0.0.0.0:{}", config.http_port);
@@ -417,12 +461,14 @@ async fn main() {
             struct Status {
                 paused: bool,
                 balance_sol: f64,
+                mode: &'static str,
             }
             Json(Status {
                 paused: state.paused.load(std::sync::atomic::Ordering::Relaxed),
                 balance_sol: f64::from_bits(
                     state.balance.load(std::sync::atomic::Ordering::Relaxed),
                 ),
+                mode: state.mode,
             })
         }
 
@@ -473,6 +519,108 @@ async fn main() {
             })
         }
 
+        async fn get_tx_log(State(state): State<ApiState>) -> impl IntoResponse {
+            let snapshot: Vec<WsFeedMessage> = match state.tx_log.lock() {
+                Ok(log) => log.iter().cloned().collect(),
+                Err(_) => Vec::new(),
+            };
+            Json(snapshot)
+        }
+
+        async fn get_mode(State(state): State<ApiState>) -> impl IntoResponse {
+            #[derive(serde::Serialize)]
+            struct ModeResponse {
+                mode: &'static str,
+                wallet: String,
+                balance_sol: f64,
+                live: loggaper::autobuy::execution::LiveExecutionConfig,
+            }
+            Json(ModeResponse {
+                mode: state.mode,
+                wallet: state.pubkey.clone(),
+                balance_sol: f64::from_bits(
+                    state.balance.load(std::sync::atomic::Ordering::Relaxed),
+                ),
+                live: state.live_cfg.clone(),
+            })
+        }
+
+        /// PUT /mode { "mode": "demo" | "live" }
+        ///
+        /// Writes the new mode into `filter_config.yaml` and returns a
+        /// `restart_required` flag. Switching to live REQUIRES the request
+        /// header `X-Confirm-Live: yes`; without it the bot rejects the
+        /// switch — a deliberate safety gate so a stray click in the
+        /// dashboard never starts spending real funds.
+        async fn put_mode(
+            State(state): State<ApiState>,
+            headers: axum::http::HeaderMap,
+            Json(body): Json<serde_json::Value>,
+        ) -> impl IntoResponse {
+            let target = match body.get("mode").and_then(|v| v.as_str()) {
+                Some("demo") => "demo",
+                Some("live") => "live",
+                _ => {
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": "mode must be 'demo' or 'live'"})),
+                    )
+                        .into_response();
+                }
+            };
+
+            if target == "live" {
+                let confirmed = headers
+                    .get("x-confirm-live")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.eq_ignore_ascii_case("yes"))
+                    .unwrap_or(false);
+                if !confirmed {
+                    return (
+                        axum::http::StatusCode::FORBIDDEN,
+                        Json(serde_json::json!({
+                            "error": "live mode requires X-Confirm-Live: yes header",
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+
+            // Rewrite filter_config.yaml in place. We only touch the
+            // `execution.mode` field — everything else is preserved.
+            let path = &state.config_path;
+            let content = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(e) => {
+                    return (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": format!("read {path}: {e}")})),
+                    )
+                        .into_response();
+                }
+            };
+
+            let new_content = rewrite_yaml_mode(&content, target);
+            if let Err(e) = std::fs::write(path, &new_content) {
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("write {path}: {e}")})),
+                )
+                    .into_response();
+            }
+
+            let restart_required = state.mode != target;
+            (
+                axum::http::StatusCode::OK,
+                Json(serde_json::json!({
+                    "mode": target,
+                    "current_mode": state.mode,
+                    "restart_required": restart_required,
+                })),
+            )
+                .into_response()
+        }
+
         async fn set_buy_size(
             State(state): State<ApiState>,
             Json(body): Json<serde_json::Value>,
@@ -499,6 +647,8 @@ async fn main() {
             .route("/chart/{mint}", get(get_chart))
             .route("/buy-size", get(get_buy_size).put(set_buy_size))
             .route("/metrics", get(get_metrics))
+            .route("/tx-log", get(get_tx_log))
+            .route("/mode", get(get_mode).put(put_mode))
             .with_state(api_state);
 
         let listener = tokio::net::TcpListener::bind(&http_addr)
@@ -679,6 +829,12 @@ async fn main() {
                 let trade_action = Arc::new(trade_action);
                 let bucket = Arc::new(bucket);
 
+                // Authoritative reconciliation hook for the broker. For the
+                // SolanaBroker this updates tracked token holdings and the
+                // cached SOL balance whenever our wallet appears in a trade.
+                // The MockBroker's default impl is a no-op.
+                broker.on_trade(trade_action.as_ref(), bucket.pool());
+
                 tokio::spawn({
                     let trades = trades.clone();
                     let trade_action = trade_action.clone();
@@ -821,5 +977,99 @@ pub async fn run_ws_server(
                 }
             }
         });
+    }
+}
+
+/// Replace the `mode:` line inside the `execution:` block of `filter_config.yaml`
+/// with the new value, preserving all other lines / formatting / comments.
+/// Falls back to appending a fresh `execution` block if the section is absent.
+fn rewrite_yaml_mode(content: &str, new_mode: &str) -> String {
+    let mut out = String::with_capacity(content.len() + 64);
+    let mut inside_exec = false;
+    let mut mode_written = false;
+    let mut saw_exec_header = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+
+        if trimmed.starts_with("execution:") {
+            inside_exec = true;
+            saw_exec_header = true;
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        if inside_exec {
+            // A new top-level key (no leading whitespace) ends the block.
+            let leading_ws = line.len() - trimmed.len();
+            let is_top_level = !line.is_empty() && leading_ws == 0;
+
+            if is_top_level {
+                if !mode_written {
+                    out.push_str(&format!("  mode: {}\n", new_mode));
+                    mode_written = true;
+                }
+                inside_exec = false;
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
+
+            // Replace existing `mode: <x>` line.
+            if !mode_written && trimmed.starts_with("mode:") {
+                let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+                out.push_str(&indent);
+                out.push_str("mode: ");
+                out.push_str(new_mode);
+                out.push('\n');
+                mode_written = true;
+                continue;
+            }
+        }
+
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    if !mode_written {
+        if !saw_exec_header {
+            out.push_str("\nexecution:\n");
+        }
+        out.push_str(&format!("  mode: {}\n", new_mode));
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rewrite_yaml_mode;
+
+    #[test]
+    fn rewrites_existing_mode_value() {
+        let yaml = "ws_port: 1\nexecution:\n  mode: demo\n  live:\n    slippage_bps: 500\n";
+        let out = rewrite_yaml_mode(yaml, "live");
+        assert!(out.contains("mode: live"));
+        assert!(!out.contains("mode: demo"));
+        assert!(out.contains("slippage_bps: 500"));
+    }
+
+    #[test]
+    fn inserts_mode_when_missing_in_block() {
+        let yaml = "ws_port: 1\nexecution:\n  live:\n    slippage_bps: 500\nhttp_port: 2\n";
+        let out = rewrite_yaml_mode(yaml, "live");
+        let exec_idx = out.find("execution:").unwrap();
+        let http_idx = out.find("http_port:").unwrap();
+        let mode_idx = out.find("mode: live").unwrap();
+        assert!(mode_idx > exec_idx && mode_idx < http_idx);
+    }
+
+    #[test]
+    fn appends_block_when_missing_entirely() {
+        let yaml = "ws_port: 1\nhttp_port: 2\n";
+        let out = rewrite_yaml_mode(yaml, "live");
+        assert!(out.contains("execution:"));
+        assert!(out.contains("mode: live"));
     }
 }

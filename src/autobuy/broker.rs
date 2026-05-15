@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use solana_address::Address;
 use thiserror::Error;
 
-use crate::generalize::general_pool::Pool;
+use crate::generalize::{general_commands::TradeAction, general_pool::Pool};
 
 // ── Receipts ──────────────────────────────────────────────────────────────────
 
@@ -11,11 +11,15 @@ pub struct BuyReceipt {
     pub sol_spent: f64,
     /// Token units received.
     pub tokens_received: f64,
+    /// On-chain transaction signature (None for demo / mock).
+    pub signature: Option<String>,
 }
 
 pub struct SellReceipt {
     /// SOL received from the sale.
     pub sol_received: f64,
+    /// On-chain transaction signature (None for demo / mock).
+    pub signature: Option<String>,
 }
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -52,6 +56,23 @@ pub trait Broker: Send + Sync {
         pool: &dyn Pool,
     ) -> Result<SellReceipt, BrokerError>;
 
-    /// Current SOL balance.
+    /// Current SOL balance (locally cached value — call
+    /// [`refresh_onchain_balance`] to pull a fresh value from the chain).
     async fn balance_sol(&self) -> Result<f64, BrokerError>;
+
+    /// Re-read the wallet balance from the RPC. No-op for in-memory brokers.
+    /// Live brokers override this and use it for periodic reconciliation.
+    async fn refresh_onchain_balance(&self) -> Result<(), BrokerError> {
+        Ok(())
+    }
+
+    /// Called for every trade observed on the live feed. Live brokers use this
+    /// to update tracked token holdings / cached SOL balance from the
+    /// authoritative on-chain events. Demo/mock brokers ignore it.
+    fn on_trade(&self, _trade: &TradeAction, _pool: &dyn Pool) {}
+
+    /// Human-readable broker label for logs and the `/status` endpoint.
+    fn mode_label(&self) -> &'static str {
+        "unknown"
+    }
 }

@@ -59,7 +59,7 @@ impl Broker for MockBroker {
             MockPosition { tokens: tokens_received, entry_mcap },
         );
 
-        Ok(BuyReceipt { sol_spent: amount_sol, tokens_received })
+        Ok(BuyReceipt { sol_spent: amount_sol, tokens_received, signature: None })
     }
 
     async fn sell(
@@ -94,10 +94,14 @@ impl Broker for MockBroker {
 
         *self.balance.lock().unwrap() += sol_received;
 
-        Ok(SellReceipt { sol_received })
+        Ok(SellReceipt { sol_received, signature: None })
     }
 
     async fn balance_sol(&self) -> Result<f64, BrokerError> {
         Ok(*self.balance.lock().unwrap())
+    }
+
+    fn mode_label(&self) -> &'static str {
+        "demo"
     }
 }

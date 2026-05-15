@@ -90,6 +90,35 @@ pub enum WsMsg {
     PausedState {
         paused: bool,
     },
+    TxEvent {
+        kind: TxEventKind,
+        mint: String,
+        signature: Option<String>,
+        amount_sol: f64,
+        status: String,
+        reason: Option<String>,
+        mode: String,
+        ts: i64,
+    },
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TxEventKind {
+    Buy,
+    Sell,
+}
+
+#[derive(Clone, Debug)]
+pub struct TxLogRow {
+    pub kind: TxEventKind,
+    pub mint: String,
+    pub signature: Option<String>,
+    pub amount_sol: f64,
+    pub status: String,
+    pub reason: Option<String>,
+    pub mode: String,
+    pub ts: i64,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -126,12 +155,36 @@ enum WsCmd {
     SetPaused { paused: bool },
 }
 
+#[derive(Deserialize, Clone, Debug)]
+pub struct LiveCfg {
+    pub slippage_bps: u32,
+    pub priority_fee_micro_lamports: u64,
+    pub compute_unit_limit: u32,
+    pub max_retries: u32,
+    pub balance_refresh_secs: u64,
+    #[serde(default)]
+    pub skip_preflight: bool,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct ModeInfo {
+    pub mode: String,
+    pub wallet: String,
+    pub balance_sol: f64,
+    pub live: LiveCfg,
+}
+
 enum DashCmd {
     Ws(WsCmd),
     FetchDevStats(String),
     FetchChart(String),
     FetchBuySize,
     SetBuySize(f64),
+    FetchMode,
+    FetchTxLog,
+    /// Switch broker mode. `confirm_live` must be true to switch to live;
+    /// the dashboard enforces this via a two-step typed confirmation.
+    SetMode { mode: String, confirm_live: bool },
 }
 
 // ── App events ────────────────────────────────────────────────────────────────
@@ -143,6 +196,7 @@ enum AppEvent {
     BotTrades(Vec<BotTradeRow>),
     Status {
         paused: bool,
+        mode: Option<String>,
     },
     DevStats {
         mint: String,
@@ -157,6 +211,13 @@ enum AppEvent {
     BuySize(f64),
     BuySizeSetOk,
     BuySizeSetErr(String),
+    ModeInfo(ModeInfo),
+    TxLog(Vec<TxLogRow>),
+    ModeSetOk {
+        mode: String,
+        restart_required: bool,
+    },
+    ModeSetErr(String),
 }
 
 // ── Positions ─────────────────────────────────────────────────────────────────
@@ -178,6 +239,22 @@ struct ConfigPanel {
     buy_size_input: String,
     buy_size_status: Option<String>,
     buy_size_saving: bool,
+
+    /// Last known mode info from the backend. None until /mode has answered.
+    mode_info: Option<ModeInfo>,
+    /// True after the user clicks "Switch to Live" but before they finish the
+    /// typed-confirmation. While true, the dashboard renders the confirm UI.
+    pending_live_switch: bool,
+    /// User-typed confirmation text. Must equal "LIVE" to enable the final
+    /// confirm button.
+    confirm_input: String,
+    /// In-flight indicator for the PUT /mode request.
+    mode_saving: bool,
+    /// Last status message for the mode block (✓ ok / ✗ err).
+    mode_status: Option<String>,
+    /// True when the user has changed mode at runtime; surfaces a restart
+    /// banner until the user actually restarts the bot.
+    restart_required: bool,
 }
 
 impl ConfigPanel {
@@ -188,6 +265,12 @@ impl ConfigPanel {
             buy_size_input: String::new(),
             buy_size_status: None,
             buy_size_saving: false,
+            mode_info: None,
+            pending_live_switch: false,
+            confirm_input: String::new(),
+            mode_saving: false,
+            mode_status: None,
+            restart_required: false,
         }
     }
 
@@ -225,6 +308,14 @@ struct Dashboard {
     chart_window: Option<(String, ChartData)>,
     sol_price: Option<f64>,
     pubkey: Option<String>,
+    /// Currently active broker mode reported by `/status` (`"demo"` / `"live"`).
+    mode: Option<String>,
+    /// Bounded log of recent tx events (buy/sell/failed) — live signatures
+    /// and demo synthetic entries share the same row format.
+    tx_log: std::collections::VecDeque<TxLogRow>,
+    /// Last UI tick when we polled `/tx-log` and `/mode` over HTTP. Keeps the
+    /// dashboard tolerant of WS gaps without spamming the backend.
+    last_http_poll: Option<std::time::Instant>,
     config_panel: ConfigPanel,
 }
 
@@ -255,6 +346,9 @@ impl Dashboard {
             chart_window: None,
             sol_price: None,
             pubkey: None,
+            mode: None,
+            tx_log: std::collections::VecDeque::with_capacity(256),
+            last_http_poll: None,
             config_panel: ConfigPanel::new(),
         }
     }
@@ -265,7 +359,47 @@ impl Dashboard {
                 AppEvent::Connected => self.connected = true,
                 AppEvent::Disconnected => self.connected = false,
                 AppEvent::BotTrades(rows) => self.history = rows,
-                AppEvent::Status { paused } => self.paused = paused,
+                AppEvent::Status { paused, mode } => {
+                    self.paused = paused;
+                    if let Some(m) = mode {
+                        self.mode = Some(m);
+                    }
+                }
+                AppEvent::ModeInfo(info) => {
+                    self.mode = Some(info.mode.clone());
+                    self.config_panel.mode_info = Some(info);
+                }
+                AppEvent::TxLog(rows) => {
+                    self.tx_log.clear();
+                    for r in rows {
+                        if self.tx_log.len() >= 256 {
+                            self.tx_log.pop_front();
+                        }
+                        self.tx_log.push_back(r);
+                    }
+                }
+                AppEvent::ModeSetOk {
+                    mode,
+                    restart_required,
+                } => {
+                    self.config_panel.mode_saving = false;
+                    self.config_panel.pending_live_switch = false;
+                    self.config_panel.confirm_input.clear();
+                    self.config_panel.restart_required = restart_required;
+                    self.config_panel.mode_status = Some(format!(
+                        "✓ saved (mode={})  — {}",
+                        mode,
+                        if restart_required {
+                            "restart bot to activate"
+                        } else {
+                            "no change"
+                        }
+                    ));
+                }
+                AppEvent::ModeSetErr(msg) => {
+                    self.config_panel.mode_saving = false;
+                    self.config_panel.mode_status = Some(format!("✗ {}", msg));
+                }
                 AppEvent::SolPrice(price) => self.sol_price = Some(price),
                 AppEvent::Pubkey(key) => self.pubkey = Some(key),
                 AppEvent::BuySize(sol) => self.config_panel.on_loaded(sol),
@@ -324,6 +458,30 @@ impl Dashboard {
                     }
                     WsMsg::BalanceUpdate { balance } => self.balance = Some(balance),
                     WsMsg::PausedState { paused } => self.paused = paused,
+                    WsMsg::TxEvent {
+                        kind,
+                        mint,
+                        signature,
+                        amount_sol,
+                        status,
+                        reason,
+                        mode,
+                        ts,
+                    } => {
+                        if self.tx_log.len() >= 256 {
+                            self.tx_log.pop_front();
+                        }
+                        self.tx_log.push_back(TxLogRow {
+                            kind,
+                            mint,
+                            signature,
+                            amount_sol,
+                            status,
+                            reason,
+                            mode,
+                            ts,
+                        });
+                    }
                 },
             }
         }
@@ -335,6 +493,159 @@ impl Dashboard {
         } else {
             format!("{:.*} SOL", decimals, val_sol)
         }
+    }
+
+    fn render_mode_block(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_min_width(320.0);
+
+            // Current mode + summary.
+            let current = self
+                .config_panel
+                .mode_info
+                .as_ref()
+                .map(|m| m.mode.clone())
+                .or_else(|| self.mode.clone())
+                .unwrap_or_else(|| "unknown".into());
+
+            let (lbl, col) = match current.as_str() {
+                "live" => ("⚠ LIVE", egui::Color32::from_rgb(255, 80, 80)),
+                "demo" => ("● DEMO", egui::Color32::from_rgb(120, 220, 120)),
+                _ => ("…", egui::Color32::GRAY),
+            };
+
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Current:").strong());
+                ui.colored_label(col, egui::RichText::new(lbl).strong());
+            });
+
+            if let Some(info) = &self.config_panel.mode_info {
+                ui.label(format!(
+                    "Wallet: {} | Balance: {:.4} SOL",
+                    short_addr(&info.wallet),
+                    info.balance_sol
+                ));
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Live cfg: slip={}bps fee={}μL/CU CU={} retries={}",
+                        info.live.slippage_bps,
+                        info.live.priority_fee_micro_lamports,
+                        info.live.compute_unit_limit,
+                        info.live.max_retries,
+                    ))
+                    .small()
+                    .color(egui::Color32::GRAY),
+                );
+            }
+
+            ui.add_space(6.0);
+
+            // Switch actions. Switching to LIVE always goes through the
+            // typed-confirm flow; switching to DEMO is one click since it's
+            // always safer.
+            if self.config_panel.pending_live_switch {
+                ui.label(
+                    egui::RichText::new("⚠ Type LIVE to confirm switching to real trading:")
+                        .color(egui::Color32::from_rgb(255, 150, 60))
+                        .strong(),
+                );
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.config_panel.confirm_input)
+                            .desired_width(120.0)
+                            .hint_text("LIVE"),
+                    );
+                    let armed = self.config_panel.confirm_input == "LIVE"
+                        && !self.config_panel.mode_saving;
+                    let btn_color = if armed {
+                        egui::Color32::from_rgb(255, 80, 80)
+                    } else {
+                        egui::Color32::GRAY
+                    };
+                    let label = if self.config_panel.mode_saving {
+                        "Switching…"
+                    } else {
+                        "Confirm LIVE"
+                    };
+                    if ui
+                        .add_enabled(
+                            armed,
+                            egui::Button::new(egui::RichText::new(label).color(btn_color)),
+                        )
+                        .clicked()
+                    {
+                        self.config_panel.mode_saving = true;
+                        self.config_panel.mode_status = None;
+                        let _ = self.cmd_tx.try_send(DashCmd::SetMode {
+                            mode: "live".into(),
+                            confirm_live: true,
+                        });
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.config_panel.pending_live_switch = false;
+                        self.config_panel.confirm_input.clear();
+                    }
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    let is_live = current == "live";
+                    let is_demo = current == "demo";
+
+                    if ui
+                        .add_enabled(
+                            !is_demo && !self.config_panel.mode_saving,
+                            egui::Button::new(
+                                egui::RichText::new("⏼ Switch to DEMO")
+                                    .color(egui::Color32::from_rgb(120, 220, 120))
+                                    .strong(),
+                            ),
+                        )
+                        .on_hover_text("Safe: simulated trading only")
+                        .clicked()
+                    {
+                        self.config_panel.mode_saving = true;
+                        self.config_panel.mode_status = None;
+                        let _ = self.cmd_tx.try_send(DashCmd::SetMode {
+                            mode: "demo".into(),
+                            confirm_live: false,
+                        });
+                    }
+                    if ui
+                        .add_enabled(
+                            !is_live && !self.config_panel.mode_saving,
+                            egui::Button::new(
+                                egui::RichText::new("⚠ Switch to LIVE")
+                                    .color(egui::Color32::from_rgb(255, 80, 80))
+                                    .strong(),
+                            ),
+                        )
+                        .on_hover_text("Real on-chain trading — requires typed confirmation")
+                        .clicked()
+                    {
+                        self.config_panel.pending_live_switch = true;
+                        self.config_panel.confirm_input.clear();
+                        self.config_panel.mode_status = None;
+                    }
+                });
+            }
+
+            ui.add_space(4.0);
+
+            if self.config_panel.restart_required {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 200, 60),
+                    "⟳ Restart the bot service for the new mode to take effect.",
+                );
+            }
+            if let Some(status) = &self.config_panel.mode_status {
+                let color = if status.starts_with('✓') {
+                    egui::Color32::from_rgb(100, 220, 100)
+                } else {
+                    egui::Color32::from_rgb(220, 90, 90)
+                };
+                ui.colored_label(color, status);
+            }
+        });
     }
 }
 
@@ -682,10 +993,29 @@ impl eframe::App for Dashboard {
                             }
                         });
                     });
+
+                    ui.add_space(12.0);
+                    ui.heading("Execution Mode");
+                    ui.add_space(6.0);
+                    self.render_mode_block(ui);
                 });
             if !open {
                 self.config_panel.open = false;
             }
+        }
+
+        // ── Periodic HTTP poll for mode + tx log ──────────────────────────────
+        // /mode and /tx-log are not pushed through WS (HTTP is the source of
+        // truth). Re-poll every 5s while the dashboard is alive so a switch
+        // performed from another client is reflected here too.
+        let should_poll = self
+            .last_http_poll
+            .map(|t| t.elapsed() >= Duration::from_secs(5))
+            .unwrap_or(true);
+        if should_poll {
+            let _ = self.cmd_tx.try_send(DashCmd::FetchMode);
+            let _ = self.cmd_tx.try_send(DashCmd::FetchTxLog);
+            self.last_http_poll = Some(std::time::Instant::now());
         }
 
         // ── Top bar ───────────────────────────────────────────────────────────
@@ -698,6 +1028,35 @@ impl eframe::App for Dashboard {
                     ui.colored_label(egui::Color32::from_rgb(100, 220, 100), "● CONNECTED");
                 } else {
                     ui.colored_label(egui::Color32::from_rgb(220, 90, 90), "● DISCONNECTED");
+                }
+                ui.separator();
+
+                // ── Mode badge (DEMO=green, LIVE=red, unknown=gray) ──────────
+                match self.mode.as_deref() {
+                    Some("live") => {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 80, 80),
+                            egui::RichText::new("⚠ LIVE").strong().size(15.0),
+                        )
+                        .on_hover_text("Real on-chain trading is ACTIVE");
+                    }
+                    Some("demo") => {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(120, 220, 120),
+                            egui::RichText::new("● DEMO").strong().size(15.0),
+                        )
+                        .on_hover_text("Simulated trading — no real funds at risk");
+                    }
+                    _ => {
+                        ui.colored_label(egui::Color32::GRAY, "mode: …");
+                    }
+                }
+                if self.config_panel.restart_required {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 200, 60),
+                        egui::RichText::new("⟳ restart required").italics(),
+                    )
+                    .on_hover_text("Mode change saved to filter_config.yaml — restart the bot service to apply");
                 }
                 ui.separator();
 
@@ -862,6 +1221,113 @@ impl eframe::App for Dashboard {
 
             ui.add_space(6.0);
 
+            // ── Tx log ────────────────────────────────────────────────────────
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("TX LOG").strong().size(14.0));
+                if let Some(m) = self.mode.as_deref() {
+                    let (txt, col) = match m {
+                        "live" => ("LIVE", egui::Color32::from_rgb(255, 90, 90)),
+                        "demo" => ("DEMO", egui::Color32::from_rgb(120, 220, 120)),
+                        _ => ("?", egui::Color32::GRAY),
+                    };
+                    ui.colored_label(col, txt);
+                }
+                ui.label(
+                    egui::RichText::new(format!("({})", self.tx_log.len()))
+                        .color(egui::Color32::GRAY),
+                );
+            });
+            ui.separator();
+            let tx_ctx = ctx.clone();
+            egui::ScrollArea::vertical()
+                .id_salt("tx_log_scroll")
+                .max_height(third.min(180.0))
+                .show(ui, |ui| {
+                    egui::Grid::new("tx_log_grid")
+                        .num_columns(6)
+                        .striped(true)
+                        .min_col_width(70.0)
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new("Time").strong());
+                            ui.label(egui::RichText::new("Kind").strong());
+                            ui.label(egui::RichText::new("Mode").strong());
+                            ui.label(egui::RichText::new("Mint").strong());
+                            ui.label(egui::RichText::new("SOL").strong());
+                            ui.label(egui::RichText::new("Tx / Status").strong());
+                            ui.end_row();
+
+                            // Newest first.
+                            for row in self.tx_log.iter().rev() {
+                                ui.label(
+                                    egui::RichText::new(format_age(row.ts))
+                                        .color(egui::Color32::GRAY),
+                                );
+                                let (lbl, col) = match row.kind {
+                                    TxEventKind::Buy => (
+                                        "BUY",
+                                        egui::Color32::from_rgb(120, 200, 255),
+                                    ),
+                                    TxEventKind::Sell => (
+                                        "SELL",
+                                        egui::Color32::from_rgb(255, 200, 100),
+                                    ),
+                                };
+                                ui.colored_label(col, lbl);
+                                let mode_col = match row.mode.as_str() {
+                                    "live" => egui::Color32::from_rgb(255, 90, 90),
+                                    "demo" => egui::Color32::from_rgb(120, 220, 120),
+                                    _ => egui::Color32::GRAY,
+                                };
+                                ui.colored_label(mode_col, row.mode.to_uppercase());
+                                ui.label(
+                                    egui::RichText::new(short_addr(&row.mint))
+                                        .monospace(),
+                                );
+                                ui.label(format!("{:.4}", row.amount_sol));
+
+                                // Signature button (copy on click) or status.
+                                if let Some(sig) = &row.signature {
+                                    let short = if sig.len() > 14 {
+                                        format!("{}…{}", &sig[..6], &sig[sig.len() - 6..])
+                                    } else {
+                                        sig.clone()
+                                    };
+                                    let btn = egui::Button::new(
+                                        egui::RichText::new(format!("📋 {}", short))
+                                            .monospace()
+                                            .color(egui::Color32::from_rgb(180, 220, 255)),
+                                    )
+                                    .frame(false);
+                                    if ui
+                                        .add(btn)
+                                        .on_hover_text(format!(
+                                            "Click to copy signature: {}\n(open in Solscan: https://solscan.io/tx/{})",
+                                            sig, sig
+                                        ))
+                                        .clicked()
+                                    {
+                                        tx_ctx.copy_text(sig.clone());
+                                    }
+                                } else {
+                                    let (lbl, col) = match row.status.as_str() {
+                                        "failed" => (
+                                            row.reason.clone().unwrap_or_else(|| "failed".into()),
+                                            egui::Color32::from_rgb(220, 90, 90),
+                                        ),
+                                        _ => (
+                                            "simulated".into(),
+                                            egui::Color32::GRAY,
+                                        ),
+                                    };
+                                    ui.colored_label(col, lbl);
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
+
+            ui.add_space(6.0);
+
             // ── History ───────────────────────────────────────────────────────
             ui.label(egui::RichText::new("HISTORY").strong().size(14.0));
             ui.separator();
@@ -997,6 +1463,8 @@ async fn ws_loop(
                     struct StatusResp {
                         paused: bool,
                         balance_sol: f64,
+                        #[serde(default)]
+                        mode: Option<String>,
                     }
                     let url = format!("{}/status", http_url);
                     let tx2 = tx.clone();
@@ -1004,7 +1472,10 @@ async fn ws_loop(
                     tokio::spawn(async move {
                         if let Ok(resp) = reqwest::get(&url).await {
                             if let Ok(s) = resp.json::<StatusResp>().await {
-                                let _ = tx2.send(AppEvent::Status { paused: s.paused });
+                                let _ = tx2.send(AppEvent::Status {
+                                    paused: s.paused,
+                                    mode: s.mode,
+                                });
                                 let _ = tx2.send(AppEvent::Msg(WsMsg::BalanceUpdate {
                                     balance: s.balance_sol,
                                 }));
@@ -1112,6 +1583,85 @@ async fn ws_loop(
                                             Err(_) => None,
                                         };
                                         let _ = tx2.send(AppEvent::ChartData { mint, data });
+                                        ctx2.request_repaint();
+                                    });
+                                }
+                                Some(DashCmd::FetchMode) => {
+                                    let url = format!("{}/mode", http_url);
+                                    let tx2 = tx.clone(); let ctx2 = ctx.clone();
+                                    tokio::spawn(async move {
+                                        if let Ok(resp) = reqwest::get(&url).await
+                                            && let Ok(info) = resp.json::<ModeInfo>().await {
+                                                let _ = tx2.send(AppEvent::ModeInfo(info));
+                                                ctx2.request_repaint();
+                                            }
+                                    });
+                                }
+                                Some(DashCmd::FetchTxLog) => {
+                                    let url = format!("{}/tx-log", http_url);
+                                    let tx2 = tx.clone(); let ctx2 = ctx.clone();
+                                    tokio::spawn(async move {
+                                        if let Ok(resp) = reqwest::get(&url).await
+                                            && let Ok(events) = resp.json::<Vec<WsMsg>>().await {
+                                                let rows: Vec<TxLogRow> = events
+                                                    .into_iter()
+                                                    .filter_map(|m| match m {
+                                                        WsMsg::TxEvent {
+                                                            kind,
+                                                            mint,
+                                                            signature,
+                                                            amount_sol,
+                                                            status,
+                                                            reason,
+                                                            mode,
+                                                            ts,
+                                                        } => Some(TxLogRow {
+                                                            kind,
+                                                            mint,
+                                                            signature,
+                                                            amount_sol,
+                                                            status,
+                                                            reason,
+                                                            mode,
+                                                            ts,
+                                                        }),
+                                                        _ => None,
+                                                    })
+                                                    .collect();
+                                                let _ = tx2.send(AppEvent::TxLog(rows));
+                                                ctx2.request_repaint();
+                                            }
+                                    });
+                                }
+                                Some(DashCmd::SetMode { mode, confirm_live }) => {
+                                    let url = format!("{}/mode", http_url);
+                                    let tx2 = tx.clone(); let ctx2 = ctx.clone();
+                                    tokio::spawn(async move {
+                                        let client = reqwest::Client::new();
+                                        let mut req = client.put(&url).json(&serde_json::json!({"mode": mode}));
+                                        if confirm_live {
+                                            req = req.header("X-Confirm-Live", "yes");
+                                        }
+                                        match req.send().await {
+                                            Ok(resp) => {
+                                                let status = resp.status();
+                                                let text = resp.text().await.unwrap_or_default();
+                                                if status.is_success() {
+                                                    #[derive(serde::Deserialize)]
+                                                    struct R { mode: String, restart_required: bool }
+                                                    if let Ok(r) = serde_json::from_str::<R>(&text) {
+                                                        let _ = tx2.send(AppEvent::ModeSetOk { mode: r.mode, restart_required: r.restart_required });
+                                                    } else {
+                                                        let _ = tx2.send(AppEvent::ModeSetErr(format!("bad response: {}", text)));
+                                                    }
+                                                } else {
+                                                    let _ = tx2.send(AppEvent::ModeSetErr(format!("HTTP {}: {}", status, text)));
+                                                }
+                                            }
+                                            Err(e) => {
+                                                let _ = tx2.send(AppEvent::ModeSetErr(e.to_string()));
+                                            }
+                                        }
                                         ctx2.request_repaint();
                                     });
                                 }

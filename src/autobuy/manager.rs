@@ -34,6 +34,13 @@ use tokio::{
 
 // --- КОНФИГУРАЦИЯ ---
 
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 fn default_tp3_pct() -> f64 {
     100.0
 }
@@ -358,9 +365,31 @@ impl PositionManagerActor {
                     };
 
                     let receipt = match self.broker.buy(mint, amount_sol, latest_pool.as_ref()).await {
-                        Ok(r) => r,
+                        Ok(r) => {
+                            let _ = self.event_tx.try_send(WsFeedMessage::TxEvent {
+                                kind: TxEventKind::Buy,
+                                mint: mint.to_string(),
+                                signature: r.signature.clone(),
+                                amount_sol: r.sol_spent,
+                                status: "sent".into(),
+                                reason: None,
+                                mode: self.broker.mode_label().to_string(),
+                                ts: now_secs(),
+                            });
+                            r
+                        }
                         Err(e) => {
                             eprintln!("[BUY] Failed {mint}: {e}");
+                            let _ = self.event_tx.try_send(WsFeedMessage::TxEvent {
+                                kind: TxEventKind::Buy,
+                                mint: mint.to_string(),
+                                signature: None,
+                                amount_sol,
+                                status: "failed".into(),
+                                reason: Some(e.to_string()),
+                                mode: self.broker.mode_label().to_string(),
+                                ts: now_secs(),
+                            });
                             continue;
                         }
                     };
@@ -407,9 +436,31 @@ impl PositionManagerActor {
                         let sell_qty = pos.holdings.to_float() * (percent / 100.0);
 
                         let return_value = match self.broker.sell(mint, sell_qty, pos.pool.as_ref()).await {
-                            Ok(r) => r.sol_received,
+                            Ok(r) => {
+                                let _ = self.event_tx.try_send(WsFeedMessage::TxEvent {
+                                    kind: TxEventKind::Sell,
+                                    mint: mint.to_string(),
+                                    signature: r.signature.clone(),
+                                    amount_sol: r.sol_received,
+                                    status: "sent".into(),
+                                    reason: Some(reason.clone()),
+                                    mode: self.broker.mode_label().to_string(),
+                                    ts: now_secs(),
+                                });
+                                r.sol_received
+                            }
                             Err(e) => {
                                 eprintln!("[SELL] Broker error for {mint}: {e}");
+                                let _ = self.event_tx.try_send(WsFeedMessage::TxEvent {
+                                    kind: TxEventKind::Sell,
+                                    mint: mint.to_string(),
+                                    signature: None,
+                                    amount_sol: 0.0,
+                                    status: "failed".into(),
+                                    reason: Some(format!("{}: {}", reason, e)),
+                                    mode: self.broker.mode_label().to_string(),
+                                    ts: now_secs(),
+                                });
                                 self.positions.insert(mint, pos);
                                 continue;
                             }
@@ -858,4 +909,24 @@ pub enum WsFeedMessage {
     PausedState {
         paused: bool,
     },
+    /// Transaction event surfaced to UIs. `signature` is None for the demo
+    /// broker (simulated) and Some(base58) for live on-chain tx. `status` is
+    /// one of: "sent", "failed", "rejected".
+    TxEvent {
+        kind: TxEventKind,
+        mint: String,
+        signature: Option<String>,
+        amount_sol: f64,
+        status: String,
+        reason: Option<String>,
+        mode: String,
+        ts: i64,
+    },
+}
+
+#[derive(Serialize, Clone, Copy, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum TxEventKind {
+    Buy,
+    Sell,
 }

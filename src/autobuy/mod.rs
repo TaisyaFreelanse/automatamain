@@ -1,5 +1,6 @@
 pub mod broker;
 pub mod broker_mock;
+pub mod execution;
 pub mod filters;
 pub mod manager;
 pub mod performance_tracker;
