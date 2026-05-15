@@ -519,25 +519,6 @@ impl Dashboard {
                 ui.colored_label(col, egui::RichText::new(lbl).strong());
             });
 
-            if let Some(info) = &self.config_panel.mode_info {
-                ui.label(format!(
-                    "Wallet: {} | Balance: {:.4} SOL",
-                    short_addr(&info.wallet),
-                    info.balance_sol
-                ));
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Live cfg: slip={}bps fee={}μL/CU CU={} retries={}",
-                        info.live.slippage_bps,
-                        info.live.priority_fee_micro_lamports,
-                        info.live.compute_unit_limit,
-                        info.live.max_retries,
-                    ))
-                    .small()
-                    .color(egui::Color32::GRAY),
-                );
-            }
-
             ui.add_space(6.0);
 
             // Switch actions. Switching to LIVE always goes through the
