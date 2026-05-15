@@ -1,17 +1,12 @@
-# =============================================================================
-# TEMPORARY — LIVE TEST PROFILE (relax filters / scoring for first on-chain buy)
-# Revert creator_config, scoring, strategy, and buy_config.amount_sol when done.
-# =============================================================================
-
 creator_config:
   min_total_coins: 0
-  max_total_coins: 100000
+  max_total_coins: 1000
 
-  min_median_market_cap: 0.0
-  min_trader_pnl_average: 0.0
-  min_total_holders_average: 0.0
-  min_average_volume: 0.0
-  min_median_total_trades: 0.0
+  min_median_market_cap: 90.0
+  min_trader_pnl_average: 4.0
+  min_total_holders_average: 50.0
+  min_average_volume: 90.0
+  min_median_total_trades: 50.0
 
   min_average_unique_buy_to_sell_ratio: 0
   min_average_buy_trader_size: 0
@@ -21,8 +16,7 @@ http_port: 1662
 start_balance_sol: 10.0
 
 buy_config:
-  # Small live test size — adjust if wallet has more headroom.
-  amount_sol: 0.05
+  amount_sol: 0.6
   tp1_pct: 15.0
   tp1_sell_pct: 30.0
   tp2_pct: 50.0
@@ -38,73 +32,80 @@ buy_config:
   time_kill_min_profit_pct: 10.0
   trailing_stop_drawdown_pct: 30.0
 
+# Score Engine A+/A/SKIP. The bot computes a combined score from dev quality,
+# liquidity, buyers, momentum, volume, smart wallets, and anti-bundle signals
+# after a short scoring window, then chooses a tier-based buy size.
 scoring:
-  # Bumped from 800 → 2500 so Helius/RPC has time to index the freshly created
-  # mint account before our buy hits simulation; otherwise pump-fun returns
-  # AccountNotInitialized (0xbc4 / Anchor 3012) on `mint`.
-  scoring_window_ms: 2500
-  # Effectively: almost any non-SKIP score maps to tier A for testing.
-  a_plus_threshold: 100
-  a_threshold: -100
+  scoring_window_ms: 1500
+  a_plus_threshold: 9
+  a_threshold: 6
   weights:
     dev_history_strong: 4
     dev_history_weak: 2
     dev_ranker_a_plus: 3
     dev_ranker_a: 1
-    dev_ranker_bad: 0
+    dev_ranker_bad: -3
     smart_wallets_3plus: 3
     smart_wallets_1plus: 1
     buyers_10plus: 2
     buyers_6plus: 1
-    buyers_below_3: 0
+    buyers_below_3: -2
     buy_to_sell_ratio_high: 1
     momentum_good: 2
-    momentum_overheated: 0
+    momentum_overheated: -3
     volume_ok: 1
-    bundle_similar: 0
-    bundle_identical: 0
+    bundle_similar: -4
+    bundle_identical: -5
   thresholds:
-    dev_strong_min_coins: 0
-    dev_strong_min_pnl_pct: 0.0
-    buyers_high: 3
-    buyers_mid: 2
-    buyers_low: 0
-    buy_to_sell_high: 1.0
-    momentum_good_low_pct: 0.0
-    momentum_good_high_pct: 99.0
-    momentum_overheated_pct: 99.0
-    volume_ok_sol: 0.0
-    bundle_similar_ratio: 10.0
-    bundle_identical_ratio: 10.0
+    dev_strong_min_coins: 5
+    dev_strong_min_pnl_pct: 20.0
+    buyers_high: 10
+    buyers_mid: 6
+    buyers_low: 3
+    buy_to_sell_high: 1.5
+    momentum_good_low_pct: 12.0
+    momentum_good_high_pct: 30.0
+    momentum_overheated_pct: 60.0
+    volume_ok_sol: 10.0
+    bundle_similar_ratio: 0.7
+    bundle_identical_ratio: 0.5
     bundle_similar_tolerance: 0.05
   size:
-    a_plus_sol: 0.05
-    a_sol: 0.05
+    a_plus_sol: 1.0
+    a_sol: 0.6
 
+# Strategy controller — risk caps applied at the InitiateBuy gate inside the
+# position manager. None of these touch open positions.
 strategy:
-  max_open_positions: 5
-  max_trades_per_day: 999
-  max_daily_loss_sol: -100.0
-  daily_profit_lock_sol: 1.0e9
-  loss_streak_limit: 999
-  loss_streak_pause_secs: 0
-  market_regime_pause: false
+  max_open_positions: 3
+  max_trades_per_day: 25
+  max_daily_loss_sol: -2.0
+  daily_profit_lock_sol: 4.0
+  loss_streak_limit: 5
+  loss_streak_pause_secs: 1800
+  market_regime_pause: true
   market_regime_window: 10
-  market_regime_loss_ratio: 0.99
-  market_regime_pause_secs: 0
+  market_regime_loss_ratio: 0.8
+  market_regime_pause_secs: 1800
 
+# Persistent JSON state for dev_ranker and smart_money. Both are flushed
+# atomically via tmp+rename every flush_every_secs.
 persistence:
   dev_ranker_path: "/home/automata/state/dev_ranker.json"
   smart_money_path: "/home/automata/state/smart_money.json"
   flush_every_secs: 30
   entity_ttl_secs: 172800
 
+# Execution mode. Demo = MockBroker (simulated, uses start_balance_sol).
+# Live = SolanaBroker — reads wallet from PRIVATE_KEY env, mainnet RPC from
+# SOLANA_RPC_URL (or SOLANA_HTTP) env, and routes real buy/sell tx with the
+# slippage/priority/retry knobs below.
 execution:
-  mode: live
+  mode: demo            # demo | live
   live:
-    slippage_bps: 500
-    priority_fee_micro_lamports: 200000
-    compute_unit_limit: 200000
+    slippage_bps: 500                   # 5%
+    priority_fee_micro_lamports: 200000 # per CU (0 disables)
+    compute_unit_limit: 200000          # 0 keeps cluster default
     max_retries: 3
     balance_refresh_secs: 10
     skip_preflight: false

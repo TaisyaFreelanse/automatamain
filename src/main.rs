@@ -121,8 +121,12 @@ async fn main() {
             Some(smart_money_handle.clone()),
         );
 
-    // Default buy size of 0.6 SOL, stored as f64 bits in an AtomicU64
-    let buy_size_state = Arc::new(std::sync::atomic::AtomicU64::new(f64::to_bits(0.6_f64)));
+    // Operator buy cap (SOL): seeded from yaml `buy_config.amount_sol`, then
+    // overridable at runtime via `PUT /buy-size` (dashboard). Each live buy
+    // uses `min(score_engine recommended tier size, this cap)`.
+    let buy_size_state = Arc::new(std::sync::atomic::AtomicU64::new(f64::to_bits(
+        config.buy_config.amount_sol,
+    )));
 
     // Bounded ring buffer of recent tx events (buy / sell / failed) — both
     // demo and live. Surfaced via `GET /tx-log` and used by the dashboard.
@@ -678,6 +682,7 @@ async fn main() {
                 let dev_ranker_for_create = dev_ranker_handle.clone();
                 let smart_money_for_create = smart_money_handle.clone();
                 let bucket_for_score = bucket.clone();
+                let buy_cap = buy_size_state.clone();
 
                 tokio::spawn({
                     let creators = creators.clone();
@@ -795,7 +800,19 @@ async fn main() {
 
                         // --- Stage 4: dispatch to manager (which still
                         // applies the StrategyController gate) -------------
-                        let amount_sol = breakdown.recommended_size_sol;
+                        let operator_cap =
+                            f64::from_bits(buy_cap.load(std::sync::atomic::Ordering::Relaxed));
+                        let amount_sol = breakdown
+                            .recommended_size_sol
+                            .min(operator_cap)
+                            .max(0.0);
+                        if amount_sol <= f64::EPSILON {
+                            eprintln!(
+                                "[BUY] {} skipped: tier size {:.4} capped to {:.4} (operator cap)",
+                                general_create.mint, breakdown.recommended_size_sol, operator_cap
+                            );
+                            return;
+                        }
                         let open_reason = OpenReason::DevStats(dev_stats);
 
                         if tx
