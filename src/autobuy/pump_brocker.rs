@@ -59,7 +59,8 @@ impl SolanaBroker {
     ) -> Result<Self, BrokerError> {
         let rpc_client = Arc::new(RpcClient::new(rpc_url));
 
-        let initial_balance_sol = fetch_balance_sol(&rpc_client, &wallet_address).await?;
+        let initial_balance_sol =
+            fetch_balance_sol_with_retry(&rpc_client, &wallet_address, "init").await?;
 
         println!(
             "[BROKER INIT] Starting SOL Balance: {:.6}",
@@ -300,7 +301,9 @@ impl Broker for SolanaBroker {
     }
 
     async fn refresh_onchain_balance(&self) -> Result<(), BrokerError> {
-        let onchain = fetch_balance_sol(&self.rpc_client, &self.wallet_address).await?;
+        let onchain =
+            fetch_balance_sol_with_retry(&self.rpc_client, &self.wallet_address, "refresh")
+                .await?;
         *self.balance.lock().unwrap() = onchain;
         Ok(())
     }
@@ -382,6 +385,58 @@ async fn fetch_balance_sol(
         .await
         .map_err(|e| BrokerError::Custom(e.to_string()))?;
     Ok(lamports as f64 / 1_000_000_000.0)
+}
+
+fn is_transient_balance_error(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("429")
+        || m.contains("too many requests")
+        || m.contains("503")
+        || m.contains("502")
+        || m.contains("504")
+        || m.contains("timed out")
+        || m.contains("timeout")
+        || m.contains("connection reset")
+        || m.contains("broken pipe")
+        || m.contains("temporarily unavailable")
+}
+
+/// Helius and other RPCs often return HTTP 429 during bursts (e.g. right after
+/// a systemd restart loop). Without retries the whole process exits and the
+/// GUI loses `/status` + WS — so we back off and retry here.
+async fn fetch_balance_sol_with_retry(
+    rpc: &RpcClient,
+    wallet: &SolAddress,
+    label: &str,
+) -> Result<f64, BrokerError> {
+    const MAX_ATTEMPTS: u32 = 24;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        match fetch_balance_sol(rpc, wallet).await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let msg = e.to_string();
+                if attempt >= MAX_ATTEMPTS || !is_transient_balance_error(&msg) {
+                    return Err(e);
+                }
+                eprintln!(
+                    "[BROKER] get_balance ({label}) transient error attempt {}/{}: {}",
+                    attempt, MAX_ATTEMPTS, msg
+                );
+                backoff_balance(attempt).await;
+            }
+        }
+    }
+    Err(BrokerError::Custom(
+        "get_balance: exhausted retries (unexpected)".into(),
+    ))
+}
+
+async fn backoff_balance(attempt: u32) {
+    // Slower than tx backoff — avoids hammering Helius when returning 429.
+    let shift = attempt.saturating_sub(1).min(7);
+    let ms = (500u64.saturating_mul(1u64 << shift)).min(15_000);
+    tokio::time::sleep(Duration::from_millis(ms)).await;
 }
 
 async fn backoff(attempt: u32) {

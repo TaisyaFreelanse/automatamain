@@ -96,9 +96,13 @@ async fn main() {
     //   live -> SolanaBroker (real wallet + mainnet RPC, slippage/priority/retries)
     // The rest of the bot uses the `Broker` trait, so PositionManagerActor
     // and the scoring/strategy pipeline are unchanged.
-    let broker: Arc<dyn Broker> = build_broker(&config.execution, config.start_balance_sol)
-        .await
-        .expect("Failed to build broker");
+    let broker: Arc<dyn Broker> = match build_broker(&config.execution, config.start_balance_sol).await {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[FATAL] Failed to build broker: {e}");
+            std::process::exit(1);
+        }
+    };
     println!("[BOOT] Broker active: {}", broker.mode_label());
 
     // Persistent dev ranking + smart-money registries. Both are actors that
