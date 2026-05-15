@@ -15,6 +15,7 @@ use solana_address::Address as SolAddress;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_instruction::Instruction as SolanaIx;
 use solana_keypair::Keypair;
+use solana_rpc_client_types::config::{CommitmentConfig, CommitmentLevel};
 // Use the modular solana crate instead of the monolithic solana_sdk
 
 use crate::{
@@ -118,6 +119,15 @@ impl SolanaBroker {
     }
 
     /// Sign + broadcast with retries. Returns the signature (base58 string).
+    ///
+    /// Special handling for pump-fun's `AccountNotInitialized` (Anchor 3012 /
+    /// `0xbc4`) error on `mint`: the bot ingests Create events from
+    /// `logsSubscribe` at Confirmed commitment, but `sendTransaction`'s
+    /// preflight simulation defaults to Finalized — so a brand-new mint can
+    /// be invisible to the simulator for up to ~12s. We pin the preflight to
+    /// `processed`, and on the propagation error we wait a bit longer between
+    /// retries so the network catches up rather than burning identical
+    /// attempts on the same blockhash.
     async fn send_with_retries(
         &self,
         ixs: Vec<SolanaIx>,
@@ -129,7 +139,9 @@ impl SolanaBroker {
             .map_err(|_| BrokerError::Custom("Invalid Payer Address".into()))?;
 
         let mut attempt: u32 = 0;
-        let max_retries = self.exec_cfg.max_retries.max(1);
+        // Give propagation retries some headroom on top of the user-configured
+        // retry budget — these are not "real" send failures.
+        let max_retries = self.exec_cfg.max_retries.max(1).max(6);
         loop {
             attempt += 1;
 
@@ -153,17 +165,15 @@ impl SolanaBroker {
                 blockhash,
             );
 
-            let send_result = if self.exec_cfg.skip_preflight {
-                let cfg = solana_client::rpc_config::RpcSendTransactionConfig {
-                    skip_preflight: true,
-                    ..Default::default()
-                };
-                self.rpc_client
-                    .send_transaction_with_config(&tx, cfg)
-                    .await
-            } else {
-                self.rpc_client.send_transaction(&tx).await
+            let cfg = solana_client::rpc_config::RpcSendTransactionConfig {
+                skip_preflight: self.exec_cfg.skip_preflight,
+                preflight_commitment: Some(CommitmentLevel::Processed),
+                ..Default::default()
             };
+            let send_result = self
+                .rpc_client
+                .send_transaction_with_config(&tx, cfg)
+                .await;
 
             match send_result {
                 Ok(sig) => {
@@ -177,7 +187,11 @@ impl SolanaBroker {
                     if attempt >= max_retries {
                         return Err(BrokerError::TransactionFailed(msg));
                     }
-                    backoff(attempt).await;
+                    if is_account_propagation_error(&msg) {
+                        propagation_backoff(attempt).await;
+                    } else {
+                        backoff(attempt).await;
+                    }
                 }
             }
         }
@@ -200,6 +214,20 @@ impl Broker for SolanaBroker {
                 need: amount_sol,
             });
         }
+
+        // Race-condition guard: pump-fun's BuyExactSolIn requires `mint` to be
+        // already initialized on-chain. The Create event arrives via
+        // `logsSubscribe` faster than the same RPC's confirmed view, so we
+        // poll the account here and only proceed once it's visible. This kills
+        // the `AccountNotInitialized` (Anchor 3012 / 0xbc4) preflight failures
+        // we used to see on freshly created tokens.
+        wait_for_account_visible(
+            &self.rpc_client,
+            &mint,
+            "BUY mint",
+            Duration::from_millis(5_000),
+        )
+        .await?;
 
         // Slippage-aware min_token_out from current pool price.
         let price_sol_per_token = pool.price().amount().to_float().max(f64::MIN_POSITIVE);
@@ -489,4 +517,79 @@ async fn backoff(attempt: u32) {
     let shift = attempt.saturating_sub(1).min(4);
     let ms = (150u64.saturating_mul(1u64 << shift)).min(2_000);
     tokio::time::sleep(Duration::from_millis(ms)).await;
+}
+
+/// Slower backoff for the "account not yet visible at preflight commitment"
+/// case — gives the cluster time to propagate the freshly created mint.
+async fn propagation_backoff(attempt: u32) {
+    // 700ms, 1.4s, 2.1s, capped at 3s
+    let ms = (700u64.saturating_mul(u64::from(attempt))).min(3_000);
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+}
+
+/// Recognize pump-fun's `AccountNotInitialized` error on `mint` (Anchor 3012,
+/// custom error `0xbc4`). Also catches the matching log messages emitted
+/// before the program panics.
+fn is_account_propagation_error(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("0xbc4")
+        || m.contains("accountnotinitialized")
+        || m.contains("error number: 3012")
+        || m.contains("\"err\": 3012")
+}
+
+/// Poll `get_account_with_commitment(Confirmed)` until the account is visible
+/// or the budget expires. Returns Ok on first sighting; otherwise a
+/// descriptive error the caller can surface to the position manager.
+async fn wait_for_account_visible(
+    rpc: &RpcClient,
+    address: &SolAddress,
+    label: &str,
+    total_timeout: Duration,
+) -> Result<(), BrokerError> {
+    let pubkey_str = address.to_string();
+    let pubkey = pubkey_str
+        .parse()
+        .map_err(|_| BrokerError::Custom(format!("{label}: invalid pubkey '{pubkey_str}'")))?;
+
+    let started = std::time::Instant::now();
+    let poll_delay = Duration::from_millis(150);
+    let mut attempts: u32 = 0;
+
+    loop {
+        attempts += 1;
+        match rpc
+            .get_account_with_commitment(&pubkey, CommitmentConfig::confirmed())
+            .await
+        {
+            Ok(resp) if resp.value.is_some() => {
+                if attempts > 1 {
+                    eprintln!(
+                        "[BROKER] {label} {pubkey_str}: visible after {attempts} polls in {:?}",
+                        started.elapsed()
+                    );
+                }
+                return Ok(());
+            }
+            Ok(_) => {
+                // Account not yet visible at confirmed commitment — keep polling.
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if !is_transient_balance_error(&msg) {
+                    return Err(BrokerError::Custom(format!(
+                        "{label}: get_account_with_commitment {pubkey_str} failed: {msg}"
+                    )));
+                }
+            }
+        }
+
+        if started.elapsed() >= total_timeout {
+            return Err(BrokerError::TransactionFailed(format!(
+                "{label}: account {pubkey_str} not visible on RPC after {:?}",
+                total_timeout
+            )));
+        }
+        tokio::time::sleep(poll_delay).await;
+    }
 }
