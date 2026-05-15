@@ -6,6 +6,7 @@ use std::{
 
 use async_trait::async_trait;
 use sips::instructions::{
+    associated_token_program::AssociatedTokenProgram,
     compute_budget::{ComputeUnitLimit, ComputeUnitPrice},
     pump::instructions::PumpInstruction,
     raw_instruction::Instruction as SipsInstruction,
@@ -238,6 +239,19 @@ impl Broker for SolanaBroker {
         let sol_amount_in = sips::helper::Amount::<9>::from_float(amount_sol);
         let min_token_out = sips::helper::Amount::<6>::from_float(min_token_out_f.max(0.0));
 
+        // pump-fun's BuyExactSolIn requires `associated_user` —
+        // `ATA(user, token_program, mint)` — to already exist. For freshly
+        // listed coins we've never traded, this ATA doesn't exist yet, so
+        // pump fails with `AccountNotInitialized` on `associated_user`. Fix:
+        // prepend an idempotent ATA-create. It's a no-op (just bumps CU) when
+        // the ATA already exists, and a one-shot create otherwise.
+        let create_ata_ix = AssociatedTokenProgram::create_idempotent(
+            mint.into(),
+            self.wallet_address.into(),
+            self.wallet_address.into(),
+            TokenProgram2022::PROGRAM,
+        );
+
         let ix = PumpInstruction::buy_exact_in(
             mint.into(),
             self.wallet_address.into(),
@@ -248,6 +262,7 @@ impl Broker for SolanaBroker {
         );
 
         let mut ixs = self.compute_budget_prelude();
+        ixs.push(create_ata_ix.into());
         ixs.push(ix.into());
 
         let sig_str = self.send_with_retries(ixs, "BUY").await?;
