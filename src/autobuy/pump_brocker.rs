@@ -755,6 +755,10 @@ impl Broker for SolanaBroker {
         println!("============================================================");
     }
 
+    fn forget_position(&self, mint: SolAddress) {
+        self.positions.lock().unwrap().remove(&mint);
+    }
+
     fn mode_label(&self) -> &'static str {
         "live"
     }
@@ -919,7 +923,10 @@ struct BondingCurveState {
     /// `BondingCurve::is_cashback_coin` (pump IDL). When true, on-chain `sell`
     /// must pass `user_volume_accumulator` before `bonding_curve_v2` (`sips`
     /// `SellAccounts`). If omitted, Pump returns `Custom(6024)` (often called
-    /// "overflow"); see pump-public-docs `PUMP_CASHBACK_README.md`.
+    /// "overflow"); see pump-public-docs `PUMP_CASHBACK_README.md`. The
+    /// trailing `buyback_fee_recipient` account (same tail as `buy`) is
+    /// required when global buyback is active — otherwise `Custom(6062)`
+    /// (`BuybackFeeRecipientMissing`).
     is_cashback_coin: bool,
 }
 

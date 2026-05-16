@@ -171,6 +171,12 @@ pub enum PositionMessage {
         mint: solana_address::Address,
         responder: tokio::sync::oneshot::Sender<Option<f64>>,
     },
+    /// Operator: drop a position from manager + broker caches without on-chain
+    /// sell (stuck ghost / manual unwind elsewhere). Emits `PositionClose` so
+    /// dashboards remove the row from OPEN.
+    AbandonPosition {
+        mint: solana_address::Address,
+    },
     /// Tick: evaluate all open positions and redraw dashboard
     Tick,
 }
@@ -338,6 +344,21 @@ impl PositionManagerActor {
                 // ----------------------------------------------------------------
                 PositionMessage::GetStrategySnapshot { responder } => {
                     let _ = responder.send(self.strategy.snapshot());
+                }
+
+                // ----------------------------------------------------------------
+                PositionMessage::AbandonPosition { mint } => {
+                    let had = self.positions.remove(&mint).is_some();
+                    self.pool_cache.remove(&mint);
+                    self.broker.forget_position(mint);
+                    let _ = self.event_tx.try_send(WsFeedMessage::PositionClose {
+                        address: mint.to_string(),
+                        reason: "abandoned (operator removed from OPEN)".into(),
+                    });
+                    eprintln!(
+                        "[MANAGER] AbandonPosition {mint}: had_open={had}, pool_cache cleared, \
+                         broker tracking cleared"
+                    );
                 }
 
                 // ----------------------------------------------------------------

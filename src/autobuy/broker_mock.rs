@@ -102,6 +102,10 @@ impl Broker for MockBroker {
         Ok(*self.balance.lock().unwrap())
     }
 
+    fn forget_position(&self, mint: Address) {
+        self.positions.lock().unwrap().remove(&mint);
+    }
+
     fn mode_label(&self) -> &'static str {
         "demo"
     }

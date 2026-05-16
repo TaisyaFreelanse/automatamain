@@ -80,6 +80,10 @@ pub trait Broker: Send + Sync {
     /// authoritative on-chain events. Demo/mock brokers ignore it.
     fn on_trade(&self, _trade: &TradeAction, _pool: &dyn Pool) {}
 
+    /// Drop any broker-local tracking for `mint` (e.g. after the operator
+    /// abandons a stuck UI position). Default: no-op.
+    fn forget_position(&self, _mint: Address) {}
+
     /// Human-readable broker label for logs and the `/status` endpoint.
     fn mode_label(&self) -> &'static str {
         "unknown"

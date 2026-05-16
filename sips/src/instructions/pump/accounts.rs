@@ -4,6 +4,20 @@ use crate::instructions::account::{AccountMeta, IntoAccountMetaArray};
 use crate::instructions::pump::instructions::PumpInstruction;
 use ix_macros::Accounts;
 
+/// Global buyback fee recipients (pump docs: `docs/FEE_RECIPIENTS.md`).
+/// Legacy `buy` / `sell` must pass one of these when buyback is active; missing
+/// account surfaces as `Custom(6062)` (`BuybackFeeRecipientMissing`).
+pub(crate) const PUMP_BUYBACK_FEE_RECIPIENTS: [&'static str; 8] = [
+    "5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD",
+    "9M4giFFMxmFGXtc3feFzRai56WbBqehoSeRE5GK7gf7",
+    "GXPFM2caqTtQYC2cJ5yJRi9VDkpsYZXzYdwYpGnLmtDL",
+    "3BpXnfJaUTiwXnJNe7Ej1rcbzqTTQUvLShZaWazebsVR",
+    "5cjcW9wExnJJiqgLjq7DEG75Pm6JBgE1hNv4B2vHXUW6",
+    "EHAAiTxcdDwQ3U4bU6YcMsQGaekdzLS3B5SmYo46kJtL",
+    "5eHhjP8JaYkz83CWwvGU2uMUXefd3AazWGx4gpcuEEYD",
+    "A7hAgCzFw14fejgCp387JUJRMNyz4j89JKnhtKU8piqW",
+];
+
 #[derive(Accounts, Debug)]
 pub struct CreateAccounts {
     #[signer]
@@ -203,17 +217,6 @@ pub struct BuyAccounts {
 }
 
 impl BuyAccounts {
-    const BUYBACK_FEE_RECIPIENTS: [&'static str; 8] = [
-        "5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD",
-        "9M4giFFMxmFGXtc3feFzRai56WbBqehoSeRE5GK7gf7",
-        "GXPFM2caqTtQYC2cJ5yJRi9VDkpsYZXzYdwYpGnLmtDL",
-        "3BpXnfJaUTiwXnJNe7Ej1rcbzqTTQUvLShZaWazebsVR",
-        "5cjcW9wExnJJiqgLjq7DEG75Pm6JBgE1hNv4B2vHXUW6",
-        "EHAAiTxcdDwQ3U4bU6YcMsQGaekdzLS3B5SmYo46kJtL",
-        "5eHhjP8JaYkz83CWwvGU2uMUXefd3AazWGx4gpcuEEYD",
-        "A7hAgCzFw14fejgCp387JUJRMNyz4j89JKnhtKU8piqW",
-    ];
-
     pub fn new(mint: Address, user: Address, creator: Address, token_program: Address) -> Self {
         let program = PumpInstruction::PROGRAM;
         let global = Address::from_str_const("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf");
@@ -233,7 +236,7 @@ impl BuyAccounts {
         let fee_program = Address::from_str_const("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ");
         let (bonding_curve_v2, _bump) =
             Address::pda(&program, &[b"bonding-curve-v2", mint.as_ref()]);
-        let buyback_fee_recipient = Address::from_str_const(Self::BUYBACK_FEE_RECIPIENTS[0]);
+        let buyback_fee_recipient = Address::from_str_const(PUMP_BUYBACK_FEE_RECIPIENTS[0]);
         Self {
             global,
             fee_recipient,
@@ -257,15 +260,15 @@ impl BuyAccounts {
     }
 }
 
-/// Pump bonding-curve `sell` accounts (Feb 2026+ layout).
+/// Pump bonding-curve legacy `sell` accounts (Feb 2026+ layout).
 ///
-/// Non-cashback: 15 accounts ending with `bonding_curve_v2` **last**.
-/// Cashback (`bonding_curve` byte 82): insert `user_volume_accumulator`
-/// (writable) immediately before `bonding_curve_v2` → 16 accounts.
+/// Matches on-chain ordering after global buyback: `bonding_curve_v2`, then
+/// `buyback_fee_recipient` (same tail as [`BuyAccounts`]).
 ///
-/// Do **not** append `buyback_fee_recipient` here — it is not part of this
-/// instruction; including it shifts indices and surfaces as `Custom(6024)`
-/// ("overflow") on-chain.
+/// Cashback (`bonding_curve` byte 82): insert writable `user_volume_accumulator`
+/// immediately before `bonding_curve_v2` (IDL remaining-accounts layout).
+///
+/// Wrong account order still surfaces as `Custom(6024)` (overflow) on-chain.
 #[derive(Debug)]
 pub struct SellAccounts {
     pub cashback_enabled: bool,
@@ -285,11 +288,12 @@ pub struct SellAccounts {
     pub fee_program: Address,
     pub user_volume_accumulator: Address,
     pub bonding_curve_v2: Address,
+    pub buyback_fee_recipient: Address,
 }
 
 impl IntoAccountMetaArray for SellAccounts {
     fn accounts_meta(self) -> alloc::vec::Vec<AccountMeta> {
-        let mut v = alloc::vec::Vec::with_capacity(15 + usize::from(self.cashback_enabled));
+        let mut v = alloc::vec::Vec::with_capacity(16 + usize::from(self.cashback_enabled));
         v.push(AccountMeta {
             pubkey: self.global,
             is_signer: false,
@@ -372,6 +376,11 @@ impl IntoAccountMetaArray for SellAccounts {
             is_signer: false,
             writable: false,
         });
+        v.push(AccountMeta {
+            pubkey: self.buyback_fee_recipient,
+            is_signer: false,
+            writable: true,
+        });
         v
     }
 }
@@ -400,6 +409,7 @@ impl SellAccounts {
             Address::pda(&program, &[b"bonding-curve-v2", mint.as_ref()]);
         let (user_volume_accumulator, _bump) =
             Address::pda(&program, &[b"user_volume_accumulator", user.as_ref()]);
+        let buyback_fee_recipient = Address::from_str_const(PUMP_BUYBACK_FEE_RECIPIENTS[0]);
         Self {
             cashback_enabled,
             global,
@@ -418,6 +428,7 @@ impl SellAccounts {
             fee_program,
             user_volume_accumulator,
             bonding_curve_v2,
+            buyback_fee_recipient,
         }
     }
 }

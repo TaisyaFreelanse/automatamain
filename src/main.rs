@@ -325,7 +325,7 @@ async fn main() {
             Json, Router,
             extract::{Path, State},
             response::IntoResponse,
-            routing::get,
+            routing::{get, post},
         };
 
         async fn get_pubkey(State(state): State<ApiState>) -> impl IntoResponse {
@@ -650,6 +650,54 @@ async fn main() {
             axum::http::StatusCode::NO_CONTENT.into_response()
         }
 
+        async fn post_positions_abandon(
+            State(state): State<ApiState>,
+            Json(body): Json<serde_json::Value>,
+        ) -> impl IntoResponse {
+            let Some(arr) = body.get("mints").and_then(|v| v.as_array()) else {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "JSON body must include \"mints\": [\"...\"]"})),
+                )
+                    .into_response();
+            };
+            let mut abandoned: Vec<String> = Vec::new();
+            let mut invalid: Vec<String> = Vec::new();
+            for v in arr {
+                let Some(s) = v.as_str() else {
+                    continue;
+                };
+                let mint: solana_address::Address = match s.parse() {
+                    Ok(m) => m,
+                    Err(_) => {
+                        invalid.push(s.to_string());
+                        continue;
+                    }
+                };
+                if state
+                    .manager_tx
+                    .send(PositionMessage::AbandonPosition { mint })
+                    .await
+                    .is_err()
+                {
+                    return (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({"error": "position manager channel closed"})),
+                    )
+                        .into_response();
+                }
+                abandoned.push(s.to_string());
+            }
+            (
+                axum::http::StatusCode::OK,
+                Json(serde_json::json!({
+                    "abandoned": abandoned,
+                    "invalid_mint_strings": invalid,
+                })),
+            )
+                .into_response()
+        }
+
         let app = Router::new()
             .route("/bot-trades", get(get_bot_trades))
             .route("/status", get(get_status))
@@ -660,6 +708,7 @@ async fn main() {
             .route("/metrics", get(get_metrics))
             .route("/tx-log", get(get_tx_log))
             .route("/mode", get(get_mode).put(put_mode))
+            .route("/positions/abandon", post(post_positions_abandon))
             .with_state(api_state);
 
         let listener = tokio::net::TcpListener::bind(&http_addr)
