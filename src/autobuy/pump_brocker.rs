@@ -441,41 +441,111 @@ impl Broker for SolanaBroker {
         // single ix, so the practical risk is just the natural curve impact.
         // We still log the *expected* SOL (using the configured slippage
         // pad) so audit/PnL tooling sees what we'd have wanted.
-        let price_sol_per_token = pool.price().amount().to_float().max(0.0);
-        let expected_sol = actual_token_amount * price_sol_per_token;
         let slip = self.exec_cfg.slippage_bps as f64 / 10_000.0;
-        let expected_sol_after_slip = (expected_sol * (1.0 - slip)).max(0.0);
         let min_sol_out_f = 0.0_f64;
 
+        // Read bonding curve once: it gives us both `creator` (for the
+        // creator_vault PDA seeds) and `real_sol_reserves` + virtual
+        // reserves needed to clamp `token_amount` against the curve's
+        // actual SOL liquidity. Without that clamp, fresh / illiquid coins
+        // hit pump-fun's `Overflow` error 6024 (0x1788) at lib.rs:844 —
+        // the underflow on `real_sol_reserves.checked_sub(sol_amount)`
+        // when our requested sell would drain more SOL than the curve
+        // physically holds.
+        let curve_state_opt = match fetch_bonding_curve_state(&self.rpc_client, &mint).await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!(
+                    "[BROKER SELL] {mint}: bonding_curve read failed ({e}); cannot \
+                     clamp sell vs real_sol_reserves — proceeding with raw amount and \
+                     hoping for the best"
+                );
+                None
+            }
+        };
+        let creator_for_vault: SolAddress = match &curve_state_opt {
+            Some(s) => s.creator,
+            None => pool.creators()[0],
+        };
+
+        // Convert UI -> raw using pump's 6 decimals, then optionally clamp.
+        let mut token_amount_raw: u64 = (actual_token_amount * 1_000_000.0).round() as u64;
+        let mut sell_was_clamped = false;
+        if let Some(curve) = &curve_state_opt {
+            // Leave a 10% safety margin: fees + intra-block trades can
+            // shrink real_sol_reserves between our read and confirmation,
+            // and pump's check is on the gross sol_amount (pre-fee).
+            let safety_cap_lamports =
+                ((curve.real_sol_reserves as u128) * 90 / 100) as u64;
+            let projected_sol_out = pump_sol_out_for_tokens(token_amount_raw, curve);
+            if projected_sol_out > safety_cap_lamports {
+                let max_sellable =
+                    pump_max_sellable_tokens_for_sol(safety_cap_lamports, curve);
+                let clamped = max_sellable.min(token_amount_raw);
+                eprintln!(
+                    "[BROKER SELL] {mint}: clamping sell {} -> {} raw tokens \
+                     (projected_sol_out={} > safety_cap={} = real_sol_reserves * 0.90, \
+                     real_sol_reserves={})",
+                    token_amount_raw,
+                    clamped,
+                    projected_sol_out,
+                    safety_cap_lamports,
+                    curve.real_sol_reserves,
+                );
+                token_amount_raw = clamped;
+                sell_was_clamped = true;
+            }
+        }
+
+        // Recompute final UI amount + expected sol_out from the (possibly
+        // clamped) raw value so logs and the SellReceipt match what we
+        // actually submit, not what the manager originally requested.
+        let final_token_amount_ui = token_amount_raw as f64 / 1_000_000.0;
+        let expected_sol = match &curve_state_opt {
+            Some(c) => pump_sol_out_for_tokens(token_amount_raw, c) as f64 / 1e9,
+            None => final_token_amount_ui * pool.price().amount().to_float().max(0.0),
+        };
+        let expected_sol_after_slip = (expected_sol * (1.0 - slip)).max(0.0);
+        let price_sol_per_token = if final_token_amount_ui > 0.0 {
+            expected_sol / final_token_amount_ui
+        } else {
+            0.0
+        };
+
+        // If we had to clamp a "100% close", the ATA will retain dust and
+        // Token-2022 will refuse to close it — so we suppress CloseAccount
+        // here and let the next sell cycle (or a manual sweep) handle it.
+        let do_close_ata = close_account_after && !sell_was_clamped;
+        if close_account_after && sell_was_clamped {
+            eprintln!(
+                "[BROKER SELL] {mint}: full-exit clamped by curve liquidity; skipping \
+                 CloseAccount this round (residual ~{:.6} UI tokens will remain in ATA)",
+                actual_token_amount - final_token_amount_ui,
+            );
+        }
+
         eprintln!(
-            "[BROKER SELL] mint={} tokens={:.6} expected={:.6} SOL (price={:.9}) \
-             min_out=0 close_ata={} (slippage waived for guaranteed exit)",
-            mint, actual_token_amount, expected_sol, price_sol_per_token, close_account_after,
+            "[BROKER SELL] mint={} tokens={:.6} (raw={}) expected={:.6} SOL \
+             (price={:.9}) min_out=0 close_ata={} clamped={} \
+             (slippage waived for guaranteed exit)",
+            mint,
+            final_token_amount_ui,
+            token_amount_raw,
+            expected_sol,
+            price_sol_per_token,
+            do_close_ata,
+            sell_was_clamped,
         );
 
         let mut ixs = self.compute_budget_prelude();
 
-        // Skip the SELL ix only if this is a full exit AND there's literally
-        // nothing left on-chain to sell. CloseAccount is still appended so we
-        // recover rent.
-        let needs_sell_ix = actual_token_amount > 0.0;
+        // Skip the SELL ix only if there's literally nothing left to sell
+        // (e.g. ATA already empty AND not clamped to zero). CloseAccount
+        // can still be appended below for rent recovery.
+        let needs_sell_ix = token_amount_raw > 0;
         if needs_sell_ix {
-            let token_amount_in = sips::helper::Amount::<6>::from_float(actual_token_amount);
+            let token_amount_in = sips::helper::Amount::<6>::from_raw(token_amount_raw);
             let min_sol_out = sips::helper::Amount::<9>::from_float(min_sol_out_f);
-
-            // Same on-chain `creator` lookup as in BUY — see the comment
-            // there for the rationale. Sell uses the same `creator_vault`
-            // derivation.
-            let creator_for_vault =
-                match fetch_bonding_curve_creator(&self.rpc_client, &mint).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!(
-                            "[BROKER] fallback to cached creator for {mint}: bonding_curve read failed: {e}"
-                        );
-                        pool.creators()[0]
-                    }
-                };
 
             let ix = PumpInstruction::sell(
                 mint.into(),
@@ -493,10 +563,8 @@ impl Broker for SolanaBroker {
         // refunds the rent-exempt SOL deposit (~0.00203928 SOL per token
         // account) back to `destination` (our wallet) and burns the
         // account. It only succeeds if the account's token balance is 0,
-        // which is why we just sized the SELL off the on-chain raw balance.
-        // Without this, every new position permanently locks rent and the
-        // wallet bleeds SOL even on a flat P&L.
-        if close_account_after {
+        // which is why we suppress it whenever the SELL was clamped.
+        if do_close_ata {
             let close_ix = TokenProgram2022::close_account(
                 ata_sol.into(),
                 self.wallet_address.into(),
@@ -504,6 +572,14 @@ impl Broker for SolanaBroker {
             );
             ixs.push(close_ix.into());
             eprintln!("[BROKER SELL] {mint}: appending CloseAccount(ata={ata_str}) for rent refund");
+        }
+
+        if ixs.is_empty()
+            || (!needs_sell_ix && !do_close_ata)
+        {
+            return Err(BrokerError::Custom(format!(
+                "{mint}: nothing to send (no tokens to sell after clamp and no close requested)"
+            )));
         }
 
         let sig_str = self.send_with_retries(ixs, "SELL").await?;
@@ -741,6 +817,38 @@ async fn fetch_bonding_curve_creator(
     rpc: &RpcClient,
     mint: &SolAddress,
 ) -> Result<SolAddress, BrokerError> {
+    Ok(fetch_bonding_curve_state(rpc, mint).await?.creator)
+}
+
+/// Full bonding-curve account snapshot used both for the `creator_vault` PDA
+/// derivation (BUY/SELL) and for sell-size clamping against available SOL
+/// liquidity (SELL only). `real_token_reserves` isn't read by today's
+/// clamp logic but is parsed for cheap parity with future maintenance
+/// tooling (e.g. dust-sweep scripts).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct BondingCurveState {
+    virtual_token_reserves: u64,
+    virtual_sol_reserves: u64,
+    real_token_reserves: u64,
+    real_sol_reserves: u64,
+    creator: SolAddress,
+}
+
+/// Decode pump-fun bonding curve account fields we care about.
+///
+/// Layout (Anchor): 8-byte discriminator
+///   + virtual_token_reserves: u64        (offset  8)
+///   + virtual_sol_reserves:   u64        (offset 16)
+///   + real_token_reserves:    u64        (offset 24)
+///   + real_sol_reserves:      u64        (offset 32)
+///   + token_total_supply:     u64        (offset 40)
+///   + complete:               bool       (offset 48)
+///   + creator:                Pubkey[32] (offset 49)
+async fn fetch_bonding_curve_state(
+    rpc: &RpcClient,
+    mint: &SolAddress,
+) -> Result<BondingCurveState, BrokerError> {
     let curve_addr = bounding_curve(mint).0;
     let curve_pk_str = curve_addr.to_string();
     let curve_pk = curve_pk_str
@@ -765,9 +873,78 @@ async fn fetch_bonding_curve_creator(
             CREATOR_OFFSET + CREATOR_LEN
         )));
     }
-    let mut bytes = [0u8; CREATOR_LEN];
-    bytes.copy_from_slice(&account.data[CREATOR_OFFSET..CREATOR_OFFSET + CREATOR_LEN]);
-    Ok(SolAddress::new_from_array(bytes))
+
+    let read_u64 = |off: usize| -> u64 {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&account.data[off..off + 8]);
+        u64::from_le_bytes(buf)
+    };
+
+    let mut creator_bytes = [0u8; CREATOR_LEN];
+    creator_bytes.copy_from_slice(&account.data[CREATOR_OFFSET..CREATOR_OFFSET + CREATOR_LEN]);
+
+    Ok(BondingCurveState {
+        virtual_token_reserves: read_u64(8),
+        virtual_sol_reserves:   read_u64(16),
+        real_token_reserves:    read_u64(24),
+        real_sol_reserves:      read_u64(32),
+        creator: SolAddress::new_from_array(creator_bytes),
+    })
+}
+
+/// Pump's constant-product sell formula:
+///   sol_out = vsr - vsr * vtr / (vtr + token_amount)
+///
+/// All math in u128 to avoid overflowing the u64*u64 multiplication
+/// (vsr ≈ 30 SOL = 3e10 lamports, vtr ≈ 1e15 raw → product ≈ 3e25 ≫ u64).
+/// Returns 0 on degenerate inputs (zero reserves) — caller decides what to do.
+fn pump_sol_out_for_tokens(token_amount_raw: u64, curve: &BondingCurveState) -> u64 {
+    if token_amount_raw == 0
+        || curve.virtual_sol_reserves == 0
+        || curve.virtual_token_reserves == 0
+    {
+        return 0;
+    }
+    let vsr = curve.virtual_sol_reserves as u128;
+    let vtr = curve.virtual_token_reserves as u128;
+    let amount = token_amount_raw as u128;
+    let new_vtr = vtr.saturating_add(amount);
+    if new_vtr == 0 {
+        return 0;
+    }
+    let new_vsr = vsr.saturating_mul(vtr) / new_vtr;
+    vsr.saturating_sub(new_vsr).min(u64::MAX as u128) as u64
+}
+
+/// Inverse of `pump_sol_out_for_tokens`: largest `token_amount_raw` whose
+/// curve sell produces *at most* `target_sol_out` lamports of gross output.
+///
+///   token_amount = vsr * vtr / (vsr - target_sol_out) - vtr
+///
+/// Used to size SELL down so the program's
+/// `real_sol_reserves.checked_sub(sol_amount)` doesn't underflow on
+/// freshly-minted, illiquid coins (manifests as Anchor `Overflow` error
+/// 6024 / 0x1788 in pump-fun's sell handler).
+fn pump_max_sellable_tokens_for_sol(target_sol_out: u64, curve: &BondingCurveState) -> u64 {
+    if target_sol_out == 0
+        || curve.virtual_sol_reserves == 0
+        || curve.virtual_token_reserves == 0
+    {
+        return 0;
+    }
+    let vsr = curve.virtual_sol_reserves as u128;
+    let vtr = curve.virtual_token_reserves as u128;
+    let target = target_sol_out as u128;
+    if target >= vsr {
+        // Can never extract more than virtual SOL itself; cap is "everything".
+        return u64::MAX;
+    }
+    let denom = vsr - target;
+    let new_vtr = vsr.saturating_mul(vtr) / denom;
+    if new_vtr <= vtr {
+        return 0;
+    }
+    new_vtr.saturating_sub(vtr).min(u64::MAX as u128) as u64
 }
 
 /// Derive the SPL associated token account address for `(wallet, mint)`
