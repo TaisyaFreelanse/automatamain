@@ -434,8 +434,18 @@ impl PositionManagerActor {
                         let exit_mcap_sol = pos.pool.market_cap().amount().to_float();
 
                         let sell_qty = pos.holdings.to_float() * (percent / 100.0);
+                        // 100% sell = position close. Tell the broker to
+                        // also tear down the on-chain ATA (atomic
+                        // CloseAccount in the same tx) so rent-exempt SOL
+                        // (~0.00203928 SOL/account) is refunded immediately
+                        // instead of being permanently locked.
+                        let close_ata = percent >= 100.0;
 
-                        let return_value = match self.broker.sell(mint, sell_qty, pos.pool.as_ref()).await {
+                        let return_value = match self
+                            .broker
+                            .sell(mint, sell_qty, pos.pool.as_ref(), close_ata)
+                            .await
+                        {
                             Ok(r) => {
                                 let _ = self.event_tx.try_send(WsFeedMessage::TxEvent {
                                     kind: TxEventKind::Sell,

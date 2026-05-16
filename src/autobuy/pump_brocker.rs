@@ -258,7 +258,7 @@ impl Broker for SolanaBroker {
         // manager would size partial sells off the slippage floor
         // (`min_token_out_f`), which severely under-counts the real position
         // and leaves most tokens stranded in the ATA after a "100% sell".
-        let ata_str = derive_ata_string(&self.wallet_address, &mint);
+        let (_ata_sol, ata_str) = derive_ata_address(&self.wallet_address, &mint);
         // ATA may not exist yet (idempotent create runs in this same tx), so
         // absence/error -> 0. Decimals are not needed pre-send.
         let pre_raw: u64 = fetch_token_account_raw(&self.rpc_client, &ata_str)
@@ -355,10 +355,51 @@ impl Broker for SolanaBroker {
         mint: SolAddress,
         token_amount: f64,
         pool: &dyn Pool,
+        close_account_after: bool,
     ) -> Result<SellReceipt, BrokerError> {
-        // Resolve actual token amount dynamically: trust the manager's value,
-        // but if it's <= 0 use whatever the WS stream observed for this mint.
-        let actual_token_amount = {
+        // Derive the ATA up-front: needed for both the optional CloseAccount
+        // ix and (on full exits) for sizing the SELL off the *current* raw
+        // balance — which is the only number that lets `CloseAccount`
+        // succeed atomically (Token-2022 refuses to close a non-empty
+        // account).
+        let (ata_sol, ata_str) = derive_ata_address(&self.wallet_address, &mint);
+
+        // Resolve actual token amount dynamically:
+        //   * full exit  -> read raw ATA balance now and sell exactly that;
+        //   * partial    -> trust the manager's value;
+        //   * fallback   -> WS-tracked balance if manager passed 0.
+        let actual_token_amount = if close_account_after {
+            match fetch_token_account_raw_with_decimals(&self.rpc_client, &ata_str).await {
+                Ok((raw, decimals)) if raw > 0 => {
+                    let scale = 10u64.pow(decimals as u32) as f64;
+                    let chain_balance = raw as f64 / scale;
+                    if (chain_balance - token_amount).abs() > token_amount.max(1.0) * 0.01 {
+                        eprintln!(
+                            "[BROKER SELL] {mint}: full-exit chain balance ({:.6}) differs from \
+                             manager request ({:.6}) by >1%; using chain balance to allow \
+                             atomic ATA close",
+                            chain_balance, token_amount,
+                        );
+                    }
+                    chain_balance
+                }
+                Ok(_) => {
+                    eprintln!(
+                        "[BROKER SELL] {mint}: full-exit requested but ATA already empty \
+                         on-chain; will skip SELL and just close the account"
+                    );
+                    0.0
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[BROKER SELL] {mint}: full-exit ATA balance read failed ({e}); \
+                         falling back to manager-supplied amount {:.6}",
+                        token_amount,
+                    );
+                    token_amount.max(0.0)
+                }
+            }
+        } else {
             let positions = self.positions.lock().unwrap();
             if token_amount > 0.0 {
                 token_amount
@@ -375,7 +416,10 @@ impl Broker for SolanaBroker {
             }
         };
 
-        if actual_token_amount <= 0.0 {
+        // For partial sells we still require a positive amount — selling
+        // nothing partially is a logic error. For full exits, an already
+        // empty ATA is fine: we'll just close it.
+        if !close_account_after && actual_token_amount <= 0.0 {
             return Err(BrokerError::Custom(
                 "Calculated token amount is 0. Position might not be updated via WS yet.".into(),
             ));
@@ -404,38 +448,63 @@ impl Broker for SolanaBroker {
         let min_sol_out_f = 0.0_f64;
 
         eprintln!(
-            "[BROKER SELL] mint={} tokens={:.2} expected={:.6} SOL (price={:.9}) \
-             min_out=0 (slippage waived for guaranteed exit)",
-            mint, actual_token_amount, expected_sol, price_sol_per_token,
-        );
-
-        let token_amount_in = sips::helper::Amount::<6>::from_float(actual_token_amount);
-        let min_sol_out = sips::helper::Amount::<9>::from_float(min_sol_out_f);
-
-        // Same on-chain `creator` lookup as in BUY — see the comment there
-        // for the rationale. Sell uses the same `creator_vault` derivation.
-        let creator_for_vault =
-            match fetch_bonding_curve_creator(&self.rpc_client, &mint).await {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!(
-                        "[BROKER] fallback to cached creator for {mint}: bonding_curve read failed: {e}"
-                    );
-                    pool.creators()[0]
-                }
-            };
-
-        let ix = PumpInstruction::sell(
-            mint.into(),
-            self.wallet_address.into(),
-            creator_for_vault.into(),
-            TokenProgram2022::PROGRAM,
-            token_amount_in,
-            min_sol_out,
+            "[BROKER SELL] mint={} tokens={:.6} expected={:.6} SOL (price={:.9}) \
+             min_out=0 close_ata={} (slippage waived for guaranteed exit)",
+            mint, actual_token_amount, expected_sol, price_sol_per_token, close_account_after,
         );
 
         let mut ixs = self.compute_budget_prelude();
-        ixs.push(ix.into());
+
+        // Skip the SELL ix only if this is a full exit AND there's literally
+        // nothing left on-chain to sell. CloseAccount is still appended so we
+        // recover rent.
+        let needs_sell_ix = actual_token_amount > 0.0;
+        if needs_sell_ix {
+            let token_amount_in = sips::helper::Amount::<6>::from_float(actual_token_amount);
+            let min_sol_out = sips::helper::Amount::<9>::from_float(min_sol_out_f);
+
+            // Same on-chain `creator` lookup as in BUY — see the comment
+            // there for the rationale. Sell uses the same `creator_vault`
+            // derivation.
+            let creator_for_vault =
+                match fetch_bonding_curve_creator(&self.rpc_client, &mint).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!(
+                            "[BROKER] fallback to cached creator for {mint}: bonding_curve read failed: {e}"
+                        );
+                        pool.creators()[0]
+                    }
+                };
+
+            let ix = PumpInstruction::sell(
+                mint.into(),
+                self.wallet_address.into(),
+                creator_for_vault.into(),
+                TokenProgram2022::PROGRAM,
+                token_amount_in,
+                min_sol_out,
+            );
+
+            ixs.push(ix.into());
+        }
+
+        // Atomic rent recovery on full exits. Token-2022 `CloseAccount`
+        // refunds the rent-exempt SOL deposit (~0.00203928 SOL per token
+        // account) back to `destination` (our wallet) and burns the
+        // account. It only succeeds if the account's token balance is 0,
+        // which is why we just sized the SELL off the on-chain raw balance.
+        // Without this, every new position permanently locks rent and the
+        // wallet bleeds SOL even on a flat P&L.
+        if close_account_after {
+            let close_ix = TokenProgram2022::close_account(
+                ata_sol.into(),
+                self.wallet_address.into(),
+                self.wallet_address.into(),
+            );
+            ixs.push(close_ix.into());
+            eprintln!("[BROKER SELL] {mint}: appending CloseAccount(ata={ata_str}) for rent refund");
+        }
 
         let sig_str = self.send_with_retries(ixs, "SELL").await?;
 
@@ -701,11 +770,12 @@ async fn fetch_bonding_curve_creator(
     Ok(SolAddress::new_from_array(bytes))
 }
 
-/// Derive the SPL associated token account string for `(wallet, mint)` under
-/// the Token-2022 program (which pump-fun uses). The string is parsed by
-/// callers into the RPC client's `Pubkey` type (avoids hard-coupling this
-/// module to a specific solana-pubkey version).
-fn derive_ata_string(wallet: &SolAddress, mint: &SolAddress) -> String {
+/// Derive the SPL associated token account address for `(wallet, mint)`
+/// under the Token-2022 program (which pump-fun uses). Returns both the
+/// typed `SolAddress` (for ix-building) and its base58 string form (for RPC
+/// calls that go through string parsing — avoids hard-coupling this module
+/// to a specific `solana-pubkey` version).
+fn derive_ata_address(wallet: &SolAddress, mint: &SolAddress) -> (SolAddress, String) {
     let wallet_sips: sips::address::Address = (*wallet).into();
     let mint_sips: sips::address::Address = (*mint).into();
     let (ata_sips, _bump) = sips::helper::ata(
@@ -714,7 +784,8 @@ fn derive_ata_string(wallet: &SolAddress, mint: &SolAddress) -> String {
         &mint_sips,
     );
     let ata_sol: SolAddress = ata_sips.into();
-    ata_sol.to_string()
+    let s = ata_sol.to_string();
+    (ata_sol, s)
 }
 
 /// Read the raw token amount of a given ATA at `confirmed` commitment.

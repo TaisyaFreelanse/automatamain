@@ -67,6 +67,7 @@ impl Broker for MockBroker {
         mint: Address,
         token_amount: f64,
         pool: &dyn Pool,
+        _close_account_after: bool,
     ) -> Result<SellReceipt, BrokerError> {
         let current_mcap = pool.market_cap().amount().to_float();
 

@@ -49,11 +49,20 @@ pub trait Broker: Send + Sync {
     ) -> Result<BuyReceipt, BrokerError>;
 
     /// Close or reduce a position: sell `token_amount` tokens, receive SOL.
+    ///
+    /// If `close_account_after == true`, the broker treats this as a full
+    /// exit: the on-chain SELL is sized to the *current* ATA balance (not
+    /// `token_amount`, which may be stale after rounding) and a
+    /// `CloseAccount` instruction is appended to the same transaction so the
+    /// ATA's rent-exempt SOL (~0.00203928 SOL per token account) is refunded
+    /// to the wallet atomically. Without this, every new position
+    /// permanently locks rent and the wallet bleeds SOL even on a flat P&L.
     async fn sell(
         &self,
         mint: Address,
         token_amount: f64,
         pool: &dyn Pool,
+        close_account_after: bool,
     ) -> Result<SellReceipt, BrokerError>;
 
     /// Current SOL balance (locally cached value — call
