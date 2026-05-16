@@ -42,7 +42,8 @@ scoring:
   a_threshold: 6
   # --- Live-only gates (ignored when execution.mode: demo) ---------------
   # Require bonding-curve mcap growth into the "good" band during the window.
-  require_momentum_good: true
+  # TEMP: off — mcap in logs stays ~flat vs window; re-enable after better mcap signal / logging.
+  require_momentum_good: false
   # Live: tier must be at least this. Use `A` so both A and A+ can buy when
   # `require_momentum_good` passes; set `APlus` only if you want top-tier-only.
   minimum_tier_for_buy: A
