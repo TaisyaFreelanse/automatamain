@@ -70,7 +70,9 @@ scoring:
     buyers_mid: 6
     buyers_low: 3
     buy_to_sell_high: 1.5
-    momentum_good_low_pct: 12.0
+    # % mcap growth over scoring_window; 12% was too strict for early-curve
+    # launches in ~3.5s — 4% still requires real lift without flat-curve noise.
+    momentum_good_low_pct: 4.0
     momentum_good_high_pct: 30.0
     momentum_overheated_pct: 60.0
     volume_ok_sol: 10.0

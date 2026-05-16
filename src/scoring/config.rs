@@ -127,6 +127,7 @@ pub struct FeatureThresholds {
     pub buyers_mid: u64,
     pub buyers_low: u64,
     pub buy_to_sell_high: f64,
+    /// Minimum % mcap growth (vs start of scoring window) for `momentum_good`.
     pub momentum_good_low_pct: f64,
     pub momentum_good_high_pct: f64,
     pub momentum_overheated_pct: f64,
@@ -148,7 +149,7 @@ impl Default for FeatureThresholds {
             buyers_mid: 6,
             buyers_low: 3,
             buy_to_sell_high: 1.5,
-            momentum_good_low_pct: 12.0,
+            momentum_good_low_pct: 4.0,
             momentum_good_high_pct: 30.0,
             momentum_overheated_pct: 60.0,
             volume_ok_sol: 10.0,
