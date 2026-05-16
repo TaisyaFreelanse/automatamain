@@ -1234,7 +1234,7 @@ impl eframe::App for Dashboard {
                             ui.label(egui::RichText::new("Mode").strong());
                             ui.label(egui::RichText::new("Mint").strong());
                             ui.label(egui::RichText::new("SOL").strong());
-                            ui.label(egui::RichText::new("Tx / Status").strong());
+                            ui.label(egui::RichText::new("Status").strong());
                             ui.end_row();
 
                             // Newest first.
@@ -1266,29 +1266,41 @@ impl eframe::App for Dashboard {
                                 );
                                 ui.label(format!("{:.4}", row.amount_sol));
 
-                                // Signature button (copy on click) or status.
+                                // Live: hide raw signatures in-grid; show compact status + optional
+                                // close hint, full sig only in tooltip / copy.
                                 if let Some(sig) = &row.signature {
-                                    let short = if sig.len() > 14 {
-                                        format!("{}…{}", &sig[..6], &sig[sig.len() - 6..])
-                                    } else {
-                                        sig.clone()
-                                    };
-                                    let btn = egui::Button::new(
-                                        egui::RichText::new(format!("📋 {}", short))
-                                            .monospace()
-                                            .color(egui::Color32::from_rgb(180, 220, 255)),
-                                    )
-                                    .frame(false);
-                                    if ui
-                                        .add(btn)
-                                        .on_hover_text(format!(
-                                            "Click to copy signature: {}\n(open in Solscan: https://solscan.io/tx/{})",
-                                            sig, sig
-                                        ))
-                                        .clicked()
-                                    {
-                                        tx_ctx.copy_text(sig.clone());
-                                    }
+                                    ui.horizontal(|ui| {
+                                        let (st_lbl, st_col) = match row.status.as_str() {
+                                            "sent" => ("ok", egui::Color32::from_rgb(110, 190, 130)),
+                                            "failed" => ("failed", egui::Color32::from_rgb(220, 90, 90)),
+                                            _ => (row.status.as_str(), egui::Color32::LIGHT_GRAY),
+                                        };
+                                        ui.colored_label(st_col, st_lbl);
+                                        if let Some(ref r) = row.reason {
+                                            if !r.is_empty() {
+                                                let short = if r.len() > 28 {
+                                                    format!("{}…", &r[..28])
+                                                } else {
+                                                    r.clone()
+                                                };
+                                                ui.label(
+                                                    egui::RichText::new(short)
+                                                        .small()
+                                                        .color(egui::Color32::GRAY),
+                                                );
+                                            }
+                                        }
+                                        let tip = format!(
+                                            "Signature (click 📋 to copy)\n{sig}\n\nSolscan:\nhttps://solscan.io/tx/{sig}"
+                                        );
+                                        if ui
+                                            .add(egui::Button::new("📋").small())
+                                            .on_hover_text(&tip)
+                                            .clicked()
+                                        {
+                                            tx_ctx.copy_text(sig.clone());
+                                        }
+                                    });
                                 } else {
                                     let (lbl, col) = match row.status.as_str() {
                                         "failed" => (
