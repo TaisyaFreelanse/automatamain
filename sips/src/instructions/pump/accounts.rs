@@ -257,36 +257,133 @@ impl BuyAccounts {
     }
 }
 
-#[derive(Accounts, Debug)]
+/// Pump bonding-curve `sell` accounts (Feb 2026+ layout).
+///
+/// Non-cashback: 15 accounts ending with `bonding_curve_v2` **last**.
+/// Cashback (`bonding_curve` byte 82): insert `user_volume_accumulator`
+/// (writable) immediately before `bonding_curve_v2` → 16 accounts.
+///
+/// Do **not** append `buyback_fee_recipient` here — it is not part of this
+/// instruction; including it shifts indices and surfaces as `Custom(6024)`
+/// ("overflow") on-chain.
+#[derive(Debug)]
 pub struct SellAccounts {
+    pub cashback_enabled: bool,
     pub global: Address,
-    #[writable]
     pub fee_recipient: Address,
     pub mint: Address,
-    #[writable]
     pub bonding_curve: Address,
-    #[writable]
     pub associated_bonding_curve: Address,
-    #[writable]
     pub associated_user: Address,
-    #[signer]
-    #[writable]
     pub user: Address,
     pub system_program: Address,
-    #[writable]
     pub creator_vault: Address,
     pub token_program: Address,
     pub event_authority: Address,
     pub program: Address,
     pub fee_config: Address,
     pub fee_program: Address,
+    pub user_volume_accumulator: Address,
     pub bonding_curve_v2: Address,
-    #[writable]
-    pub buyback_fee_recipient: Address,
+}
+
+impl IntoAccountMetaArray for SellAccounts {
+    fn accounts_meta(self) -> alloc::vec::Vec<AccountMeta> {
+        let mut v = alloc::vec::Vec::with_capacity(15 + usize::from(self.cashback_enabled));
+        v.push(AccountMeta {
+            pubkey: self.global,
+            is_signer: false,
+            writable: false,
+        });
+        v.push(AccountMeta {
+            pubkey: self.fee_recipient,
+            is_signer: false,
+            writable: true,
+        });
+        v.push(AccountMeta {
+            pubkey: self.mint,
+            is_signer: false,
+            writable: false,
+        });
+        v.push(AccountMeta {
+            pubkey: self.bonding_curve,
+            is_signer: false,
+            writable: true,
+        });
+        v.push(AccountMeta {
+            pubkey: self.associated_bonding_curve,
+            is_signer: false,
+            writable: true,
+        });
+        v.push(AccountMeta {
+            pubkey: self.associated_user,
+            is_signer: false,
+            writable: true,
+        });
+        v.push(AccountMeta {
+            pubkey: self.user,
+            is_signer: true,
+            writable: true,
+        });
+        v.push(AccountMeta {
+            pubkey: self.system_program,
+            is_signer: false,
+            writable: false,
+        });
+        v.push(AccountMeta {
+            pubkey: self.creator_vault,
+            is_signer: false,
+            writable: true,
+        });
+        v.push(AccountMeta {
+            pubkey: self.token_program,
+            is_signer: false,
+            writable: false,
+        });
+        v.push(AccountMeta {
+            pubkey: self.event_authority,
+            is_signer: false,
+            writable: false,
+        });
+        v.push(AccountMeta {
+            pubkey: self.program,
+            is_signer: false,
+            writable: false,
+        });
+        v.push(AccountMeta {
+            pubkey: self.fee_config,
+            is_signer: false,
+            writable: false,
+        });
+        v.push(AccountMeta {
+            pubkey: self.fee_program,
+            is_signer: false,
+            writable: false,
+        });
+        if self.cashback_enabled {
+            v.push(AccountMeta {
+                pubkey: self.user_volume_accumulator,
+                is_signer: false,
+                writable: true,
+            });
+        }
+        v.push(AccountMeta {
+            pubkey: self.bonding_curve_v2,
+            is_signer: false,
+            writable: false,
+        });
+        v
+    }
 }
 
 impl SellAccounts {
-    pub fn new(mint: Address, user: Address, creator: Address, token_program: Address) -> Self {
+    pub fn new(
+        mint: Address,
+        user: Address,
+        creator: Address,
+        token_program: Address,
+        cashback_enabled: bool,
+    ) -> Self {
         let program = PumpInstruction::PROGRAM;
         let global = Address::from_str_const("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf");
         let fee_recipient = Address::from_str_const("62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV");
@@ -301,8 +398,10 @@ impl SellAccounts {
         let fee_program = Address::from_str_const("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ");
         let (bonding_curve_v2, _bump) =
             Address::pda(&program, &[b"bonding-curve-v2", mint.as_ref()]);
-        let buyback_fee_recipient = Address::from_str_const(BuyAccounts::BUYBACK_FEE_RECIPIENTS[0]);
+        let (user_volume_accumulator, _bump) =
+            Address::pda(&program, &[b"user_volume_accumulator", user.as_ref()]);
         Self {
+            cashback_enabled,
             global,
             fee_recipient,
             mint,
@@ -311,14 +410,14 @@ impl SellAccounts {
             associated_user,
             user,
             system_program,
-            token_program,
             creator_vault,
+            token_program,
             event_authority,
             program,
             fee_config,
             fee_program,
+            user_volume_accumulator,
             bonding_curve_v2,
-            buyback_fee_recipient,
         }
     }
 }

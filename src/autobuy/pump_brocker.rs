@@ -597,6 +597,16 @@ impl Broker for SolanaBroker {
         // (e.g. ATA already empty AND not clamped to zero). CloseAccount
         // can still be appended below for rent recovery.
         let needs_sell_ix = token_amount_raw > 0;
+        let cashback_enabled = curve_state_opt
+            .as_ref()
+            .map(|c| c.is_cashback_coin)
+            .unwrap_or(false);
+        if cashback_enabled {
+            eprintln!(
+                "[BROKER SELL] {mint}: bonding curve has cashback enabled — \
+                 including user_volume_accumulator in sell accounts"
+            );
+        }
         if needs_sell_ix {
             let token_amount_in = sips::helper::Amount::<6>::from_raw(token_amount_raw);
             let min_sol_out = sips::helper::Amount::<9>::from_float(min_sol_out_f);
@@ -608,6 +618,7 @@ impl Broker for SolanaBroker {
                 TokenProgram2022::PROGRAM,
                 token_amount_in,
                 min_sol_out,
+                cashback_enabled,
             );
 
             ixs.push(ix.into());
@@ -905,18 +916,26 @@ struct BondingCurveState {
     real_token_reserves: u64,
     real_sol_reserves: u64,
     creator: SolAddress,
+    /// `BondingCurve::is_cashback_coin` (pump IDL). When true, on-chain `sell`
+    /// must pass `user_volume_accumulator` before `bonding_curve_v2` (`sips`
+    /// `SellAccounts`). If omitted, Pump returns `Custom(6024)` (often called
+    /// "overflow"); see pump-public-docs `PUMP_CASHBACK_README.md`.
+    is_cashback_coin: bool,
 }
 
 /// Decode pump-fun bonding curve account fields we care about.
 ///
 /// Layout (Anchor): 8-byte discriminator
 ///   + virtual_token_reserves: u64        (offset  8)
-///   + virtual_sol_reserves:   u64        (offset 16)
+///   + virtual_quote_reserves: u64        (offset 16)  (legacy name: virtual SOL)
 ///   + real_token_reserves:    u64        (offset 24)
-///   + real_sol_reserves:      u64        (offset 32)
+///   + real_quote_reserves:    u64        (offset 32)
 ///   + token_total_supply:     u64        (offset 40)
 ///   + complete:               bool       (offset 48)
 ///   + creator:                Pubkey[32] (offset 49)
+///   + is_mayhem_mode:         bool       (offset 81)
+///   + is_cashback_coin:       bool       (offset 82)
+///   + quote_mint:             Pubkey     (offset 83)
 async fn fetch_bonding_curve_state(
     rpc: &RpcClient,
     mint: &SolAddress,
@@ -938,6 +957,7 @@ async fn fetch_bonding_curve_state(
 
     const CREATOR_OFFSET: usize = 8 + 8 * 5 + 1;
     const CREATOR_LEN: usize = 32;
+    const IS_CASHBACK_COIN_OFFSET: usize = CREATOR_OFFSET + CREATOR_LEN + 1; // after `is_mayhem_mode`
     if account.data.len() < CREATOR_OFFSET + CREATOR_LEN {
         return Err(BrokerError::Custom(format!(
             "bonding_curve data too short: {} bytes, need at least {}",
@@ -955,12 +975,16 @@ async fn fetch_bonding_curve_state(
     let mut creator_bytes = [0u8; CREATOR_LEN];
     creator_bytes.copy_from_slice(&account.data[CREATOR_OFFSET..CREATOR_OFFSET + CREATOR_LEN]);
 
+    let is_cashback_coin = account.data.len() > IS_CASHBACK_COIN_OFFSET
+        && account.data[IS_CASHBACK_COIN_OFFSET] != 0;
+
     Ok(BondingCurveState {
         virtual_token_reserves: read_u64(8),
         virtual_sol_reserves:   read_u64(16),
         real_token_reserves:    read_u64(24),
         real_sol_reserves:      read_u64(32),
         creator: SolAddress::new_from_array(creator_bytes),
+        is_cashback_coin,
     })
 }
 

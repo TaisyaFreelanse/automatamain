@@ -105,13 +105,14 @@ impl PumpInstruction {
         token_program: Address,
         token_amount: Amount<PUMP_SPL_PRECISION>,
         minimum_sol_payout: Amount<NATIVE_SOL_PRECISION>,
+        cashback_enabled: bool,
     ) -> Instruction<PumpSellInstruction, SellAccounts> {
         Instruction {
             data: PumpSellInstruction {
                 spl_amount: token_amount,
                 minimum_sol_payout,
             },
-            accounts: SellAccounts::new(mint, user, creator, token_program),
+            accounts: SellAccounts::new(mint, user, creator, token_program, cashback_enabled),
         }
     }
 }
