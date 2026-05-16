@@ -22,6 +22,7 @@ use solana_rpc_client_types::config::{CommitmentConfig, CommitmentLevel};
 use crate::{
     autobuy::execution::LiveExecutionConfig,
     generalize::{general_commands::TradeAction, general_pool::Pool},
+    launchpads::pump::general::bounding_curve,
 };
 
 use super::broker::{Broker, BrokerError, BuyReceipt, SellReceipt};
@@ -252,10 +253,29 @@ impl Broker for SolanaBroker {
             TokenProgram2022::PROGRAM,
         );
 
+        // pump-fun derives `creator_vault` from `bonding_curve.creator`, NOT
+        // from the user / CreateEvent.creator. That on-chain field can be
+        // rewritten by `set_metaplex_creator` or seeded from backend data for
+        // historical coins, so cached CreateEvent values mismatch and the BUY
+        // fails with `ConstraintSeeds` (Anchor 2006 / 0xbc6+). We read the
+        // authoritative value off the bonding curve account right before
+        // submit and fall back to the cached creator only if the RPC read
+        // fails for some reason.
+        let creator_for_vault =
+            match fetch_bonding_curve_creator(&self.rpc_client, &mint).await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "[BROKER] fallback to cached creator for {mint}: bonding_curve read failed: {e}"
+                    );
+                    pool.creators()[0]
+                }
+            };
+
         let ix = PumpInstruction::buy_exact_in(
             mint.into(),
             self.wallet_address.into(),
-            pool.creators()[0].into(),
+            creator_for_vault.into(),
             TokenProgram2022::PROGRAM,
             sol_amount_in,
             min_token_out,
@@ -347,10 +367,23 @@ impl Broker for SolanaBroker {
         let token_amount_in = sips::helper::Amount::<6>::from_float(actual_token_amount);
         let min_sol_out = sips::helper::Amount::<9>::from_float(min_sol_out_f);
 
+        // Same on-chain `creator` lookup as in BUY — see the comment there
+        // for the rationale. Sell uses the same `creator_vault` derivation.
+        let creator_for_vault =
+            match fetch_bonding_curve_creator(&self.rpc_client, &mint).await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "[BROKER] fallback to cached creator for {mint}: bonding_curve read failed: {e}"
+                    );
+                    pool.creators()[0]
+                }
+            };
+
         let ix = PumpInstruction::sell(
             mint.into(),
             self.wallet_address.into(),
-            pool.creators()[0].into(),
+            creator_for_vault.into(),
             TokenProgram2022::PROGRAM,
             token_amount_in,
             min_sol_out,
@@ -576,6 +609,51 @@ fn is_account_propagation_error(msg: &str) -> bool {
         || m.contains("accountnotinitialized")
         || m.contains("error number: 3012")
         || m.contains("\"err\": 3012")
+}
+
+/// Read the `creator` field directly from a pump-fun bonding_curve account.
+///
+/// Layout (Anchor): 8-byte discriminator + 5 × u64 (virtual/real reserves +
+/// supply) + 1-byte `complete` flag + 32-byte `creator` Pubkey. So `creator`
+/// lives at byte offset 49..81 of the account data. Newer pump-fun bonding
+/// curves are extended to 150 bytes (see pump-public-docs), but the field
+/// position is stable.
+///
+/// We deliberately ignore CreateEvent.creator and PumpPool.creators() because
+/// `set_metaplex_creator` and the backend creator-seed path can mutate this
+/// value after creation; only the on-chain account is authoritative for the
+/// `creator_vault` PDA seeds the program checks.
+async fn fetch_bonding_curve_creator(
+    rpc: &RpcClient,
+    mint: &SolAddress,
+) -> Result<SolAddress, BrokerError> {
+    let curve_addr = bounding_curve(mint).0;
+    let curve_pk_str = curve_addr.to_string();
+    let curve_pk = curve_pk_str
+        .parse()
+        .map_err(|_| BrokerError::Custom(format!("invalid bonding curve pubkey: {curve_pk_str}")))?;
+
+    let resp = rpc
+        .get_account_with_commitment(&curve_pk, CommitmentConfig::confirmed())
+        .await
+        .map_err(|e| BrokerError::Custom(format!("get_account bonding_curve {curve_pk_str}: {e}")))?;
+
+    let account = resp
+        .value
+        .ok_or_else(|| BrokerError::Custom(format!("bonding curve {curve_pk_str} not found")))?;
+
+    const CREATOR_OFFSET: usize = 8 + 8 * 5 + 1;
+    const CREATOR_LEN: usize = 32;
+    if account.data.len() < CREATOR_OFFSET + CREATOR_LEN {
+        return Err(BrokerError::Custom(format!(
+            "bonding_curve data too short: {} bytes, need at least {}",
+            account.data.len(),
+            CREATOR_OFFSET + CREATOR_LEN
+        )));
+    }
+    let mut bytes = [0u8; CREATOR_LEN];
+    bytes.copy_from_slice(&account.data[CREATOR_OFFSET..CREATOR_OFFSET + CREATOR_LEN]);
+    Ok(SolAddress::new_from_array(bytes))
 }
 
 /// Poll `get_account_with_commitment(Confirmed)` until the account is visible
