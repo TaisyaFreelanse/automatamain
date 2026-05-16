@@ -15,7 +15,7 @@ use sips::instructions::{
 use solana_address::Address as SolAddress;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_instruction::Instruction as SolanaIx;
-use solana_keypair::Keypair;
+use solana_keypair::{Keypair, Signature};
 use solana_rpc_client_types::config::{CommitmentConfig, CommitmentLevel};
 // Use the modular solana crate instead of the monolithic solana_sdk
 
@@ -120,6 +120,59 @@ impl SolanaBroker {
         out
     }
 
+    /// `send_transaction` only proves the RPC accepted the wire format. With
+    /// `skip_preflight: true` (Gatekeeper / unsupported preflight) the same
+    /// call can return a signature for a tx that never lands or fails at
+    /// execution. The manager must not drop a position until we see this
+    /// signature at **confirmed** commitment with no `err`.
+    async fn wait_until_signature_confirmed_ok(
+        &self,
+        signature: &Signature,
+        label: &str,
+    ) -> Result<(), BrokerError> {
+        const TIMEOUT: Duration = Duration::from_secs(90);
+        const POLL: Duration = Duration::from_millis(400);
+        let started = std::time::Instant::now();
+
+        loop {
+            let resp = self
+                .rpc_client
+                .get_signature_statuses(std::slice::from_ref(signature))
+                .await
+                .map_err(|e| {
+                    BrokerError::Custom(format!("{label}: get_signature_statuses: {e}"))
+                })?;
+
+            if let Some(Some(status)) = resp.value.first() {
+                if let Some(ref err) = status.err {
+                    return Err(BrokerError::TransactionFailed(format!(
+                        "{label}: on-chain transaction error: {err:?}"
+                    )));
+                }
+                if status.status.is_err() {
+                    return Err(BrokerError::TransactionFailed(format!(
+                        "{label}: on-chain transaction status: {:?}",
+                        status.status
+                    )));
+                }
+                if status.satisfies_commitment(CommitmentConfig::confirmed()) {
+                    eprintln!(
+                        "[BROKER TX] {label}: {signature} confirmed (no execution error)"
+                    );
+                    return Ok(());
+                }
+            }
+
+            if started.elapsed() >= TIMEOUT {
+                return Err(BrokerError::TransactionFailed(format!(
+                    "{label}: timed out after {TIMEOUT:?} waiting for confirmed success \
+                     (sig={signature})"
+                )));
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
     /// Sign + broadcast with retries. Returns the signature (base58 string).
     ///
     /// Special handling for pump-fun's `AccountNotInitialized` (Anchor 3012 /
@@ -181,6 +234,7 @@ impl SolanaBroker {
                 Ok(sig) => {
                     let sig_str = sig.to_string();
                     println!("[BROKER TX] {label} sent (attempt {attempt}): {sig_str}");
+                    self.wait_until_signature_confirmed_ok(&sig, label).await?;
                     return Ok(sig_str);
                 }
                 Err(e) => {
@@ -582,7 +636,25 @@ impl Broker for SolanaBroker {
             )));
         }
 
+        // Snapshot at `confirmed` immediately before broadcast so we can prove
+        // the SELL actually moved tokens (or removed the ATA) — matching what
+        // the manager will deduct from in-memory holdings.
+        let pre_sell_raw = fetch_token_account_raw(&self.rpc_client, &ata_str)
+            .await
+            .unwrap_or(0);
+
         let sig_str = self.send_with_retries(ixs, "SELL").await?;
+
+        poll_ata_confirms_sell(
+            &self.rpc_client,
+            &ata_str,
+            pre_sell_raw,
+            token_amount_raw,
+            do_close_ata,
+            mint,
+            Duration::from_secs(45),
+        )
+        .await?;
 
         // Balance/holdings will be updated authoritatively via `on_trade`.
         // We optimistically credit the (slippage-discounted) expected SOL so
@@ -1052,6 +1124,113 @@ async fn poll_token_balance_increase(
                 last_err.unwrap_or_else(|| "no successful read".into()),
             )));
         }
+        tokio::time::sleep(poll_delay).await;
+    }
+}
+
+/// How much raw balance drop we tolerate below `sold_raw` (rounding / RPC).
+fn sell_raw_delta_slack(sold_raw: u64) -> u64 {
+    if sold_raw == 0 {
+        return 0;
+    }
+    // Up to 0.01% of the sell, at least 1 raw unit, capped at 100 raw (= 0.0001 UI @ 6 dp).
+    (sold_raw / 10_000).max(1).min(100)
+}
+
+/// After `send_with_retries` (signature already **confirmed**, no `err`),
+/// verify the ATA reflects the sell: partial → raw balance dropped by at
+/// least `sold_raw - slack`; full exit + CloseAccount → ATA must vanish at
+/// `confirmed`. Without this, `skip_preflight` + RPC quirks can leave the
+/// manager/UI out of sync with chain state.
+async fn poll_ata_confirms_sell(
+    rpc: &RpcClient,
+    ata: &str,
+    pre_raw: u64,
+    sold_raw: u64,
+    expect_ata_closed: bool,
+    mint: SolAddress,
+    total_timeout: Duration,
+) -> Result<(), BrokerError> {
+    let poll_delay = Duration::from_millis(400);
+    let started = std::time::Instant::now();
+    let mut attempts: u32 = 0;
+
+    let ata_pk = ata
+        .parse()
+        .map_err(|_| BrokerError::Custom(format!("poll_ata_confirms_sell: invalid ATA {ata}")))?;
+
+    let slack = sell_raw_delta_slack(sold_raw);
+    // Never accept "zero drop" as success when we meant to sell a positive raw amount.
+    let min_drop = (sold_raw.saturating_sub(slack)).max(if sold_raw > 0 { 1 } else { 0 });
+
+    loop {
+        attempts += 1;
+
+        if expect_ata_closed {
+            match rpc
+                .get_account_with_commitment(&ata_pk, CommitmentConfig::confirmed())
+                .await
+            {
+                Ok(resp) if resp.value.is_none() => {
+                    eprintln!(
+                        "[BROKER SELL] {mint}: ATA {ata} closed or absent at confirmed \
+                         (attempt {attempts}, {:?})",
+                        started.elapsed()
+                    );
+                    return Ok(());
+                }
+                Ok(resp) if resp.value.is_some() => {
+                    // CloseAccount is in the same tx as the sell; if the ATA still
+                    // exists, either we're lagging or the close did not land.
+                    if started.elapsed() >= total_timeout {
+                        return Err(BrokerError::TransactionFailed(format!(
+                            "{mint}: expected ATA {ata} to close after full SELL; still present \
+                             after {attempts} polls in {:?} (pre_raw={pre_raw}, sold_raw={sold_raw})",
+                            total_timeout
+                        )));
+                    }
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if started.elapsed() >= total_timeout {
+                        return Err(BrokerError::Custom(format!(
+                            "{mint}: get_account ATA {ata} after full SELL: {msg}"
+                        )));
+                    }
+                }
+                Ok(_) => {}
+            }
+        } else {
+            match fetch_token_account_raw_with_decimals(rpc, ata).await {
+                Ok((post_raw, _decimals)) => {
+                    let drop = pre_raw.saturating_sub(post_raw);
+                    if drop >= min_drop {
+                        eprintln!(
+                            "[BROKER SELL] {mint}: ATA balance drop confirmed raw {pre_raw} -> \
+                             {post_raw} (delta={drop}, need>={min_drop}, sold_raw={sold_raw}, \
+                             attempt {attempts})",
+                        );
+                        return Ok(());
+                    }
+                    if started.elapsed() >= total_timeout {
+                        return Err(BrokerError::TransactionFailed(format!(
+                            "{mint}: ATA {ata} balance did not drop enough after confirmed SELL: \
+                             pre_raw={pre_raw} post_raw={post_raw} delta={drop} need>={min_drop} \
+                             sold_raw={sold_raw} after {attempts} polls in {:?}",
+                            total_timeout
+                        )));
+                    }
+                }
+                Err(e) => {
+                    if started.elapsed() >= total_timeout {
+                        return Err(BrokerError::Custom(format!(
+                            "{mint}: token balance read ATA {ata} after SELL: {e}"
+                        )));
+                    }
+                }
+            }
+        }
+
         tokio::time::sleep(poll_delay).await;
     }
 }

@@ -452,7 +452,7 @@ impl PositionManagerActor {
                                     mint: mint.to_string(),
                                     signature: r.signature.clone(),
                                     amount_sol: r.sol_received,
-                                    status: "sent".into(),
+                                    status: "confirmed".into(),
                                     reason: Some(reason.clone()),
                                     mode: self.broker.mode_label().to_string(),
                                     ts: now_secs(),
@@ -947,7 +947,7 @@ pub enum WsFeedMessage {
     },
     /// Transaction event surfaced to UIs. `signature` is None for the demo
     /// broker (simulated) and Some(base58) for live on-chain tx. `status` is
-    /// one of: "sent", "failed", "rejected".
+    /// one of: "sent", "confirmed", "failed", "rejected".
     TxEvent {
         kind: TxEventKind,
         mint: String,

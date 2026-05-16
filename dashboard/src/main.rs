@@ -1271,7 +1271,9 @@ impl eframe::App for Dashboard {
                                 if let Some(sig) = &row.signature {
                                     ui.horizontal(|ui| {
                                         let (st_lbl, st_col) = match row.status.as_str() {
-                                            "sent" => ("ok", egui::Color32::from_rgb(110, 190, 130)),
+                                            "sent" | "confirmed" => {
+                                                ("ok", egui::Color32::from_rgb(110, 190, 130))
+                                            }
                                             "failed" => ("failed", egui::Color32::from_rgb(220, 90, 90)),
                                             _ => (row.status.as_str(), egui::Color32::LIGHT_GRAY),
                                         };
