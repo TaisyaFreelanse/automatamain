@@ -53,8 +53,10 @@ pub struct LiveExecutionConfig {
     #[serde(default = "default_balance_refresh_secs")]
     pub balance_refresh_secs: u64,
 
-    /// Skip preflight simulation on send (faster, but you get less info on
-    /// bad txs). Recommended `false` while you're validating live.
+    /// Skip preflight simulation on `sendTransaction` (faster; failures land
+    /// on-chain). **Required** for Helius **Gatekeeper** HTTP (`beta.helius-rpc.com`),
+    /// which returns `-32602` if preflight is requested. Standard RPC can set
+    /// `false` to simulate before broadcast.
     #[serde(default)]
     pub skip_preflight: bool,
 }

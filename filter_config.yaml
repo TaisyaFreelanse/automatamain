@@ -120,4 +120,7 @@ execution:
     compute_unit_limit: 200000          # 0 keeps cluster default
     max_retries: 3
     balance_refresh_secs: 10
-    skip_preflight: false
+    # Helius Gatekeeper (beta.helius-rpc.com) rejects sendTransaction preflight
+    # (-32602 "not supported"). Use true for that HTTP endpoint; standard
+    # mainnet.helius can use false if you want RPC simulation before send.
+    skip_preflight: true
