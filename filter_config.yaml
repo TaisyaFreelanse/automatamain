@@ -36,9 +36,16 @@ buy_config:
 # liquidity, buyers, momentum, volume, smart wallets, and anti-bundle signals
 # after a short scoring window, then chooses a tier-based buy size.
 scoring:
-  scoring_window_ms: 1500
+  # Longer window so mcap_now can diverge from mcap_init (momentum signal).
+  scoring_window_ms: 3500
   a_plus_threshold: 9
   a_threshold: 6
+  # --- Live-only gates (ignored when execution.mode: demo) ---------------
+  # Require bonding-curve mcap growth into the "good" band during the window.
+  require_momentum_good: true
+  # Live: tier must be at least this. Use `A` so both A and A+ can buy when
+  # `require_momentum_good` passes; set `APlus` only if you want top-tier-only.
+  minimum_tier_for_buy: A
   weights:
     dev_history_strong: 4
     dev_history_weak: 2
@@ -72,7 +79,9 @@ scoring:
     bundle_similar_tolerance: 0.05
   size:
     a_plus_sol: 1.0
-    a_sol: 0.6
+    # Tier A live size (min with operator cap). Kept modest vs A+ because
+    # A hits the score threshold more easily even with momentum_good.
+    a_sol: 0.12
 
 # Strategy controller — risk caps applied at the InitiateBuy gate inside the
 # position manager. None of these touch open positions.

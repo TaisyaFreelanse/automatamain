@@ -1,5 +1,15 @@
 use serde::{Deserialize, Serialize};
 
+/// Minimum tier that may proceed to `InitiateBuy` when `execution.mode` is
+/// `live` and this gate is evaluated. Demo mode ignores this (same as legacy).
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase")]
+pub enum MinBuyTier {
+    #[default]
+    A,
+    APlus,
+}
+
 // --- ScoringConfig -----------------------------------------------------------
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -15,6 +25,19 @@ pub struct ScoringConfig {
 
     #[serde(default = "default_a")]
     pub a_threshold: i32,
+
+    /// When `true` and `execution.mode` is **live**, skip `InitiateBuy` unless
+    /// the score breakdown includes `momentum_good` (mcap grew into the
+    /// configured band during the scoring window).
+    #[serde(default)]
+    pub require_momentum_good: bool,
+
+    /// When `execution.mode` is **live**, only this tier or higher may open a
+    /// position. `A` = both A and A+ (after other gates); `APlus` = stricter,
+    /// top-tier only. Pair with `require_momentum_good` so A entries still
+    /// need confirmed mcap momentum.
+    #[serde(default)]
+    pub minimum_tier_for_buy: MinBuyTier,
 
     #[serde(default)]
     pub weights: ScoringWeights,
@@ -32,6 +55,8 @@ impl Default for ScoringConfig {
             scoring_window_ms: default_window_ms(),
             a_plus_threshold: default_a_plus(),
             a_threshold: default_a(),
+            require_momentum_good: false,
+            minimum_tier_for_buy: MinBuyTier::A,
             weights: ScoringWeights::default(),
             thresholds: FeatureThresholds::default(),
             size: TierSize::default(),

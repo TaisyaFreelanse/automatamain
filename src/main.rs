@@ -3,7 +3,7 @@ use futures::{SinkExt, StreamExt};
 use loggaper::{
     autobuy::{
         broker::Broker,
-        execution::build_broker,
+        execution::{build_broker, ExecutionMode},
         manager::{OpenReason, PositionManagerActor, PositionMessage, WsCommand, WsFeedMessage},
         performance_tracker::{CreatorRegistryHandle, PerformanceTrackerHandle},
     },
@@ -18,6 +18,7 @@ use loggaper::{
     },
     pipelines::pump::PumpPipeline,
     scoring::{
+        config::MinBuyTier,
         dev_ranker::{self, DevRankerHandle, DevRankerSnapshot},
         features,
         score_engine::{ScoreEngine, Tier},
@@ -789,13 +790,45 @@ async fn main() {
                             breakdown.items,
                         );
 
-                        match breakdown.tier {
-                            Tier::Skip => {
-                                bot_metrics_create.note_score_skip();
+                        if matches!(breakdown.tier, Tier::Skip) {
+                            bot_metrics_create.note_score_skip();
+                            return;
+                        }
+
+                        // Live-only gates: avoid A-tier noise entries with flat
+                        // mcap (no `momentum_good`) and optionally require A+.
+                        if filter_config.execution.mode == ExecutionMode::Live {
+                            let has_momentum_good = breakdown
+                                .items
+                                .iter()
+                                .any(|(name, _)| *name == "momentum_good");
+
+                            if filter_config.scoring.require_momentum_good && !has_momentum_good {
+                                eprintln!(
+                                    "[BUY] {} skipped (live): require_momentum_good=true but no \
+                                     momentum_good in items={:?}",
+                                    general_create.mint,
+                                    breakdown.items
+                                );
                                 return;
                             }
+
+                            if filter_config.scoring.minimum_tier_for_buy == MinBuyTier::APlus
+                                && breakdown.tier != Tier::APlus
+                            {
+                                eprintln!(
+                                    "[BUY] {} skipped (live): minimum_tier_for_buy=APlus but tier={:?}",
+                                    general_create.mint,
+                                    breakdown.tier
+                                );
+                                return;
+                            }
+                        }
+
+                        match breakdown.tier {
                             Tier::A => bot_metrics_create.note_score_a(),
                             Tier::APlus => bot_metrics_create.note_score_a_plus(),
+                            Tier::Skip => unreachable!("tier Skip filtered above"),
                         }
 
                         // --- Stage 4: dispatch to manager (which still
