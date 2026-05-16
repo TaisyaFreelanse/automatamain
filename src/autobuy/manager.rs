@@ -545,11 +545,37 @@ impl PositionManagerActor {
                                 reason: reason.clone(),
                             });
 
+                            // Historical bug: the row used to report
+                            // `invested_sol = initial_holdings.to_float()`,
+                            // which is in TOKEN units, and `realized_pnl_pct`
+                            // computed against that — both junk numbers (HUGE
+                            // `Invested $` and a sticky `-100%` whenever
+                            // `total_returned` came out at 0). We already have
+                            // the right SOL-side values just above, so write
+                            // those into Postgres.
+                            //
+                            // If `spent_sol` is somehow zero (only possible
+                            // for legacy MockBroker rows), fall back to a
+                            // mcap-based pct so the row at least reflects the
+                            // actual price move instead of -100%.
+                            let invested_sol_row = if close_spent_sol > 0.0 {
+                                close_spent_sol
+                            } else {
+                                0.0
+                            };
+                            let realized_pnl_pct_row = if close_spent_sol > 0.0 {
+                                pnl_pct_sol
+                            } else if entry_mcap_sol > 0.0 {
+                                (exit_mcap_sol / entry_mcap_sol - 1.0) * 100.0
+                            } else {
+                                0.0
+                            };
+
                             let entry = BotTradeEntry {
                                 mint: mint.to_string(),
                                 entry_mcap_sol,
-                                invested_sol,
-                                realized_pnl_pct: overall_pnl_pct,
+                                invested_sol: invested_sol_row,
+                                realized_pnl_pct: realized_pnl_pct_row,
                                 close_reason: reason,
                                 closed_at: SystemTime::now()
                                     .duration_since(UNIX_EPOCH)
