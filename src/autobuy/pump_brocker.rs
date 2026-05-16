@@ -253,6 +253,18 @@ impl Broker for SolanaBroker {
             TokenProgram2022::PROGRAM,
         );
 
+        // Derive our ATA so we can read its raw token balance before/after the
+        // BUY and report the *actual* fill in the receipt. Without this the
+        // manager would size partial sells off the slippage floor
+        // (`min_token_out_f`), which severely under-counts the real position
+        // and leaves most tokens stranded in the ATA after a "100% sell".
+        let ata_str = derive_ata_string(&self.wallet_address, &mint);
+        // ATA may not exist yet (idempotent create runs in this same tx), so
+        // absence/error -> 0. Decimals are not needed pre-send.
+        let pre_raw: u64 = fetch_token_account_raw(&self.rpc_client, &ata_str)
+            .await
+            .unwrap_or(0);
+
         // pump-fun derives `creator_vault` from `bonding_curve.creator`, NOT
         // from the user / CreateEvent.creator. That on-chain field can be
         // rewritten by `set_metaplex_creator` or seeded from backend data for
@@ -287,20 +299,53 @@ impl Broker for SolanaBroker {
 
         let sig_str = self.send_with_retries(ixs, "BUY").await?;
 
-        // The actual tokens received are resolved in the WS event loop via
-        // `on_trade`. We optimistically debit `amount_sol` here so subsequent
-        // `balance_sol()` calls reflect the spend without waiting on the
-        // periodic RPC refresh, and we report an *expected* token count
-        // (slippage-discounted) so the position manager can place sane
-        // partial sells before the WS event arrives.
+        // Optimistically debit so subsequent `balance_sol()` calls reflect the
+        // spend without waiting on the periodic RPC refresh.
         {
             let mut bal = self.balance.lock().unwrap();
             *bal -= amount_sol;
         }
 
+        // Resolve the *actual* fill from the chain by reading the ATA balance
+        // delta. We poll until the post-balance exceeds the pre-balance (or
+        // the timeout expires) and convert the raw lamport-equivalent diff
+        // back to a UI float using on-chain decimals. This replaces the old
+        // behaviour of reporting `min_token_out_f` (slippage floor), which
+        // caused the position manager to size partial TP/SL sells off a
+        // value that was orders of magnitude smaller than what we actually
+        // bought, leaving most tokens stranded in the ATA on "100% exit".
+        let actual_tokens_received = match poll_token_balance_increase(
+            &self.rpc_client,
+            &ata_str,
+            pre_raw,
+            Duration::from_millis(15_000),
+        )
+        .await
+        {
+            Ok((post_raw, decimals)) => {
+                let delta_raw = post_raw.saturating_sub(pre_raw);
+                let scale = 10u64.pow(decimals as u32) as f64;
+                let actual = delta_raw as f64 / scale;
+                eprintln!(
+                    "[BROKER BUY] {mint}: filled tokens={:.6} (raw_delta={}, decimals={}, \
+                     min_token_out={:.6})",
+                    actual, delta_raw, decimals, min_token_out_f,
+                );
+                actual
+            }
+            Err(e) => {
+                eprintln!(
+                    "[BROKER BUY] {mint}: ATA balance delta unavailable ({e}); \
+                     falling back to min_token_out={:.6} for receipt",
+                    min_token_out_f,
+                );
+                min_token_out_f
+            }
+        };
+
         Ok(BuyReceipt {
             sol_spent: amount_sol,
-            tokens_received: min_token_out_f,
+            tokens_received: actual_tokens_received,
             signature: Some(sig_str),
         })
     }
@@ -654,6 +699,113 @@ async fn fetch_bonding_curve_creator(
     let mut bytes = [0u8; CREATOR_LEN];
     bytes.copy_from_slice(&account.data[CREATOR_OFFSET..CREATOR_OFFSET + CREATOR_LEN]);
     Ok(SolAddress::new_from_array(bytes))
+}
+
+/// Derive the SPL associated token account string for `(wallet, mint)` under
+/// the Token-2022 program (which pump-fun uses). The string is parsed by
+/// callers into the RPC client's `Pubkey` type (avoids hard-coupling this
+/// module to a specific solana-pubkey version).
+fn derive_ata_string(wallet: &SolAddress, mint: &SolAddress) -> String {
+    let wallet_sips: sips::address::Address = (*wallet).into();
+    let mint_sips: sips::address::Address = (*mint).into();
+    let (ata_sips, _bump) = sips::helper::ata(
+        &wallet_sips,
+        &TokenProgram2022::PROGRAM,
+        &mint_sips,
+    );
+    let ata_sol: SolAddress = ata_sips.into();
+    ata_sol.to_string()
+}
+
+/// Read the raw token amount of a given ATA at `confirmed` commitment.
+/// Errors if the account does not exist or is not parseable as a token
+/// account (caller usually treats that as "balance == 0").
+async fn fetch_token_account_raw(rpc: &RpcClient, ata: &str) -> Result<u64, BrokerError> {
+    let pk = ata
+        .parse()
+        .map_err(|_| BrokerError::Custom(format!("invalid ATA pubkey: {ata}")))?;
+    let resp = rpc
+        .get_token_account_balance_with_commitment(&pk, CommitmentConfig::confirmed())
+        .await
+        .map_err(|e| BrokerError::Custom(format!("get_token_account_balance {ata}: {e}")))?;
+    resp.value
+        .amount
+        .parse::<u64>()
+        .map_err(|e| BrokerError::Custom(format!("parse token amount {ata}: {e}")))
+}
+
+/// Read the raw token amount + decimals of an ATA at `confirmed` commitment.
+async fn fetch_token_account_raw_with_decimals(
+    rpc: &RpcClient,
+    ata: &str,
+) -> Result<(u64, u8), BrokerError> {
+    let pk = ata
+        .parse()
+        .map_err(|_| BrokerError::Custom(format!("invalid ATA pubkey: {ata}")))?;
+    let resp = rpc
+        .get_token_account_balance_with_commitment(&pk, CommitmentConfig::confirmed())
+        .await
+        .map_err(|e| BrokerError::Custom(format!("get_token_account_balance {ata}: {e}")))?;
+    let raw = resp
+        .value
+        .amount
+        .parse::<u64>()
+        .map_err(|e| BrokerError::Custom(format!("parse token amount {ata}: {e}")))?;
+    Ok((raw, resp.value.decimals))
+}
+
+/// Poll the ATA's token balance until it exceeds `pre_raw` (i.e. our BUY tx
+/// has been confirmed and credited the ATA) or the total timeout elapses.
+/// Returns `(post_raw, decimals)`.
+///
+/// Returning the on-chain `decimals` (rather than hardcoding pump's "6")
+/// keeps the receipt accurate even if a token uses a non-standard precision.
+async fn poll_token_balance_increase(
+    rpc: &RpcClient,
+    ata: &str,
+    pre_raw: u64,
+    total_timeout: Duration,
+) -> Result<(u64, u8), BrokerError> {
+    let started = std::time::Instant::now();
+    let poll_delay = Duration::from_millis(400);
+    let mut attempts: u32 = 0;
+    let mut last_seen: Option<(u64, u8)> = None;
+    let mut last_err: Option<String> = None;
+
+    loop {
+        attempts += 1;
+        match fetch_token_account_raw_with_decimals(rpc, ata).await {
+            Ok((raw, decimals)) => {
+                last_seen = Some((raw, decimals));
+                if raw > pre_raw {
+                    return Ok((raw, decimals));
+                }
+            }
+            Err(e) => {
+                // ATA may simply not exist yet right after CreateIdempotent —
+                // keep polling until the BUY ix actually credits it.
+                last_err = Some(e.to_string());
+            }
+        }
+
+        if started.elapsed() >= total_timeout {
+            if let Some((raw, _decimals)) = last_seen
+                && raw == pre_raw
+            {
+                return Err(BrokerError::Custom(format!(
+                    "ATA {ata} balance did not increase after {attempts} polls in {:?} \
+                     (pre={pre_raw}, post={raw})",
+                    total_timeout
+                )));
+            }
+            return Err(BrokerError::Custom(format!(
+                "ATA {ata} balance read failed after {attempts} polls in {:?}: {}",
+                total_timeout,
+                last_err.unwrap_or_else(|| "no successful read".into()),
+            )));
+        }
+        tokio::time::sleep(poll_delay).await;
+    }
 }
 
 /// Poll `get_account_with_commitment(Confirmed)` until the account is visible
