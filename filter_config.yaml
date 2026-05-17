@@ -18,7 +18,7 @@ start_balance_sol: 10.0
 buy_config:
   # Operator / GUI buy cap (seed + PUT /buy-size). Never below max tier size so A+ is not clipped.
   amount_sol: 0.4
-  tp1_pct: 15.0
+  tp1_pct: 30.0
   tp1_sell_pct: 30.0
   tp2_pct: 50.0
   tp2_sell_pct: 50.0
