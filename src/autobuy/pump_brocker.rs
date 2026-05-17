@@ -5,6 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use sips::instructions::{
     associated_token_program::AssociatedTokenProgram,
     compute_budget::{ComputeUnitLimit, ComputeUnitPrice},
@@ -17,6 +18,7 @@ use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_instruction::Instruction as SolanaIx;
 use solana_keypair::{Keypair, Signature};
 use solana_rpc_client_types::config::{CommitmentConfig, CommitmentLevel};
+use solana_transaction::versioned::VersionedTransaction;
 // Use the modular solana crate instead of the monolithic solana_sdk
 
 use crate::{
@@ -25,7 +27,10 @@ use crate::{
     launchpads::pump::general::bounding_curve,
 };
 
-use super::broker::{Broker, BrokerError, BuyReceipt, SellReceipt};
+use super::{
+    broker::{Broker, BrokerError, BuyReceipt, SellReceipt},
+    jupiter_sell::{decode_jupiter_swap_transaction, jupiter_build_swap_exact_in},
+};
 
 // ── State per open position ───────────────────────────────────────────────────
 
@@ -248,6 +253,143 @@ impl SolanaBroker {
                     } else {
                         backoff(attempt).await;
                     }
+                }
+            }
+        }
+    }
+
+    /// Full or partial exit after the bonding curve has migrated (pump `Sell`
+    /// returns 6005). Uses Jupiter Swap API v6 (`quote` + `swap`).
+    async fn sell_tokens_post_graduation(
+        &self,
+        mint: SolAddress,
+        ata_str: &str,
+        ata_sol: SolAddress,
+        pre_sell_raw: u64,
+        sold_raw: u64,
+        do_close_ata: bool,
+        slip: f64,
+    ) -> Result<SellReceipt, BrokerError> {
+        let slippage_bps_u16: u16 = self
+            .exec_cfg
+            .slippage_bps
+            .min(5000)
+            .try_into()
+            .unwrap_or(500);
+
+        let mint_s = mint.to_string();
+        let build = jupiter_build_swap_exact_in(
+            &mint_s,
+            sold_raw,
+            slippage_bps_u16,
+            &self.wallet_address.to_string(),
+        )
+        .await?;
+
+        let tx_bytes = STANDARD
+            .decode(build.swap_transaction_b64.trim())
+            .map_err(|e| BrokerError::Custom(format!("Jupiter swapTransaction base64: {e}")))?;
+        let template = decode_jupiter_swap_transaction(&tx_bytes)?;
+
+        let sig = self
+            .send_versioned_jupiter_with_retries(&template, "SELL-JUPITER")
+            .await?;
+
+        poll_ata_confirms_sell(
+            &self.rpc_client,
+            ata_str,
+            pre_sell_raw,
+            sold_raw,
+            false,
+            mint,
+            Duration::from_secs(90),
+        )
+        .await?;
+
+        if do_close_ata {
+            match fetch_token_account_raw(&self.rpc_client, ata_str).await {
+                Ok(0) => {
+                    let mut ixs = self.compute_budget_prelude();
+                    let close_ix = TokenProgram2022::close_account(
+                        ata_sol.into(),
+                        self.wallet_address.into(),
+                        self.wallet_address.into(),
+                    );
+                    ixs.push(close_ix.into());
+                    let _close_sig = self.send_with_retries(ixs, "CLOSE-ATA").await?;
+                }
+                Ok(left) => {
+                    eprintln!(
+                        "[BROKER SELL] {mint}: post-Jupiter ATA still has raw balance {left}; \
+                         skip CloseAccount"
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[BROKER SELL] {mint}: post-Jupiter ATA balance read failed ({e}); \
+                         skip CloseAccount"
+                    );
+                }
+            }
+        }
+
+        let sol_gross = build.out_lamports as f64 / 1e9;
+        let sol_received = (sol_gross * (1.0 - slip)).max(0.0);
+        {
+            let mut bal = self.balance.lock().unwrap();
+            *bal += sol_received;
+        }
+        Ok(SellReceipt {
+            sol_received,
+            signature: Some(sig.to_string()),
+        })
+    }
+
+    async fn send_versioned_jupiter_with_retries(
+        &self,
+        template: &VersionedTransaction,
+        label: &str,
+    ) -> Result<Signature, BrokerError> {
+        let max_retries = self.exec_cfg.max_retries.max(1).max(6);
+        let mut attempt: u32 = 0;
+        let signer: &Keypair = self.keypair.as_ref();
+        loop {
+            attempt += 1;
+            let blockhash = self
+                .rpc_client
+                .get_latest_blockhash()
+                .await
+                .map_err(|e| BrokerError::Custom(format!("{label}: get_latest_blockhash: {e}")))?;
+            let mut message = template.message.clone();
+            message.set_recent_blockhash(blockhash);
+            let signed = VersionedTransaction::try_new(message, &[signer]).map_err(|e| {
+                BrokerError::Custom(format!("{label}: VersionedTransaction::try_new: {e}"))
+            })?;
+
+            let cfg = solana_client::rpc_config::RpcSendTransactionConfig {
+                skip_preflight: self.exec_cfg.skip_preflight,
+                preflight_commitment: Some(CommitmentLevel::Processed),
+                ..Default::default()
+            };
+
+            match self
+                .rpc_client
+                .send_transaction_with_config(&signed, cfg)
+                .await
+            {
+                Ok(sig) => {
+                    let sig_str = sig.to_string();
+                    println!("[BROKER TX] {label} sent (attempt {attempt}): {sig_str}");
+                    self.wait_until_signature_confirmed_ok(&sig, label).await?;
+                    return Ok(sig);
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    eprintln!("[BROKER TX] {label} attempt {attempt}/{max_retries} failed: {msg}");
+                    if attempt >= max_retries {
+                        return Err(BrokerError::TransactionFailed(msg));
+                    }
+                    backoff(attempt).await;
                 }
             }
         }
@@ -578,6 +720,32 @@ impl Broker for SolanaBroker {
             );
         }
 
+        let bonding_curve_complete = curve_state_opt
+            .as_ref()
+            .map(|c| c.curve_complete)
+            .unwrap_or(false);
+
+        if bonding_curve_complete && token_amount_raw > 0 {
+            eprintln!(
+                "[BROKER SELL] mint={mint} bonding curve COMPLETE (graduated) — \
+                 routing via Jupiter (raw_tokens={token_amount_raw}, close_ata={do_close_ata})"
+            );
+            let pre_raw = fetch_token_account_raw(&self.rpc_client, &ata_str)
+                .await
+                .unwrap_or(0);
+            return self
+                .sell_tokens_post_graduation(
+                    mint,
+                    &ata_str,
+                    ata_sol,
+                    pre_raw,
+                    token_amount_raw,
+                    do_close_ata,
+                    slip,
+                )
+                .await;
+        }
+
         eprintln!(
             "[BROKER SELL] mint={} tokens={:.6} (raw={}) expected={:.6} SOL \
              (price={:.9}) min_out=0 close_ata={} clamped={} \
@@ -654,7 +822,32 @@ impl Broker for SolanaBroker {
             .await
             .unwrap_or(0);
 
-        let sig_str = self.send_with_retries(ixs, "SELL").await?;
+        let sig_str = match self.send_with_retries(ixs, "SELL").await {
+            Ok(s) => s,
+            Err(BrokerError::TransactionFailed(ref msg))
+                if is_bonding_curve_complete_pump_error(msg) =>
+            {
+                if token_amount_raw == 0 || !needs_sell_ix {
+                    return Err(BrokerError::TransactionFailed(msg.clone()));
+                }
+                eprintln!(
+                    "[BROKER SELL] {mint}: pump Sell failed with BondingCurveComplete (6005); \
+                     retrying via Jupiter"
+                );
+                return self
+                    .sell_tokens_post_graduation(
+                        mint,
+                        &ata_str,
+                        ata_sol,
+                        pre_sell_raw,
+                        token_amount_raw,
+                        do_close_ata,
+                        slip,
+                    )
+                    .await;
+            }
+            Err(e) => return Err(e),
+        };
 
         poll_ata_confirms_sell(
             &self.rpc_client,
@@ -765,6 +958,11 @@ impl Broker for SolanaBroker {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Pump `Sell` returns Anchor `BondingCurveComplete` as `InstructionError(_, Custom(6005))`.
+fn is_bonding_curve_complete_pump_error(msg: &str) -> bool {
+    msg.contains("Custom(6005)")
+}
 
 async fn fetch_balance_sol(
     rpc: &RpcClient,
@@ -928,6 +1126,9 @@ struct BondingCurveState {
     /// required when global buyback is active — otherwise `Custom(6062)`
     /// (`BuybackFeeRecipientMissing`).
     is_cashback_coin: bool,
+    /// Anchor `BondingCurve::complete` — when true, liquidity has migrated off
+    /// the bonding curve; pump `Sell` fails with `BondingCurveComplete` (6005).
+    curve_complete: bool,
 }
 
 /// Decode pump-fun bonding curve account fields we care about.
@@ -985,6 +1186,8 @@ async fn fetch_bonding_curve_state(
     let is_cashback_coin = account.data.len() > IS_CASHBACK_COIN_OFFSET
         && account.data[IS_CASHBACK_COIN_OFFSET] != 0;
 
+    let curve_complete = account.data.len() > 48 && account.data[48] != 0;
+
     Ok(BondingCurveState {
         virtual_token_reserves: read_u64(8),
         virtual_sol_reserves:   read_u64(16),
@@ -992,6 +1195,7 @@ async fn fetch_bonding_curve_state(
         real_sol_reserves:      read_u64(32),
         creator: SolAddress::new_from_array(creator_bytes),
         is_cashback_coin,
+        curve_complete,
     })
 }
 

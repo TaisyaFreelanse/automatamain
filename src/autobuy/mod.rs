@@ -2,6 +2,7 @@ pub mod broker;
 pub mod broker_mock;
 pub mod execution;
 pub mod filters;
+pub mod jupiter_sell;
 pub mod manager;
 pub mod performance_tracker;
 pub mod positions;
