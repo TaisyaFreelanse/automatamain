@@ -71,7 +71,7 @@ fn default_a_plus() -> i32 {
     9
 }
 fn default_a() -> i32 {
-    6
+    8
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -134,10 +134,17 @@ pub struct FeatureThresholds {
     pub volume_ok_sol: f64,
     /// share of buys whose size is within ±tolerance of the median
     pub bundle_similar_ratio: f64,
-    /// share of buys with exactly equal raw size
+    /// Share of buys with exactly equal raw size (logged / analytics; V2 score
+    /// engine uses `similar_size_ratio` only for the bundle penalty).
     pub bundle_identical_ratio: f64,
     /// "similar" tolerance, in fraction of median (e.g. 0.05 = ±5%)
     pub bundle_similar_tolerance: f64,
+    /// Minimum smart-wallet count for the `smart_wallets_3plus` score bucket.
+    #[serde(default = "default_smart_wallet_3plus_min")]
+    pub smart_wallet_3plus_min: u32,
+    /// Minimum count for the `smart_wallets_1plus` bucket (must stay `< smart_wallet_3plus_min`).
+    #[serde(default = "default_smart_wallet_1plus_min")]
+    pub smart_wallet_1plus_min: u32,
 }
 
 impl Default for FeatureThresholds {
@@ -149,15 +156,25 @@ impl Default for FeatureThresholds {
             buyers_mid: 6,
             buyers_low: 3,
             buy_to_sell_high: 1.5,
-            momentum_good_low_pct: 4.0,
+            momentum_good_low_pct: 12.0,
             momentum_good_high_pct: 30.0,
             momentum_overheated_pct: 60.0,
             volume_ok_sol: 10.0,
             bundle_similar_ratio: 0.7,
             bundle_identical_ratio: 0.5,
-            bundle_similar_tolerance: 0.05,
+            // Wider default so near-identical bundle sizes count toward `similar_size_ratio`.
+            bundle_similar_tolerance: 0.10,
+            smart_wallet_3plus_min: default_smart_wallet_3plus_min(),
+            smart_wallet_1plus_min: default_smart_wallet_1plus_min(),
         }
     }
+}
+
+fn default_smart_wallet_3plus_min() -> u32 {
+    3
+}
+fn default_smart_wallet_1plus_min() -> u32 {
+    1
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -259,6 +276,9 @@ pub struct PersistenceConfig {
     pub dev_ranker_path: String,
     #[serde(default = "default_smart_path")]
     pub smart_money_path: String,
+    /// JSON file merged into `scoring.thresholds` at runtime (learning engine).
+    #[serde(default = "default_learning_overrides_path")]
+    pub learning_overrides_path: String,
     #[serde(default = "default_flush")]
     pub flush_every_secs: u64,
     /// Drop wallets/devs whose last activity is older than this many seconds.
@@ -272,10 +292,15 @@ impl Default for PersistenceConfig {
         Self {
             dev_ranker_path: default_dev_path(),
             smart_money_path: default_smart_path(),
+            learning_overrides_path: default_learning_overrides_path(),
             flush_every_secs: default_flush(),
             entity_ttl_secs: default_ttl(),
         }
     }
+}
+
+fn default_learning_overrides_path() -> String {
+    "./state/learning_overrides.json".into()
 }
 
 fn default_dev_path() -> String {

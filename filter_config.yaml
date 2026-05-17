@@ -39,7 +39,7 @@ scoring:
   # Longer window so mcap_now can diverge from mcap_init (momentum signal).
   scoring_window_ms: 3500
   a_plus_threshold: 9
-  a_threshold: 6
+  a_threshold: 8
   # --- Live-only gates (ignored when execution.mode: demo) ---------------
   # Require bonding-curve mcap growth into the "good" band during the window.
   # TEMP: off — mcap in logs stays ~flat vs window; re-enable after better mcap signal / logging.
@@ -71,15 +71,16 @@ scoring:
     buyers_mid: 6
     buyers_low: 3
     buy_to_sell_high: 1.5
-    # % mcap growth over scoring_window; 12% was too strict for early-curve
-    # launches in ~3.5s — 4% still requires real lift without flat-curve noise.
-    momentum_good_low_pct: 4.0
+    # Entry filter V2: "good momentum" band [low, high] % mcap growth over the
+    # scoring window; above `high` (or >= overheated_pct when that is > high)
+    # applies `momentum_overheated`.
+    momentum_good_low_pct: 12.0
     momentum_good_high_pct: 30.0
     momentum_overheated_pct: 60.0
     volume_ok_sol: 10.0
     bundle_similar_ratio: 0.7
     bundle_identical_ratio: 0.5
-    bundle_similar_tolerance: 0.05
+    bundle_similar_tolerance: 0.10
   size:
     a_plus_sol: 1.0
     # Tier A live size (min with operator cap). Kept modest vs A+ because
@@ -105,8 +106,17 @@ strategy:
 persistence:
   dev_ranker_path: "/home/automata/state/dev_ranker.json"
   smart_money_path: "/home/automata/state/smart_money.json"
+  learning_overrides_path: "/home/automata/state/learning_overrides.json"
   flush_every_secs: 30
   entity_ttl_secs: 172800
+
+# Self-learning: logs closed trades + skipped mints to Postgres; periodically
+# nudges scoring thresholds (merged at runtime, max ~±15% via merge clamps).
+learning:
+  enabled: true
+  analyze_every_trades: 150
+  analyze_interval_secs: 3600
+  min_trades_for_update: 30
 
 # Execution mode. Demo = MockBroker (simulated, uses start_balance_sol).
 # Live = SolanaBroker — reads wallet from PRIVATE_KEY env, mainnet RPC from

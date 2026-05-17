@@ -1,6 +1,10 @@
 use solana_address::Address;
 
-use crate::{generalize::general_pool::Pool, helper::Amount};
+use crate::{
+    generalize::general_pool::Pool,
+    helper::Amount,
+    learning::LearningTradeSnapshot,
+};
 
 pub struct Position {
     pub pool: Box<dyn Pool>,
@@ -31,6 +35,8 @@ pub struct Position {
     /// Snapshot of early buyers, captured at scoring time. Used on close to
     /// credit/debit the smart-money registry.
     pub early_buyers: Vec<Address>,
+    /// Self-learning: scoring-time feature snapshot (logged on full close).
+    pub learning_snapshot: Option<LearningTradeSnapshot>,
 }
 
 impl Position {
@@ -56,6 +62,7 @@ impl Position {
             spent_sol: 0.0,
             dev_address: None,
             early_buyers: Vec::new(),
+            learning_snapshot: None,
         }
     }
 

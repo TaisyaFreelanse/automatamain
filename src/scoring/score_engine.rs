@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 
-use crate::scoring::config::ScoringConfig;
+use crate::scoring::config::{FeatureThresholds, ScoringConfig};
 use crate::scoring::dev_ranker::DevCategory;
 use crate::scoring::features::TokenFeatures;
 
@@ -30,9 +30,9 @@ impl<'a> ScoreEngine<'a> {
         Self { cfg }
     }
 
-    pub fn score(&self, f: &TokenFeatures) -> ScoreBreakdown {
+    pub fn score(&self, f: &TokenFeatures, thresholds: &FeatureThresholds) -> ScoreBreakdown {
         let w = &self.cfg.weights;
-        let t = &self.cfg.thresholds;
+        let t = thresholds;
         let mut items: Vec<(&'static str, i32)> = Vec::with_capacity(12);
         let mut total = 0_i32;
 
@@ -83,14 +83,14 @@ impl<'a> ScoreEngine<'a> {
         }
 
         // --- Smart wallets -------------------------------------------------
-        if f.smart_wallet_count >= 3 {
+        if f.smart_wallet_count >= t.smart_wallet_3plus_min {
             add(
                 "smart_wallets_3plus",
                 w.smart_wallets_3plus,
                 &mut total,
                 &mut items,
             );
-        } else if f.smart_wallet_count >= 1 {
+        } else if f.smart_wallet_count >= t.smart_wallet_1plus_min {
             add(
                 "smart_wallets_1plus",
                 w.smart_wallets_1plus,
@@ -125,15 +125,23 @@ impl<'a> ScoreEngine<'a> {
         } else {
             0.0
         };
-        if momentum_pct >= t.momentum_overheated_pct {
+        // V2: reward only launches inside [low, high]; penalize anything above
+        // the good window, and still allow a separate "blow-off" floor via
+        // `momentum_overheated_pct` when it sits above `good_high` (legacy YAML).
+        let in_good_band =
+            (t.momentum_good_low_pct..=t.momentum_good_high_pct).contains(&momentum_pct);
+        if in_good_band {
+            add("momentum_good", w.momentum_good, &mut total, &mut items);
+        } else if momentum_pct > t.momentum_good_high_pct
+            || (t.momentum_overheated_pct > t.momentum_good_high_pct
+                && momentum_pct >= t.momentum_overheated_pct)
+        {
             add(
                 "momentum_overheated",
                 w.momentum_overheated,
                 &mut total,
                 &mut items,
             );
-        } else if (t.momentum_good_low_pct..=t.momentum_good_high_pct).contains(&momentum_pct) {
-            add("momentum_good", w.momentum_good, &mut total, &mut items);
         }
 
         // --- Volume --------------------------------------------------------
@@ -141,15 +149,10 @@ impl<'a> ScoreEngine<'a> {
             add("volume_ok", w.volume_ok, &mut total, &mut items);
         }
 
-        // --- Anti-bundle ---------------------------------------------------
-        if f.bundle.identical_size_ratio >= t.bundle_identical_ratio {
-            add(
-                "bundle_identical",
-                w.bundle_identical,
-                &mut total,
-                &mut items,
-            );
-        } else if f.bundle.similar_size_ratio >= t.bundle_similar_ratio {
+        // --- Anti-bundle (V2) ----------------------------------------------
+        // Similar-size clustering (median band) catches coordinated bundles
+        // that no longer use byte-identical amounts. Penalty: `bundle_similar`.
+        if f.bundle.similar_size_ratio >= t.bundle_similar_ratio {
             add("bundle_similar", w.bundle_similar, &mut total, &mut items);
         }
 

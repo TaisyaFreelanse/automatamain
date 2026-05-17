@@ -90,4 +90,24 @@ mod tests {
         assert!(s.identical_size_ratio < 0.5);
         assert!(s.similar_size_ratio < 0.5);
     }
+
+    /// Bundle bots often use almost-equal SOL sizes (not bit-identical).
+    #[test]
+    fn near_equal_sizes_high_similar_ratio() {
+        let tol = 0.10;
+        let s = compute_bundle_stats(
+            &[0.10, 0.102, 0.099, 0.101, 0.103, 2.0],
+            tol,
+        );
+        assert!(
+            s.similar_size_ratio >= 0.7,
+            "expected >=0.7 similar cluster, got {}",
+            s.similar_size_ratio
+        );
+        assert!(
+            s.identical_size_ratio < 0.5,
+            "identical-only ratio should stay low, got {}",
+            s.identical_size_ratio
+        );
+    }
 }

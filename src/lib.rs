@@ -1,6 +1,7 @@
 pub mod address;
 pub mod autobuy;
 pub mod feed;
+pub mod learning;
 pub mod general;
 pub mod generalize;
 pub mod helper;

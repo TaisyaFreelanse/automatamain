@@ -9,6 +9,9 @@ use loggaper::{
     },
     feed::metrics::{BotMetrics, BotSnapshot, FeedMetrics, FeedSnapshot, new_dedup},
     generalize::general_commands::Action,
+    learning::{
+        load_patch, merge_thresholds, spawn_learning_engine, LearningLogPg, LearningTradeSnapshot,
+    },
     persistence::{
         bot_trades::BotTradeRow,
         creators::CreatorRepository,
@@ -38,7 +41,7 @@ use std::{
 };
 use tokio::{
     net::TcpListener,
-    sync::{broadcast, mpsc},
+    sync::{broadcast, mpsc, RwLock},
 };
 use tokio_tungstenite::accept_async;
 
@@ -56,6 +59,16 @@ async fn main() {
         Arc::new(trades),
         Arc::new(bot_trades),
     );
+
+    let learn_path = config.persistence.learning_overrides_path.clone();
+    let learning_overrides = Arc::new(RwLock::new(
+        load_patch(&learn_path).await,
+    ));
+    let learning_log = if config.learning.enabled {
+        Some(LearningLogPg::new(pool.clone()))
+    } else {
+        None
+    };
 
     #[derive(Clone)]
     struct ApiState {
@@ -120,7 +133,20 @@ async fn main() {
             config.strategy.clone(),
             Some(dev_ranker_handle.clone()),
             Some(smart_money_handle.clone()),
+            learning_log.clone(),
         );
+
+    if config.learning.enabled {
+        if let Some(ref lg) = learning_log {
+            spawn_learning_engine(
+                lg.clone(),
+                config.learning.clone(),
+                learn_path,
+                config.scoring.thresholds.clone(),
+                learning_overrides.clone(),
+            );
+        }
+    }
 
     // Operator buy cap (SOL): seeded from yaml `buy_config.amount_sol`, then
     // overridable at runtime via `PUT /buy-size` (dashboard). Each live buy
@@ -733,10 +759,18 @@ async fn main() {
                 let smart_money_for_create = smart_money_handle.clone();
                 let bucket_for_score = bucket.clone();
                 let buy_cap = buy_size_state.clone();
+                let learning_log_create = learning_log.clone();
+                let learning_overrides_spawn = learning_overrides.clone();
 
                 tokio::spawn({
                     let creators = creators.clone();
                     async move {
+                        let unix_now = || {
+                            SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(0)
+                        };
                         // --- Stage 1: cheap pre-gate on dev history ---------
                         // Operator-tuned creator_config still acts as the
                         // hard pre-filter. Score Engine runs *after* this so
@@ -746,6 +780,25 @@ async fn main() {
                                 Ok(stats) => stats,
                                 Err(e) => {
                                     eprintln!("[FILTER] DB error for {}: {e}", general_create.user);
+                                    if let Some(ref log) = learning_log_create {
+                                        let log = log.clone();
+                                        let mint_s = general_create.mint.to_string();
+                                        let dev_s = general_create.user.to_string();
+                                        let ts = unix_now();
+                                        let msg = format!("{e}");
+                                        tokio::spawn(async move {
+                                            let _ = log
+                                                .log_skipped(
+                                                    &mint_s,
+                                                    Some(dev_s.as_str()),
+                                                    "filter_db",
+                                                    &msg,
+                                                    serde_json::json!({}),
+                                                    ts,
+                                                )
+                                                .await;
+                                        });
+                                    }
                                     return;
                                 }
                             };
@@ -758,6 +811,24 @@ async fn main() {
                                     general_create.mint
                                 );
                                 bot_metrics_create.note_no_history();
+                                if let Some(ref log) = learning_log_create {
+                                    let log = log.clone();
+                                    let mint_s = general_create.mint.to_string();
+                                    let dev_s = general_create.user.to_string();
+                                    let ts = unix_now();
+                                    tokio::spawn(async move {
+                                        let _ = log
+                                            .log_skipped(
+                                                &mint_s,
+                                                Some(dev_s.as_str()),
+                                                "filter_no_history",
+                                                "no_creator_history",
+                                                serde_json::json!({}),
+                                                ts,
+                                            )
+                                            .await;
+                                    });
+                                }
                                 return;
                             }
                         };
@@ -768,6 +839,24 @@ async fn main() {
                                 general_create.mint
                             );
                             bot_metrics_create.note_filter_rejected();
+                            if let Some(ref log) = learning_log_create {
+                                let log = log.clone();
+                                let mint_s = general_create.mint.to_string();
+                                let dev_s = general_create.user.to_string();
+                                let ts = unix_now();
+                                tokio::spawn(async move {
+                                    let _ = log
+                                        .log_skipped(
+                                            &mint_s,
+                                            Some(dev_s.as_str()),
+                                            "filter_creator",
+                                            "creator_config_rejected",
+                                            serde_json::json!({}),
+                                            ts,
+                                        )
+                                        .await;
+                                });
+                            }
                             return;
                         }
                         registry.save(mint_address, dev_stats.clone()).await;
@@ -779,13 +868,14 @@ async fn main() {
                         let window_ms = filter_config.scoring.scoring_window_ms;
                         tokio::time::sleep(std::time::Duration::from_millis(window_ms)).await;
 
+                        let merged_thr = merge_thresholds(
+                            &filter_config.scoring.thresholds,
+                            &learning_overrides_spawn.read().await.patch,
+                        );
+
                         // --- Stage 3: snapshot features ---------------------
                         let (early_buyers, _buy_sizes_sol, buy_volume_sol, still_long, sold, bundle) =
-                            features::snapshot_early_buyers(
-                                &bucket_for_score,
-                                &filter_config.scoring.thresholds,
-                            )
-                            .await;
+                            features::snapshot_early_buyers(&bucket_for_score, &merged_thr).await;
 
                         let (dev_category, dev_record) =
                             dev_ranker_for_create.category(general_create.user).await;
@@ -818,7 +908,7 @@ async fn main() {
                         );
 
                         let engine = ScoreEngine::new(&filter_config.scoring);
-                        let breakdown = engine.score(&token_features);
+                        let breakdown = engine.score(&token_features, &merged_thr);
 
                         eprintln!(
                             "[SCORE] {} tier={:?} score={} buyers={}+{} vol={:.2} \
@@ -841,6 +931,26 @@ async fn main() {
 
                         if matches!(breakdown.tier, Tier::Skip) {
                             bot_metrics_create.note_score_skip();
+                            if let Some(ref log) = learning_log_create {
+                                let log = log.clone();
+                                let mint_s = general_create.mint.to_string();
+                                let dev_s = general_create.user.to_string();
+                                let snap = LearningTradeSnapshot::from_scoring(&token_features, &breakdown);
+                                let payload = serde_json::to_value(&snap).unwrap_or_else(|_| serde_json::json!({}));
+                                let ts = unix_now();
+                                tokio::spawn(async move {
+                                    let _ = log
+                                        .log_skipped(
+                                            &mint_s,
+                                            Some(dev_s.as_str()),
+                                            "score_skip",
+                                            "tier_skip",
+                                            payload,
+                                            ts,
+                                        )
+                                        .await;
+                                });
+                            }
                             return;
                         }
 
@@ -859,6 +969,28 @@ async fn main() {
                                     general_create.mint,
                                     breakdown.items
                                 );
+                                if let Some(ref log) = learning_log_create {
+                                    let log = log.clone();
+                                    let mint_s = general_create.mint.to_string();
+                                    let dev_s = general_create.user.to_string();
+                                    let snap =
+                                        LearningTradeSnapshot::from_scoring(&token_features, &breakdown);
+                                    let payload =
+                                        serde_json::to_value(&snap).unwrap_or_else(|_| serde_json::json!({}));
+                                    let ts = unix_now();
+                                    tokio::spawn(async move {
+                                        let _ = log
+                                            .log_skipped(
+                                                &mint_s,
+                                                Some(dev_s.as_str()),
+                                                "live_gate_momentum",
+                                                "require_momentum_good",
+                                                payload,
+                                                ts,
+                                            )
+                                            .await;
+                                    });
+                                }
                                 return;
                             }
 
@@ -870,6 +1002,28 @@ async fn main() {
                                     general_create.mint,
                                     breakdown.tier
                                 );
+                                if let Some(ref log) = learning_log_create {
+                                    let log = log.clone();
+                                    let mint_s = general_create.mint.to_string();
+                                    let dev_s = general_create.user.to_string();
+                                    let snap =
+                                        LearningTradeSnapshot::from_scoring(&token_features, &breakdown);
+                                    let payload =
+                                        serde_json::to_value(&snap).unwrap_or_else(|_| serde_json::json!({}));
+                                    let ts = unix_now();
+                                    tokio::spawn(async move {
+                                        let _ = log
+                                            .log_skipped(
+                                                &mint_s,
+                                                Some(dev_s.as_str()),
+                                                "live_gate_tier",
+                                                "minimum_tier_APlus",
+                                                payload,
+                                                ts,
+                                            )
+                                            .await;
+                                    });
+                                }
                                 return;
                             }
                         }
@@ -893,6 +1047,26 @@ async fn main() {
                                 "[BUY] {} skipped: tier size {:.4} capped to {:.4} (operator cap)",
                                 general_create.mint, breakdown.recommended_size_sol, operator_cap
                             );
+                            if let Some(ref log) = learning_log_create {
+                                let log = log.clone();
+                                let mint_s = general_create.mint.to_string();
+                                let dev_s = general_create.user.to_string();
+                                let snap = LearningTradeSnapshot::from_scoring(&token_features, &breakdown);
+                                let payload = serde_json::to_value(&snap).unwrap_or_else(|_| serde_json::json!({}));
+                                let ts = unix_now();
+                                tokio::spawn(async move {
+                                    let _ = log
+                                        .log_skipped(
+                                            &mint_s,
+                                            Some(dev_s.as_str()),
+                                            "size_zero",
+                                            "operator_cap",
+                                            payload,
+                                            ts,
+                                        )
+                                        .await;
+                                });
+                            }
                             return;
                         }
                         eprintln!(
@@ -904,6 +1078,8 @@ async fn main() {
                             amount_sol,
                         );
                         let open_reason = OpenReason::DevStats(dev_stats);
+                        let learning_snapshot =
+                            LearningTradeSnapshot::from_scoring(&token_features, &breakdown);
 
                         if tx
                             .send(PositionMessage::InitiateBuy {
@@ -912,6 +1088,7 @@ async fn main() {
                                 open_reason,
                                 dev_address: Some(general_create.user),
                                 early_buyers: buyers_for_position,
+                                learning_snapshot: Some(learning_snapshot),
                             })
                             .await
                             .is_ok()

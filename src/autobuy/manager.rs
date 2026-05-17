@@ -5,6 +5,7 @@ use crate::{
     },
     generalize::general_pool::Pool,
     helper::Amount,
+    learning::{LearningLogPg, LearningTradeSnapshot},
     persistence::{
         bot_trades::{BotTradeEntry, BotTradeRepository},
         creators::CreatorStatistics,
@@ -18,6 +19,7 @@ use crate::{
 };
 use solana_address::Address;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::sync::Arc;
 use std::{
     collections::{HashMap, HashSet},
@@ -147,6 +149,8 @@ pub enum PositionMessage {
         dev_address: Option<Address>,
         /// Snapshot of early buyers (used for smart_money on close).
         early_buyers: Vec<Address>,
+        /// Scoring-time snapshot for self-learning (optional).
+        learning_snapshot: Option<LearningTradeSnapshot>,
     },
     /// Internal: actual buy after delay
     ExecuteBuy {
@@ -155,6 +159,7 @@ pub enum PositionMessage {
         open_reason: OpenReason,
         dev_address: Option<Address>,
         early_buyers: Vec<Address>,
+        learning_snapshot: Option<LearningTradeSnapshot>,
     },
     /// Snapshot the current strategy state (caps, loss-streak, regime).
     /// Used by the HTTP /metrics endpoint.
@@ -222,6 +227,7 @@ pub struct PositionManagerActor {
     strategy: StrategyController,
     dev_ranker: Option<DevRankerHandle>,
     smart_money: Option<SmartMoneyHandle>,
+    learning: Option<LearningLogPg>,
 }
 
 impl PositionManagerActor {
@@ -233,6 +239,7 @@ impl PositionManagerActor {
         strategy_cfg: StrategyConfig,
         dev_ranker: Option<DevRankerHandle>,
         smart_money: Option<SmartMoneyHandle>,
+        learning: Option<LearningLogPg>,
     ) -> (
         Self,
         mpsc::Sender<PositionMessage>,
@@ -262,6 +269,7 @@ impl PositionManagerActor {
             strategy: StrategyController::new(strategy_cfg),
             dev_ranker,
             smart_money,
+            learning,
         };
         (actor, tx, event_rx, paused_state, balance_state)
     }
@@ -296,6 +304,7 @@ impl PositionManagerActor {
                     open_reason,
                     dev_address,
                     early_buyers,
+                    learning_snapshot,
                 } => {
                     if self.paused {
                         continue;
@@ -320,6 +329,25 @@ impl PositionManagerActor {
                         BuyDecision::Allow => {}
                         block => {
                             eprintln!("[STRATEGY] {mint} blocked: {:?}", block);
+                            if let Some(ref log) = self.learning {
+                                let log = log.clone();
+                                let mint_s = mint.to_string();
+                                let dev_s = dev_address.map(|d| d.to_string());
+                                let r = format!("{block:?}");
+                                let payload = json!({ "tier_sol": amount_sol });
+                                tokio::spawn(async move {
+                                    let _ = log
+                                        .log_skipped(
+                                            &mint_s,
+                                            dev_s.as_deref(),
+                                            "strategy_gate",
+                                            &r,
+                                            payload,
+                                            now_secs(),
+                                        )
+                                        .await;
+                                });
+                            }
                             continue;
                         }
                     }
@@ -336,6 +364,7 @@ impl PositionManagerActor {
                                 open_reason,
                                 dev_address,
                                 early_buyers,
+                                learning_snapshot,
                             })
                             .await;
                     });
@@ -368,6 +397,7 @@ impl PositionManagerActor {
                     open_reason,
                     dev_address,
                     early_buyers,
+                    learning_snapshot,
                 } => {
                     self.pending_buys.remove(&mint);
 
@@ -426,6 +456,7 @@ impl PositionManagerActor {
                     position.spent_sol = amount_sol;
                     position.dev_address = dev_address;
                     position.early_buyers = early_buyers;
+                    position.learning_snapshot = learning_snapshot;
                     let enter_mcap = position.enter_mcap.to_float();
                     eprintln!("[BUY] Opened {mint} | mcap={enter_mcap:.1} SOL | spent={amount_sol:.4} SOL");
                     self.positions.insert(mint, position);
@@ -515,6 +546,8 @@ impl PositionManagerActor {
                         } else {
                             Vec::new()
                         };
+                        let close_learning_snapshot = pos.learning_snapshot.clone();
+                        let close_entry_time = pos.entry_time;
 
                         if percent < 100.0 {
                             pos.holdings = Amount::from_float_native(pos.holdings.to_float() - sell_qty);
@@ -570,6 +603,29 @@ impl PositionManagerActor {
                                         handle.note_trade_outcome(buyers, pnl).await;
                                     });
                                 }
+
+                            if let (Some(log), Some(snap)) =
+                                (self.learning.as_ref(), close_learning_snapshot.as_ref())
+                            {
+                                let log = log.clone();
+                                let snap = snap.clone();
+                                let ex_mc = exit_mcap_sol;
+                                let pnl_p = pnl_pct_sol;
+                                let rsn = reason.clone();
+                                let closed_at_ts = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs() as i64;
+                                let held_secs = (closed_at_ts - close_entry_time as i64).max(0);
+                                tokio::spawn(async move {
+                                    if let Err(e) = log
+                                        .log_closed_trade(&snap, ex_mc, pnl_p, held_secs, &rsn, closed_at_ts)
+                                        .await
+                                    {
+                                        eprintln!("[LEARNING] log_closed_trade: {e}");
+                                    }
+                                });
+                            }
 
                             let _ = self.event_tx.try_send(WsFeedMessage::PositionClose {
                                 address: mint.to_string(),
@@ -898,6 +954,7 @@ impl PositionManagerHandler {
         open_reason: OpenReason,
         dev_address: Option<Address>,
         early_buyers: Vec<Address>,
+        learning_snapshot: Option<LearningTradeSnapshot>,
     ) {
         let _ = self
             .tx
@@ -907,6 +964,7 @@ impl PositionManagerHandler {
                 open_reason,
                 dev_address,
                 early_buyers,
+                learning_snapshot,
             })
             .await;
     }

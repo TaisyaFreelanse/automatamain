@@ -1,5 +1,5 @@
 //! Selection-quality stack: replaces the single hard CreatorStatisticsFilter
-//! with an A+/A/SKIP score engine, anti-bundle detection, smart-money
+//! with an A+/A/SKIP score engine, anti-bundle (similar-cluster) detection, smart-money
 //! tracking, dynamic dev ranking, and a strategy controller (daily caps,
 //! loss-streak pause, regime pause, max open positions).
 //!
