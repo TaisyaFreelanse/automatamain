@@ -71,7 +71,7 @@ fn default_a_plus() -> i32 {
     9
 }
 fn default_a() -> i32 {
-    8
+    7
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -39,7 +39,7 @@ scoring:
   # Longer window so mcap_now can diverge from mcap_init (momentum signal).
   scoring_window_ms: 3500
   a_plus_threshold: 9
-  a_threshold: 8
+  a_threshold: 7
   # --- Live-only gates (ignored when execution.mode: demo) ---------------
   # Require bonding-curve mcap growth into the "good" band during the window.
   # TEMP: off — mcap in logs stays ~flat vs window; re-enable after better mcap signal / logging.
