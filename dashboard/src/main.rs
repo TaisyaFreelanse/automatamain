@@ -897,7 +897,7 @@ impl eframe::App for Dashboard {
                                 egui::TextEdit::singleline(&mut self.config_panel.buy_size_input)
                                     .desired_width(90.0)
                                     .text_color(input_color)
-                                    .hint_text("e.g. 0.6"),
+                                    .hint_text("min 0.4 (server)"),
                             );
 
                             ui.label(egui::RichText::new("SOL").color(egui::Color32::GRAY));

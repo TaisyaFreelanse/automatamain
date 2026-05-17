@@ -186,8 +186,8 @@ pub struct TierSize {
 impl Default for TierSize {
     fn default() -> Self {
         Self {
-            a_plus_sol: 1.0,
-            a_sol: 0.6,
+            a_plus_sol: 0.4,
+            a_sol: 0.3,
         }
     }
 }

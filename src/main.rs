@@ -87,6 +87,8 @@ async fn main() {
         tx_log: Arc<std::sync::Mutex<std::collections::VecDeque<WsFeedMessage>>>,
         config_path: String,
         live_cfg: loggaper::autobuy::execution::LiveExecutionConfig,
+        /// Minimum allowed `PUT /buy-size` (and seed floor): at least 0.4 SOL and >= `a_plus_sol`.
+        buy_cap_floor: f64,
     }
 
     let (waiter_actor, waiter_handle) = DatabaseCreateWaiter::new();
@@ -151,9 +153,21 @@ async fn main() {
     // Operator buy cap (SOL): seeded from yaml `buy_config.amount_sol`, then
     // overridable at runtime via `PUT /buy-size` (dashboard). Each live buy
     // uses `min(score_engine recommended tier size, this cap)`.
+    const BUY_CAP_ABSOLUTE_FLOOR_SOL: f64 = 0.4;
+    let buy_cap_floor = BUY_CAP_ABSOLUTE_FLOOR_SOL.max(config.scoring.size.a_plus_sol);
+    let buy_cap_seed = config.buy_config.amount_sol.max(buy_cap_floor);
     let buy_size_state = Arc::new(std::sync::atomic::AtomicU64::new(f64::to_bits(
-        config.buy_config.amount_sol,
+        buy_cap_seed,
     )));
+    if buy_cap_seed > config.buy_config.amount_sol + f64::EPSILON {
+        eprintln!(
+            "[BOOT] buy cap seed raised from yaml {:.4} to {:.4} SOL (floor {:.4}, a_plus_sol {:.4})",
+            config.buy_config.amount_sol,
+            buy_cap_seed,
+            BUY_CAP_ABSOLUTE_FLOOR_SOL,
+            config.scoring.size.a_plus_sol
+        );
+    }
 
     // Bounded ring buffer of recent tx events (buy / sell / failed) — both
     // demo and live. Surfaced via `GET /tx-log` and used by the dashboard.
@@ -343,6 +357,7 @@ async fn main() {
         tx_log: tx_log.clone(),
         config_path: "filter_config.yaml".to_string(),
         live_cfg: config.execution.live.clone(),
+        buy_cap_floor,
     };
 
     let http_addr = format!("0.0.0.0:{}", config.http_port);
@@ -669,6 +684,19 @@ async fn main() {
                     return axum::http::StatusCode::BAD_REQUEST.into_response();
                 }
             };
+            if sol < state.buy_cap_floor {
+                eprintln!(
+                    "[HTTP] set_buy_size: rejected {:.6} SOL (minimum {:.6})",
+                    sol, state.buy_cap_floor
+                );
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("sol must be >= {} (covers a_plus tier size)", state.buy_cap_floor),
+                    })),
+                )
+                    .into_response();
+            }
             state
                 .buy_size
                 .store(f64::to_bits(sol), std::sync::atomic::Ordering::Relaxed);

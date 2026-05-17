@@ -16,7 +16,8 @@ http_port: 1662
 start_balance_sol: 10.0
 
 buy_config:
-  amount_sol: 0.6
+  # Operator / GUI buy cap (seed + PUT /buy-size). Never below max tier size so A+ is not clipped.
+  amount_sol: 0.4
   tp1_pct: 15.0
   tp1_sell_pct: 30.0
   tp2_pct: 50.0
@@ -82,10 +83,9 @@ scoring:
     bundle_identical_ratio: 0.5
     bundle_similar_tolerance: 0.10
   size:
-    a_plus_sol: 1.0
-    # Tier A live size (min with operator cap). Kept modest vs A+ because
-    # A hits the score threshold more easily even with momentum_good.
-    a_sol: 0.12
+    a_plus_sol: 0.4
+    # Tier A: smaller than A+; operator cap must be >= a_plus_sol (see buy_config.amount_sol).
+    a_sol: 0.3
 
 # Strategy controller — risk caps applied at the InitiateBuy gate inside the
 # position manager. None of these touch open positions.
