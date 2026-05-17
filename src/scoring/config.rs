@@ -39,6 +39,13 @@ pub struct ScoringConfig {
     #[serde(default)]
     pub minimum_tier_for_buy: MinBuyTier,
 
+    /// When `true`, use the pre–entry-filter-V2 score path: overheated-before-good
+    /// momentum ordering, bundle penalty = `bundle_identical` else `bundle_similar`,
+    /// smart-wallet buckets fixed at 3+/1+, and **YAML `thresholds` only** (learning
+    /// merge is not applied to snapshot or score). Flip back to `false` for V2.
+    #[serde(default)]
+    pub legacy_scoring: bool,
+
     #[serde(default)]
     pub weights: ScoringWeights,
 
@@ -57,6 +64,7 @@ impl Default for ScoringConfig {
             a_threshold: default_a(),
             require_momentum_good: false,
             minimum_tier_for_buy: MinBuyTier::A,
+            legacy_scoring: false,
             weights: ScoringWeights::default(),
             thresholds: FeatureThresholds::default(),
             size: TierSize::default(),

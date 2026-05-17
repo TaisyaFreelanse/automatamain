@@ -37,10 +37,16 @@ buy_config:
 # liquidity, buyers, momentum, volume, smart wallets, and anti-bundle signals
 # after a short scoring window, then chooses a tier-based buy size.
 scoring:
+  # TEMP A/B vs entry-filter V2: true = legacy engine (overheated-before-good
+  # momentum, bundle_identical then bundle_similar, smart 3+/1+ fixed, YAML
+  # thresholds only — learning merge not applied to snapshot/score). Set false
+  # to restore V2 scoring path.
+  legacy_scoring: true
   # Longer window so mcap_now can diverge from mcap_init (momentum signal).
   scoring_window_ms: 3500
   a_plus_threshold: 9
-  a_threshold: 7
+  # Pre-V2 default was 6 (V2 experiment used 7–8).
+  a_threshold: 6
   # --- Live-only gates (ignored when execution.mode: demo) ---------------
   # Require bonding-curve mcap growth into the "good" band during the window.
   # TEMP: off — mcap in logs stays ~flat vs window; re-enable after better mcap signal / logging.
@@ -72,16 +78,15 @@ scoring:
     buyers_mid: 6
     buyers_low: 3
     buy_to_sell_high: 1.5
-    # Entry filter V2: "good momentum" band [low, high] % mcap growth over the
-    # scoring window; above `high` (or >= overheated_pct when that is > high)
-    # applies `momentum_overheated`.
-    momentum_good_low_pct: 12.0
+    # Legacy: low band 4% (pre-V2). V2 A/B used 12% — set back to 12.0 when legacy_scoring: false.
+    momentum_good_low_pct: 4.0
     momentum_good_high_pct: 30.0
     momentum_overheated_pct: 60.0
     volume_ok_sol: 10.0
     bundle_similar_ratio: 0.7
     bundle_identical_ratio: 0.5
-    bundle_similar_tolerance: 0.10
+    # Legacy default 0.05 (V2 used 0.10 for similar-cluster sensitivity).
+    bundle_similar_tolerance: 0.05
   size:
     a_plus_sol: 0.4
     # Tier A: smaller than A+; operator cap must be >= a_plus_sol (see buy_config.amount_sol).

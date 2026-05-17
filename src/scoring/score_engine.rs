@@ -31,6 +31,134 @@ impl<'a> ScoreEngine<'a> {
     }
 
     pub fn score(&self, f: &TokenFeatures, thresholds: &FeatureThresholds) -> ScoreBreakdown {
+        if self.cfg.legacy_scoring {
+            self.score_legacy(f)
+        } else {
+            self.score_v2(f, thresholds)
+        }
+    }
+
+    /// Pre–entry-filter-V2: YAML `thresholds` only, classic momentum + bundle rules.
+    fn score_legacy(&self, f: &TokenFeatures) -> ScoreBreakdown {
+        let w = &self.cfg.weights;
+        let t = &self.cfg.thresholds;
+        let mut items: Vec<(&'static str, i32)> = Vec::with_capacity(12);
+        let mut total = 0_i32;
+
+        let add = |name: &'static str, points: i32, total: &mut i32, items: &mut Vec<_>| {
+            if points != 0 {
+                *total += points;
+                items.push((name, points));
+            }
+        };
+
+        if f.dev_has_history {
+            let strong = f.dev_total_coins >= t.dev_strong_min_coins
+                && f.dev_pnl_avg >= t.dev_strong_min_pnl_pct;
+            if strong {
+                add(
+                    "dev_history_strong",
+                    w.dev_history_strong,
+                    &mut total,
+                    &mut items,
+                );
+            } else {
+                add(
+                    "dev_history_weak",
+                    w.dev_history_weak,
+                    &mut total,
+                    &mut items,
+                );
+            }
+        }
+
+        match f.dev_category {
+            DevCategory::APlus => add(
+                "dev_ranker_a_plus",
+                w.dev_ranker_a_plus,
+                &mut total,
+                &mut items,
+            ),
+            DevCategory::A => add("dev_ranker_a", w.dev_ranker_a, &mut total, &mut items),
+            DevCategory::Bad => add(
+                "dev_ranker_bad",
+                w.dev_ranker_bad,
+                &mut total,
+                &mut items,
+            ),
+            DevCategory::Neutral | DevCategory::Stale => {}
+        }
+
+        if f.smart_wallet_count >= 3 {
+            add(
+                "smart_wallets_3plus",
+                w.smart_wallets_3plus,
+                &mut total,
+                &mut items,
+            );
+        } else if f.smart_wallet_count >= 1 {
+            add(
+                "smart_wallets_1plus",
+                w.smart_wallets_1plus,
+                &mut total,
+                &mut items,
+            );
+        }
+
+        let buyers = f.buyer_count();
+        if buyers >= t.buyers_high {
+            add("buyers_10plus", w.buyers_10plus, &mut total, &mut items);
+        } else if buyers >= t.buyers_mid {
+            add("buyers_6plus", w.buyers_6plus, &mut total, &mut items);
+        } else if buyers < t.buyers_low {
+            add("buyers_below_3", w.buyers_below_3, &mut total, &mut items);
+        }
+
+        if f.buy_to_sell_ratio >= t.buy_to_sell_high {
+            add(
+                "buy_to_sell_ratio_high",
+                w.buy_to_sell_ratio_high,
+                &mut total,
+                &mut items,
+            );
+        }
+
+        let momentum_pct = if f.initial_mcap_sol > 0.0 {
+            (f.current_mcap_sol / f.initial_mcap_sol - 1.0) * 100.0
+        } else {
+            0.0
+        };
+        if momentum_pct >= t.momentum_overheated_pct {
+            add(
+                "momentum_overheated",
+                w.momentum_overheated,
+                &mut total,
+                &mut items,
+            );
+        } else if (t.momentum_good_low_pct..=t.momentum_good_high_pct).contains(&momentum_pct) {
+            add("momentum_good", w.momentum_good, &mut total, &mut items);
+        }
+
+        if f.buy_volume_sol >= t.volume_ok_sol {
+            add("volume_ok", w.volume_ok, &mut total, &mut items);
+        }
+
+        if f.bundle.identical_size_ratio >= t.bundle_identical_ratio {
+            add(
+                "bundle_identical",
+                w.bundle_identical,
+                &mut total,
+                &mut items,
+            );
+        } else if f.bundle.similar_size_ratio >= t.bundle_similar_ratio {
+            add("bundle_similar", w.bundle_similar, &mut total, &mut items);
+        }
+
+        self.finish_breakdown(total, items)
+    }
+
+    /// Entry filter V2: merged thresholds, band-first momentum, similar-cluster bundle only.
+    fn score_v2(&self, f: &TokenFeatures, thresholds: &FeatureThresholds) -> ScoreBreakdown {
         let w = &self.cfg.weights;
         let t = thresholds;
         let mut items: Vec<(&'static str, i32)> = Vec::with_capacity(12);
@@ -156,6 +284,10 @@ impl<'a> ScoreEngine<'a> {
             add("bundle_similar", w.bundle_similar, &mut total, &mut items);
         }
 
+        self.finish_breakdown(total, items)
+    }
+
+    fn finish_breakdown(&self, total: i32, items: Vec<(&'static str, i32)>) -> ScoreBreakdown {
         let tier = if total >= self.cfg.a_plus_threshold {
             Tier::APlus
         } else if total >= self.cfg.a_threshold {

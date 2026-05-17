@@ -120,6 +120,11 @@ async fn main() {
         }
     };
     println!("[BOOT] Broker active: {}", broker.mode_label());
+    if config.scoring.legacy_scoring {
+        eprintln!(
+            "[BOOT] scoring=legacy_pre_v2 (YAML thresholds for snapshot+score; learning merge ignored)"
+        );
+    }
 
     // Persistent dev ranking + smart-money registries. Both are actors that
     // own their own state and flush JSON to disk every N seconds.
@@ -900,10 +905,15 @@ async fn main() {
                             &filter_config.scoring.thresholds,
                             &learning_overrides_spawn.read().await.patch,
                         );
+                        let thr_snapshot = if filter_config.scoring.legacy_scoring {
+                            &filter_config.scoring.thresholds
+                        } else {
+                            &merged_thr
+                        };
 
                         // --- Stage 3: snapshot features ---------------------
                         let (early_buyers, _buy_sizes_sol, buy_volume_sol, still_long, sold, bundle) =
-                            features::snapshot_early_buyers(&bucket_for_score, &merged_thr).await;
+                            features::snapshot_early_buyers(&bucket_for_score, thr_snapshot).await;
 
                         let (dev_category, dev_record) =
                             dev_ranker_for_create.category(general_create.user).await;
@@ -936,7 +946,12 @@ async fn main() {
                         );
 
                         let engine = ScoreEngine::new(&filter_config.scoring);
-                        let breakdown = engine.score(&token_features, &merged_thr);
+                        let thr_score = if filter_config.scoring.legacy_scoring {
+                            &filter_config.scoring.thresholds
+                        } else {
+                            &merged_thr
+                        };
+                        let breakdown = engine.score(&token_features, thr_score);
 
                         eprintln!(
                             "[SCORE] {} tier={:?} score={} buyers={}+{} vol={:.2} \
