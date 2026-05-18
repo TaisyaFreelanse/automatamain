@@ -29,8 +29,24 @@ buy_config:
   tp5_pct: 200.0
   tp5_sell_pct: 10.0
   exit_profit_floor: -16.0
+  # Fixed window when time_kill_adaptive: false. When adaptive (V3), weak/neutral/strong
+  # seconds below are used instead (this value is ignored for the timer).
   time_kill_secs: 25
   time_kill_min_profit_pct: 10.0
+  # --- Adaptive time kill (V3): weak launch ~20–25s, strong ~45–70s -----------------
+  time_kill_adaptive: true
+  time_kill_weak_secs: 22
+  time_kill_strong_secs: 60
+  time_kill_neutral_secs: 32
+  time_kill_strong_min_buyers: 38
+  time_kill_strong_min_b2s: 4.5
+  time_kill_weak_max_buyers: 28
+  time_kill_weak_max_b2s: 3.0
+  # % of entry mcap per second (same scale as PnL velocity on bonding curve).
+  time_kill_vel_strong: 0.06
+  time_kill_vel_flat: 0.025
+  time_kill_early_green_pct: 8.0
+  time_kill_peak_dd_for_weak: 0.055
   trailing_stop_drawdown_pct: 30.0
 
 # Score Engine A+/A/SKIP. The bot computes a combined score from dev quality,
@@ -44,6 +60,8 @@ scoring:
   legacy_scoring: true
   # Longer window so mcap_now can diverge from mcap_init (momentum signal).
   scoring_window_ms: 3500
+  # Sub-samples inside scoring_window_ms: new buyers/sell tape per slice (>=2 recommended).
+  buyer_velocity_slices: 3
   a_plus_threshold: 9
   # Pre-V2 default was 6 (V2 experiment used 7–8).
   a_threshold: 6
@@ -71,6 +89,13 @@ scoring:
     volume_ok: 1
     bundle_similar: -4
     bundle_identical: -5
+    # Early-window tape (V3): buyer cadence + sell pressure / absorb / dumps
+    buyer_velocity_persistent: 1
+    buyer_velocity_fading: -2
+    sell_pressure_high: -2
+    absorb_strong: 2
+    smart_early_exit_dump: -2
+    repeat_dump_penalty: -1
   thresholds:
     dev_strong_min_coins: 5
     dev_strong_min_pnl_pct: 20.0

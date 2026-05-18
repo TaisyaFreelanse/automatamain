@@ -21,8 +21,8 @@ impl BotTradeRepository for BotTradesRepositoryPostgres {
         sqlx::query(
             r#"
             INSERT INTO bot_trades
-                (mint, entry_mcap_sol, invested_sol, realized_pnl_pct, close_reason, closed_at, exit_mcap_sol)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+                (mint, entry_mcap_sol, invested_sol, realized_pnl_pct, close_reason, closed_at, exit_mcap_sol, entry_meta)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             "#,
         )
         .bind(&entry.mint)
@@ -32,6 +32,7 @@ impl BotTradeRepository for BotTradesRepositoryPostgres {
         .bind(&entry.close_reason)
         .bind(entry.closed_at)
         .bind(entry.exit_mcap_sol)
+        .bind(&entry.entry_meta)
         .execute(&self.pool)
         .await
         .map_err(Error::from)?;

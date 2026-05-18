@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 
-use crate::scoring::config::{FeatureThresholds, ScoringConfig};
+use crate::scoring::config::{FeatureThresholds, ScoringConfig, ScoringWeights};
 use crate::scoring::dev_ranker::DevCategory;
 use crate::scoring::features::TokenFeatures;
 
@@ -154,6 +154,8 @@ impl<'a> ScoreEngine<'a> {
             add("bundle_similar", w.bundle_similar, &mut total, &mut items);
         }
 
+        Self::apply_early_tape_scores(f, w, &mut total, &mut items);
+
         self.finish_breakdown(total, items)
     }
 
@@ -284,6 +286,8 @@ impl<'a> ScoreEngine<'a> {
             add("bundle_similar", w.bundle_similar, &mut total, &mut items);
         }
 
+        Self::apply_early_tape_scores(f, w, &mut total, &mut items);
+
         self.finish_breakdown(total, items)
     }
 
@@ -307,6 +311,69 @@ impl<'a> ScoreEngine<'a> {
             items,
             tier,
             recommended_size_sol,
+        }
+    }
+
+    /// Buyer cadence + sell-tape signals (shared by legacy and V2 paths).
+    fn apply_early_tape_scores(
+        f: &TokenFeatures,
+        w: &ScoringWeights,
+        total: &mut i32,
+        items: &mut Vec<(&'static str, i32)>,
+    ) {
+        let add = |name: &'static str, points: i32, total: &mut i32, items: &mut Vec<_>| {
+            if points != 0 {
+                *total += points;
+                items.push((name, points));
+            }
+        };
+
+        if f.buyer_velocity_persistence >= 0.62 {
+            add(
+                "buyer_velocity_persistent",
+                w.buyer_velocity_persistent,
+                total,
+                items,
+            );
+        } else if f.buyer_velocity_persistence <= 0.28 && f.buyer_velocity_new_per_slice.len() >= 2
+        {
+            add(
+                "buyer_velocity_fading",
+                w.buyer_velocity_fading,
+                total,
+                items,
+            );
+        }
+
+        if f.sell_pressure_score >= 0.58 {
+            add("sell_pressure_high", w.sell_pressure_high, total, items);
+        }
+
+        if f.absorb_quality_score >= 0.58 && f.sell_volume_window_sol >= 0.05 {
+            add("absorb_strong", w.absorb_strong, total, items);
+        }
+
+        if f.smart_wallet_early_exits >= 2 {
+            add(
+                "smart_early_exit_dump",
+                w.smart_early_exit_dump,
+                total,
+                items,
+            );
+        } else if f.smart_wallet_early_exits == 1 {
+            let pen = (w.smart_early_exit_dump / 2).max(-2);
+            add("smart_early_exit_dump", pen, total, items);
+        }
+
+        if f.repeat_dump_slices >= 2 {
+            add(
+                "repeat_dump_cluster",
+                w.repeat_dump_penalty.saturating_mul(2),
+                total,
+                items,
+            );
+        } else if f.repeat_dump_slices == 1 && f.sell_pressure_score >= 0.35 {
+            add("repeat_dump_cluster", w.repeat_dump_penalty, total, items);
         }
     }
 }

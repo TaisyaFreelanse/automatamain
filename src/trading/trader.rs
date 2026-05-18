@@ -9,6 +9,9 @@ pub struct Trader {
     avg_cost_basis: u128,
     total_spent: Amount,
     realized_pnl: i64,
+    /// Cumulative quote (lamports) received from sells — for early sell-pressure tape.
+    sell_proceeds_raw: u64,
+    sell_event_count: u32,
 
     trader_type: TraderType,
 }
@@ -38,6 +41,8 @@ impl Trader {
             avg_cost_basis: 0,
             total_spent: Amount::from_raw(0, paired_decimals),
             realized_pnl: 0,
+            sell_proceeds_raw: 0,
+            sell_event_count: 0,
 
             trader_type,
         }
@@ -66,6 +71,8 @@ impl Trader {
                     (self.avg_cost_basis * sell_amount.raw() as u128 / scale / scale) as i64;
                 self.realized_pnl += received as i64 - cost_of_sold;
                 self.current_holdings = self.current_holdings - sell_amount;
+                self.sell_proceeds_raw = self.sell_proceeds_raw.saturating_add(received);
+                self.sell_event_count = self.sell_event_count.saturating_add(1);
             }
         }
     }
@@ -95,5 +102,13 @@ impl Trader {
 
     pub fn trader_type(&self) -> TraderType {
         self.trader_type
+    }
+
+    pub fn sell_proceeds_raw(&self) -> u64 {
+        self.sell_proceeds_raw
+    }
+
+    pub fn sell_event_count(&self) -> u32 {
+        self.sell_event_count
     }
 }

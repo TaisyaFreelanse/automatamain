@@ -34,6 +34,37 @@ use tokio::{
     time::sleep,
 };
 
+// --- WebSocket / dashboard wire: V3 entry tape --------------------------------
+
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct V3TapeWire {
+    pub bv_persist: f64,
+    pub sell_press: f64,
+    pub absorb: f64,
+    pub dumps: u32,
+    pub sm_exits: u32,
+}
+
+impl V3TapeWire {
+    pub fn from_learning(s: &LearningTradeSnapshot) -> Self {
+        Self {
+            bv_persist: s.buyer_velocity_persistence,
+            sell_press: s.sell_pressure_score,
+            absorb: s.absorb_quality_score,
+            dumps: s.repeat_dump_slices,
+            sm_exits: s.smart_wallet_early_exits,
+        }
+    }
+}
+
+pub fn entry_meta_json(snap: Option<&LearningTradeSnapshot>) -> String {
+    snap.map(|s| {
+        let w = V3TapeWire::from_learning(s);
+        serde_json::to_string(&w).unwrap_or_default()
+    })
+    .unwrap_or_default()
+}
+
 // --- КОНФИГУРАЦИЯ ---
 
 fn now_secs() -> i64 {
@@ -60,6 +91,43 @@ fn default_tp5_pct() -> f64 {
 }
 fn default_tp5_sell_pct() -> f64 {
     10.0
+}
+
+fn default_time_kill_adaptive() -> bool {
+    true
+}
+fn default_time_kill_weak_secs() -> u64 {
+    22
+}
+fn default_time_kill_strong_secs() -> u64 {
+    60
+}
+fn default_time_kill_neutral_secs() -> u64 {
+    32
+}
+fn default_time_kill_strong_min_buyers() -> u64 {
+    38
+}
+fn default_time_kill_strong_min_b2s() -> f64 {
+    4.5
+}
+fn default_time_kill_weak_max_buyers() -> u64 {
+    28
+}
+fn default_time_kill_weak_max_b2s() -> f64 {
+    3.0
+}
+fn default_time_kill_vel_strong() -> f64 {
+    0.06
+}
+fn default_time_kill_vel_flat() -> f64 {
+    0.025
+}
+fn default_time_kill_early_green_pct() -> f64 {
+    8.0
+}
+fn default_time_kill_peak_dd_weak() -> f64 {
+    0.055
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -98,6 +166,42 @@ pub struct SmartBuyConfig {
     pub time_kill_secs: u64,
     /// Time kill: minimum profit to survive the time kill check (%)
     pub time_kill_min_profit_pct: f64,
+    /// When true, time-kill window is chosen from weak/neutral/strong using entry snapshot + mcap tape.
+    #[serde(default = "default_time_kill_adaptive")]
+    pub time_kill_adaptive: bool,
+    /// Weak launch: aggressive cut-off (seconds).
+    #[serde(default = "default_time_kill_weak_secs")]
+    pub time_kill_weak_secs: u64,
+    /// Strong launch: extended consolidation window (seconds).
+    #[serde(default = "default_time_kill_strong_secs")]
+    pub time_kill_strong_secs: u64,
+    /// Neither clearly weak nor strong.
+    #[serde(default = "default_time_kill_neutral_secs")]
+    pub time_kill_neutral_secs: u64,
+    /// Entry buyers at or above this count vote "strong".
+    #[serde(default = "default_time_kill_strong_min_buyers")]
+    pub time_kill_strong_min_buyers: u64,
+    /// Entry buy/sell at or above this votes "strong".
+    #[serde(default = "default_time_kill_strong_min_b2s")]
+    pub time_kill_strong_min_b2s: f64,
+    /// Entry buyers below this vote "weak" (with other weak cues).
+    #[serde(default = "default_time_kill_weak_max_buyers")]
+    pub time_kill_weak_max_buyers: u64,
+    /// Entry buy/sell below this (when > 0) votes "weak".
+    #[serde(default = "default_time_kill_weak_max_b2s")]
+    pub time_kill_weak_max_b2s: f64,
+    /// Live mcap velocity (% of entry mcap / sec) at or above → continuation vote.
+    #[serde(default = "default_time_kill_vel_strong")]
+    pub time_kill_vel_strong: f64,
+    /// |velocity| at or below this (after a few seconds held) → stagnation vote.
+    #[serde(default = "default_time_kill_vel_flat")]
+    pub time_kill_vel_flat: f64,
+    /// In-position mcap PnL at or above this early → strong (already escaping chop).
+    #[serde(default = "default_time_kill_early_green_pct")]
+    pub time_kill_early_green_pct: f64,
+    /// Drawdown from session peak (0..1) while still below min profit → weak / distribution.
+    #[serde(default = "default_time_kill_peak_dd_weak")]
+    pub time_kill_peak_dd_for_weak: f64,
     /// Trailing stop: how far (%) below the peak mcap before we exit
     pub trailing_stop_drawdown_pct: f64,
 }
@@ -119,6 +223,18 @@ impl Default for SmartBuyConfig {
             exit_profit_floor: -40.0, // lose at most 25%
             time_kill_secs: 25,
             time_kill_min_profit_pct: 10.0,
+            time_kill_adaptive: default_time_kill_adaptive(),
+            time_kill_weak_secs: default_time_kill_weak_secs(),
+            time_kill_strong_secs: default_time_kill_strong_secs(),
+            time_kill_neutral_secs: default_time_kill_neutral_secs(),
+            time_kill_strong_min_buyers: default_time_kill_strong_min_buyers(),
+            time_kill_strong_min_b2s: default_time_kill_strong_min_b2s(),
+            time_kill_weak_max_buyers: default_time_kill_weak_max_buyers(),
+            time_kill_weak_max_b2s: default_time_kill_weak_max_b2s(),
+            time_kill_vel_strong: default_time_kill_vel_strong(),
+            time_kill_vel_flat: default_time_kill_vel_flat(),
+            time_kill_early_green_pct: default_time_kill_early_green_pct(),
+            time_kill_peak_dd_for_weak: default_time_kill_peak_dd_weak(),
             trailing_stop_drawdown_pct: 30.0, // exit if mcap drops 30% from peak
         }
     }
@@ -415,6 +531,8 @@ impl PositionManagerActor {
                         continue;
                     };
 
+                    let v3_wire = learning_snapshot.as_ref().map(V3TapeWire::from_learning);
+
                     let receipt = match self.broker.buy(mint, amount_sol, latest_pool.as_ref()).await {
                         Ok(r) => {
                             let _ = self.event_tx.try_send(WsFeedMessage::TxEvent {
@@ -426,6 +544,8 @@ impl PositionManagerActor {
                                 reason: None,
                                 mode: self.broker.mode_label().to_string(),
                                 ts: now_secs(),
+                                v3_tape: v3_wire.clone(),
+                                time_kill_detail: None,
                             });
                             r
                         }
@@ -440,6 +560,8 @@ impl PositionManagerActor {
                                 reason: Some(e.to_string()),
                                 mode: self.broker.mode_label().to_string(),
                                 ts: now_secs(),
+                                v3_tape: v3_wire.clone(),
+                                time_kill_detail: None,
                             });
                             continue;
                         }
@@ -456,6 +578,16 @@ impl PositionManagerActor {
                     position.spent_sol = amount_sol;
                     position.dev_address = dev_address;
                     position.early_buyers = early_buyers;
+                    let (tk_b, tk_s, tk_b2s) = learning_snapshot
+                        .as_ref()
+                        .map(|s| (s.buyer_count, s.smart_wallet_count, s.buy_to_sell_ratio))
+                        .unwrap_or_else(|| {
+                            let eb = position.early_buyers.len() as u64;
+                            (eb, 0u32, 0.0f64)
+                        });
+                    position.tk_entry_buyers = tk_b;
+                    position.tk_entry_smart = tk_s;
+                    position.tk_entry_b2s = tk_b2s;
                     position.learning_snapshot = learning_snapshot;
                     let enter_mcap = position.enter_mcap.to_float();
                     eprintln!("[BUY] Opened {mint} | mcap={enter_mcap:.1} SOL | spent={amount_sol:.4} SOL");
@@ -470,6 +602,7 @@ impl PositionManagerActor {
                         address: mint.to_string(),
                         open_reason,
                         enter_mcap,
+                        v3_tape: v3_wire,
                     });
                 }
 
@@ -493,6 +626,21 @@ impl PositionManagerActor {
                         // instead of being permanently locked.
                         let close_ata = percent >= 100.0;
 
+                        let time_kill_detail = if reason == "TIME KILL" {
+                            if self.config.time_kill_adaptive && !pos.last_time_kill_tier.is_empty() {
+                                Some(format!(
+                                    "adaptive · {} · {}s",
+                                    pos.last_time_kill_tier, pos.last_time_kill_after_secs
+                                ))
+                            } else if !self.config.time_kill_adaptive {
+                                Some(format!("fixed · {}s", self.config.time_kill_secs))
+                            } else {
+                                Some("adaptive · ?".to_string())
+                            }
+                        } else {
+                            None
+                        };
+
                         let return_value = match self
                             .broker
                             .sell(mint, sell_qty, pos.pool.as_ref(), close_ata)
@@ -508,6 +656,8 @@ impl PositionManagerActor {
                                     reason: Some(reason.clone()),
                                     mode: self.broker.mode_label().to_string(),
                                     ts: now_secs(),
+                                    v3_tape: None,
+                                    time_kill_detail: time_kill_detail.clone(),
                                 });
                                 r.sol_received
                             }
@@ -522,6 +672,8 @@ impl PositionManagerActor {
                                     reason: Some(format!("{}: {}", reason, e)),
                                     mode: self.broker.mode_label().to_string(),
                                     ts: now_secs(),
+                                    v3_tape: None,
+                                    time_kill_detail,
                                 });
                                 self.positions.insert(mint, pos);
                                 continue;
@@ -669,6 +821,7 @@ impl PositionManagerActor {
                                     .unwrap()
                                     .as_secs() as i64,
                                 exit_mcap_sol,
+                                entry_meta: entry_meta_json(close_learning_snapshot.as_ref()),
                             };
                             let repo = self.bot_trades.clone();
                             tokio::spawn(async move {
@@ -695,6 +848,74 @@ impl PositionManagerActor {
         }
     }
 
+    /// V3 adaptive time-kill: weak vs strong window from entry snapshot + short mcap tape.
+    /// Returns `(kill_after_secs, tier_label)` where `tier_label` is `strong` / `weak` / `neutral`, or `fixed` when adaptive is off.
+    fn time_kill_window_profile(
+        cfg: &SmartBuyConfig,
+        pos: &Position,
+        profit: f64,
+        current_mcap: f64,
+        held_secs: u64,
+    ) -> (u64, &'static str) {
+        if !cfg.time_kill_adaptive {
+            return (cfg.time_kill_secs, "fixed");
+        }
+
+        let enter_mcap = pos.enter_mcap.to_float();
+        let vel = pos.time_kill_mcap_velocity_pct_per_sec(enter_mcap);
+
+        let mut strong = 0u32;
+        let mut weak = 0u32;
+
+        if pos.tk_entry_smart >= 1 {
+            strong += 1;
+        }
+        if pos.tk_entry_buyers >= cfg.time_kill_strong_min_buyers {
+            strong += 1;
+        }
+        if pos.tk_entry_b2s >= cfg.time_kill_strong_min_b2s {
+            strong += 1;
+        }
+
+        if pos.tk_entry_smart == 0 {
+            weak += 1;
+        }
+        if pos.tk_entry_buyers > 0 && pos.tk_entry_buyers < cfg.time_kill_weak_max_buyers {
+            weak += 1;
+        }
+        if pos.tk_entry_b2s > 0.0 && pos.tk_entry_b2s < cfg.time_kill_weak_max_b2s {
+            weak += 1;
+        }
+
+        if held_secs >= 6 && vel >= cfg.time_kill_vel_strong {
+            strong += 1;
+        }
+        if held_secs >= 8 && vel.abs() <= cfg.time_kill_vel_flat {
+            weak += 1;
+        }
+
+        if profit >= cfg.time_kill_early_green_pct {
+            strong += 1;
+        }
+
+        let peak_dd = if pos.highest_mcap > 0.0 {
+            (pos.highest_mcap - current_mcap) / pos.highest_mcap
+        } else {
+            0.0
+        };
+        if peak_dd >= cfg.time_kill_peak_dd_for_weak && profit < cfg.time_kill_min_profit_pct {
+            weak += 1;
+        }
+
+        if strong >= 4 && weak <= 1 {
+            (cfg.time_kill_strong_secs.clamp(45, 70), "strong")
+        } else if weak >= 3 && strong <= 1 {
+            (cfg.time_kill_weak_secs.clamp(18, 28), "weak")
+        } else {
+            (cfg.time_kill_neutral_secs.clamp(20, 45), "neutral")
+        }
+    }
+
     async fn process_positions(&mut self) {
         let current_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -714,17 +935,27 @@ impl PositionManagerActor {
                 pos.highest_mcap = current_mcap;
             }
 
+            pos.time_kill_note_mcap_sample(current_time, current_mcap);
+
             let profit = pos.pnl();
+
+            let held_secs = current_time.saturating_sub(pos.entry_time);
+            let (kill_after_secs, tk_tier) =
+                Self::time_kill_window_profile(&self.config, pos, profit, current_mcap, held_secs);
+            pos.last_time_kill_tier = tk_tier.to_string();
+            pos.last_time_kill_after_secs = kill_after_secs;
 
             let _ = self.event_tx.try_send(WsFeedMessage::PositionUpdate {
                 address: mint.to_string(),
                 pnl: profit,
                 holdings: pos.holdings.to_float(),
                 market_cap: current_mcap,
+                time_kill_tier: Some(pos.last_time_kill_tier.clone()),
+                time_kill_after_secs: Some(pos.last_time_kill_after_secs),
             });
 
-            // --- 1. Time Kill ---
-            if current_time >= pos.entry_time + self.config.time_kill_secs
+            // --- 1. Time Kill (adaptive window: weak 20–25s, strong 45–70s) ---
+            if current_time >= pos.entry_time + kill_after_secs
                 && profit < self.config.time_kill_min_profit_pct
             {
                 pos.is_closing = true;
@@ -1007,12 +1238,18 @@ pub enum WsFeedMessage {
         address: String,
         open_reason: OpenReason,
         enter_mcap: f64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        v3_tape: Option<V3TapeWire>,
     },
     PositionUpdate {
         address: String,
         pnl: f64,
         holdings: f64,
         market_cap: f64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        time_kill_tier: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        time_kill_after_secs: Option<u64>,
     },
     PositionClose {
         address: String,
@@ -1036,6 +1273,10 @@ pub enum WsFeedMessage {
         reason: Option<String>,
         mode: String,
         ts: i64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        v3_tape: Option<V3TapeWire>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        time_kill_detail: Option<String>,
     },
 }
 

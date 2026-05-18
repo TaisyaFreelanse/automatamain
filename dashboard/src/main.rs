@@ -71,6 +71,21 @@ pub enum OpenReason {
     TraderStats,
 }
 
+/// V3 tape snapshot (entry buy / persisted close meta). Mirrors `autobuy::manager::V3TapeWire`.
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct V3TapeWire {
+    #[serde(default)]
+    pub bv_persist: f64,
+    #[serde(default)]
+    pub sell_press: f64,
+    #[serde(default)]
+    pub absorb: f64,
+    #[serde(default)]
+    pub dumps: u32,
+    #[serde(default)]
+    pub sm_exits: u32,
+}
+
 #[derive(Deserialize, Clone, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsMsg {
@@ -78,12 +93,18 @@ pub enum WsMsg {
         address: String,
         open_reason: OpenReason,
         enter_mcap: f64,
+        #[serde(default)]
+        v3_tape: Option<V3TapeWire>,
     },
     PositionUpdate {
         address: String,
         pnl: f64,
         holdings: f64,
         market_cap: f64,
+        #[serde(default)]
+        time_kill_tier: Option<String>,
+        #[serde(default)]
+        time_kill_after_secs: Option<u64>,
     },
     PositionClose {
         address: String,
@@ -104,6 +125,10 @@ pub enum WsMsg {
         reason: Option<String>,
         mode: String,
         ts: i64,
+        #[serde(default)]
+        v3_tape: Option<V3TapeWire>,
+        #[serde(default)]
+        time_kill_detail: Option<String>,
     },
 }
 
@@ -124,6 +149,8 @@ pub struct TxLogRow {
     pub reason: Option<String>,
     pub mode: String,
     pub ts: i64,
+    pub v3_tape: Option<V3TapeWire>,
+    pub time_kill_detail: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -136,6 +163,8 @@ pub struct BotTradeRow {
     pub close_reason: String,
     pub closed_at: i64,
     pub exit_mcap_sol: f64,
+    #[serde(default)]
+    pub entry_meta: String,
 }
 
 #[derive(Deserialize, Clone)]
@@ -234,6 +263,9 @@ struct Position {
     holdings: f64,
     market_cap: f64,
     enter_mcap: f64,
+    v3_tape: Option<V3TapeWire>,
+    time_kill_tier: Option<String>,
+    time_kill_after_secs: Option<u64>,
 }
 
 // ── Config panel ──────────────────────────────────────────────────────────────
@@ -436,6 +468,7 @@ impl Dashboard {
                         address,
                         open_reason,
                         enter_mcap,
+                        v3_tape,
                     } => {
                         self.open.insert(
                             address.clone(),
@@ -446,6 +479,9 @@ impl Dashboard {
                                 holdings: 0.0,
                                 market_cap: 0.0,
                                 enter_mcap,
+                                v3_tape,
+                                time_kill_tier: None,
+                                time_kill_after_secs: None,
                             },
                         );
                     }
@@ -454,11 +490,19 @@ impl Dashboard {
                         pnl,
                         holdings,
                         market_cap,
+                        time_kill_tier,
+                        time_kill_after_secs,
                     } => {
                         if let Some(pos) = self.open.get_mut(&address) {
                             pos.pnl = pnl;
                             pos.holdings = holdings;
                             pos.market_cap = market_cap;
+                            if time_kill_tier.is_some() {
+                                pos.time_kill_tier = time_kill_tier;
+                            }
+                            if time_kill_after_secs.is_some() {
+                                pos.time_kill_after_secs = time_kill_after_secs;
+                            }
                         }
                     }
                     WsMsg::PositionClose { address, .. } => {
@@ -475,6 +519,8 @@ impl Dashboard {
                         reason,
                         mode,
                         ts,
+                        v3_tape,
+                        time_kill_detail,
                     } => {
                         if self.tx_log.len() >= 256 {
                             self.tx_log.pop_front();
@@ -488,6 +534,8 @@ impl Dashboard {
                             reason,
                             mode,
                             ts,
+                            v3_tape,
+                            time_kill_detail,
                         });
                     }
                 },
@@ -647,6 +695,32 @@ fn pnl_color(pnl: f64) -> egui::Color32 {
         egui::Color32::from_rgb(220, 90, 90)
     } else {
         egui::Color32::GRAY
+    }
+}
+
+fn parse_entry_meta_v3(json: &str) -> Option<V3TapeWire> {
+    let s = json.trim();
+    if s.is_empty() {
+        return None;
+    }
+    serde_json::from_str(s).ok()
+}
+
+/// One-line V3 tape for grids (bv_persist, sell_press, absorb, dumps, sm_exits).
+fn format_v3_tape_compact(t: &V3TapeWire) -> String {
+    format!(
+        "bv {:.2} · sp {:.2} · ab {:.2} · d{} · sm{}",
+        t.bv_persist, t.sell_press, t.absorb, t.dumps, t.sm_exits
+    )
+}
+
+fn time_kill_tier_color(tier: &str) -> egui::Color32 {
+    match tier {
+        "strong" => egui::Color32::from_rgb(110, 200, 130),
+        "weak" => egui::Color32::from_rgb(255, 120, 100),
+        "neutral" => egui::Color32::from_rgb(230, 200, 90),
+        "fixed" => egui::Color32::from_rgb(160, 170, 190),
+        _ => egui::Color32::LIGHT_GRAY,
     }
 }
 
@@ -1219,9 +1293,9 @@ impl eframe::App for Dashboard {
                 .max_height(third)
                 .show(ui, |ui| {
                     egui::Grid::new("open_grid")
-                        .num_columns(6)
+                        .num_columns(8)
                         .striped(true)
-                        .min_col_width(90.0)
+                        .min_col_width(72.0)
                         .show(ui, |ui| {
                             ui.label(egui::RichText::new("Address").strong());
                             ui.label(egui::RichText::new("PnL %").strong());
@@ -1229,6 +1303,8 @@ impl eframe::App for Dashboard {
                             ui.label(egui::RichText::new("Entry MCAP ($)").strong());
                             ui.label(egui::RichText::new("Curr MCAP ($)").strong());
                             ui.label(egui::RichText::new("Source").strong());
+                            ui.label(egui::RichText::new("V3 @ entry").strong());
+                            ui.label(egui::RichText::new("Time kill").strong());
                             ui.end_row();
                             for addr in &open_addresses {
                                 if let Some(pos) = self.open.get(addr) {
@@ -1246,6 +1322,42 @@ impl eframe::App for Dashboard {
                                     ui.label(self.usd_val(pos.enter_mcap, 0));
                                     ui.label(self.usd_val(pos.market_cap, 0));
                                     render_open_reason(ui, &pos.open_reason, self.sol_price);
+                                    if let Some(ref t) = pos.v3_tape {
+                                        let s = format_v3_tape_compact(t);
+                                        ui.label(
+                                            egui::RichText::new(&s)
+                                                .small()
+                                                .monospace()
+                                                .color(egui::Color32::from_rgb(190, 205, 230)),
+                                        )
+                                        .on_hover_text(&s);
+                                    } else {
+                                        ui.label(
+                                            egui::RichText::new("—")
+                                                .small()
+                                                .color(egui::Color32::GRAY),
+                                        );
+                                    }
+                                    match (&pos.time_kill_tier, pos.time_kill_after_secs) {
+                                        (Some(tier), Some(secs)) => {
+                                            ui.colored_label(
+                                                time_kill_tier_color(tier),
+                                                format!("{tier} · {secs}s"),
+                                            )
+                                            .on_hover_text(
+                                                "Adaptive time-kill window: tier from entry tape + live mcap velocity; \
+                                                 position closes if held ≥ window and PnL < min profit. \
+                                                 \"fixed\" = non-adaptive config window.",
+                                            );
+                                        }
+                                        _ => {
+                                            ui.label(
+                                                egui::RichText::new("…")
+                                                    .small()
+                                                    .color(egui::Color32::GRAY),
+                                            );
+                                        }
+                                    }
                                     ui.end_row();
                                 }
                             }
@@ -1277,15 +1389,16 @@ impl eframe::App for Dashboard {
                 .max_height(third.min(180.0))
                 .show(ui, |ui| {
                     egui::Grid::new("tx_log_grid")
-                        .num_columns(6)
+                        .num_columns(7)
                         .striped(true)
-                        .min_col_width(70.0)
+                        .min_col_width(56.0)
                         .show(ui, |ui| {
                             ui.label(egui::RichText::new("Time").strong());
                             ui.label(egui::RichText::new("Kind").strong());
                             ui.label(egui::RichText::new("Mode").strong());
                             ui.label(egui::RichText::new("Mint").strong());
                             ui.label(egui::RichText::new("SOL").strong());
+                            ui.label(egui::RichText::new("V3 / time kill").strong());
                             ui.label(egui::RichText::new("Status").strong());
                             ui.end_row();
 
@@ -1319,6 +1432,46 @@ impl eframe::App for Dashboard {
                                     &mut self.mint_copy_flash_until,
                                 );
                                 ui.label(format!("{:.4}", row.amount_sol));
+
+                                match row.kind {
+                                    TxEventKind::Buy => {
+                                        if let Some(ref t) = row.v3_tape {
+                                            let s = format_v3_tape_compact(t);
+                                            ui.label(
+                                                egui::RichText::new(&s)
+                                                    .small()
+                                                    .monospace()
+                                                    .color(egui::Color32::from_rgb(180, 200, 235)),
+                                            )
+                                            .on_hover_text("V3 tape at entry (buy)");
+                                        } else {
+                                            ui.label(
+                                                egui::RichText::new("—")
+                                                    .small()
+                                                    .color(egui::Color32::GRAY),
+                                            );
+                                        }
+                                    }
+                                    TxEventKind::Sell => {
+                                        if let Some(ref d) = row.time_kill_detail {
+                                            ui.label(
+                                                egui::RichText::new(d.as_str())
+                                                    .small()
+                                                    .monospace()
+                                                    .color(egui::Color32::from_rgb(240, 190, 120)),
+                                            )
+                                            .on_hover_text(
+                                                "TIME KILL: adaptive tier + kill window seconds, or fixed window from config.",
+                                            );
+                                        } else {
+                                            ui.label(
+                                                egui::RichText::new("—")
+                                                    .small()
+                                                    .color(egui::Color32::GRAY),
+                                            );
+                                        }
+                                    }
+                                }
 
                                 // Live: hide raw signatures in-grid; show compact status + optional
                                 // close hint, full sig only in tooltip / copy.
@@ -1386,15 +1539,16 @@ impl eframe::App for Dashboard {
                 .id_salt("history_scroll")
                 .show(ui, |ui| {
                     egui::Grid::new("history_grid")
-                        .num_columns(6)
+                        .num_columns(7)
                         .striped(true)
-                        .min_col_width(80.0)
+                        .min_col_width(72.0)
                         .show(ui, |ui| {
                             ui.label(egui::RichText::new("Time").strong());
                             ui.label(egui::RichText::new("Mint").strong());
                             ui.label(egui::RichText::new("PnL %").strong());
                             ui.label(egui::RichText::new("Invested ($)").strong());
                             ui.label(egui::RichText::new("Entry MCAP ($)").strong());
+                            ui.label(egui::RichText::new("V3 @ close").strong());
                             ui.label(egui::RichText::new("Close Reason").strong());
                             ui.end_row();
 
@@ -1424,6 +1578,24 @@ impl eframe::App for Dashboard {
                                 );
                                 ui.label(self.usd_val(row.invested_sol, 2));
                                 ui.label(self.usd_val(row.entry_mcap_sol, 0));
+                                if let Some(t) = parse_entry_meta_v3(&row.entry_meta) {
+                                    let s = format_v3_tape_compact(&t);
+                                    ui.label(
+                                        egui::RichText::new(&s)
+                                            .small()
+                                            .monospace()
+                                            .color(egui::Color32::from_rgb(175, 195, 225)),
+                                    )
+                                    .on_hover_text(format!(
+                                        "Tape snapshot persisted at full close (entry_meta JSON).\n{s}"
+                                    ));
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new("—")
+                                            .small()
+                                            .color(egui::Color32::DARK_GRAY),
+                                    );
+                                }
                                 ui.label(&row.close_reason);
                                 ui.end_row();
                             }
@@ -1674,6 +1846,8 @@ async fn ws_loop(
                                                             reason,
                                                             mode,
                                                             ts,
+                                                            v3_tape,
+                                                            time_kill_detail,
                                                         } => Some(TxLogRow {
                                                             kind,
                                                             mint,
@@ -1683,6 +1857,8 @@ async fn ws_loop(
                                                             reason,
                                                             mode,
                                                             ts,
+                                                            v3_tape,
+                                                            time_kill_detail,
                                                         }),
                                                         _ => None,
                                                     })

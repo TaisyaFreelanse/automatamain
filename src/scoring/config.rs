@@ -20,6 +20,11 @@ pub struct ScoringConfig {
     #[serde(default = "default_window_ms")]
     pub scoring_window_ms: u64,
 
+    /// Number of equal sub-samples inside `scoring_window_ms` for buyer-velocity
+    /// and sell-pressure tape. `1` = legacy single wait (no mid-window slices).
+    #[serde(default = "default_buyer_velocity_slices")]
+    pub buyer_velocity_slices: usize,
+
     #[serde(default = "default_a_plus")]
     pub a_plus_threshold: i32,
 
@@ -60,6 +65,7 @@ impl Default for ScoringConfig {
     fn default() -> Self {
         Self {
             scoring_window_ms: default_window_ms(),
+            buyer_velocity_slices: default_buyer_velocity_slices(),
             a_plus_threshold: default_a_plus(),
             a_threshold: default_a(),
             require_momentum_good: false,
@@ -74,6 +80,9 @@ impl Default for ScoringConfig {
 
 fn default_window_ms() -> u64 {
     1500
+}
+fn default_buyer_velocity_slices() -> usize {
+    3
 }
 fn default_a_plus() -> i32 {
     9
@@ -100,6 +109,19 @@ pub struct ScoringWeights {
     pub volume_ok: i32,
     pub bundle_similar: i32,
     pub bundle_identical: i32,
+
+    #[serde(default = "default_weight_buyer_velocity_persistent")]
+    pub buyer_velocity_persistent: i32,
+    #[serde(default = "default_weight_buyer_velocity_fading")]
+    pub buyer_velocity_fading: i32,
+    #[serde(default = "default_weight_sell_pressure_high")]
+    pub sell_pressure_high: i32,
+    #[serde(default = "default_weight_absorb_strong")]
+    pub absorb_strong: i32,
+    #[serde(default = "default_weight_smart_early_exit")]
+    pub smart_early_exit_dump: i32,
+    #[serde(default = "default_weight_repeat_dump")]
+    pub repeat_dump_penalty: i32,
 }
 
 impl Default for ScoringWeights {
@@ -121,8 +143,33 @@ impl Default for ScoringWeights {
             volume_ok: 1,
             bundle_similar: -4,
             bundle_identical: -5,
+            buyer_velocity_persistent: default_weight_buyer_velocity_persistent(),
+            buyer_velocity_fading: default_weight_buyer_velocity_fading(),
+            sell_pressure_high: default_weight_sell_pressure_high(),
+            absorb_strong: default_weight_absorb_strong(),
+            smart_early_exit_dump: default_weight_smart_early_exit(),
+            repeat_dump_penalty: default_weight_repeat_dump(),
         }
     }
+}
+
+fn default_weight_buyer_velocity_persistent() -> i32 {
+    1
+}
+fn default_weight_buyer_velocity_fading() -> i32 {
+    -2
+}
+fn default_weight_sell_pressure_high() -> i32 {
+    -2
+}
+fn default_weight_absorb_strong() -> i32 {
+    2
+}
+fn default_weight_smart_early_exit() -> i32 {
+    -2
+}
+fn default_weight_repeat_dump() -> i32 {
+    -1
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

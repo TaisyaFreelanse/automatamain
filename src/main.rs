@@ -386,7 +386,7 @@ async fn main() {
 
         async fn get_bot_trades(State(state): State<ApiState>) -> impl IntoResponse {
             match sqlx::query_as::<_, BotTradeRow>(
-                "SELECT id, mint, entry_mcap_sol, invested_sol, realized_pnl_pct, close_reason, closed_at, exit_mcap_sol \
+                "SELECT id, mint, entry_mcap_sol, invested_sol, realized_pnl_pct, close_reason, closed_at, exit_mcap_sol, entry_meta \
                  FROM bot_trades ORDER BY closed_at DESC"
             )
             .fetch_all(&state.pool)
@@ -895,11 +895,20 @@ async fn main() {
                         registry.save(mint_address, dev_stats.clone()).await;
                         bot_metrics_create.note_passed_filter();
 
-                        // --- Stage 2: scoring window ------------------------
+                        // --- Stage 2: scoring window + early tape ---------
                         let initial_mcap_sol =
                             bucket_for_score.pool().market_cap().amount().to_float();
                         let window_ms = filter_config.scoring.scoring_window_ms;
-                        tokio::time::sleep(std::time::Duration::from_millis(window_ms)).await;
+                        let tape_slices = filter_config
+                            .scoring
+                            .buyer_velocity_slices
+                            .max(1);
+                        let tape_points = features::observe_early_tape_points(
+                            &bucket_for_score,
+                            window_ms,
+                            tape_slices,
+                        )
+                        .await;
 
                         let merged_thr = merge_thresholds(
                             &filter_config.scoring.thresholds,
@@ -917,15 +926,33 @@ async fn main() {
 
                         let (dev_category, dev_record) =
                             dev_ranker_for_create.category(general_create.user).await;
+                        let buyers_for_position = early_buyers.all();
                         let smart_count = smart_money_for_create
-                            .count_smart(early_buyers.all())
+                            .count_smart(buyers_for_position.clone())
                             .await;
+
+                        let smart_addrs = smart_money_for_create
+                            .filter_smart_wallets(buyers_for_position.clone())
+                            .await;
+                        let mut smart_wallet_early_exits: u32 = 0;
+                        for a in smart_addrs {
+                            if let Some(t) = bucket_for_score.swarm().get_trader(a).await {
+                                if t.holdings().raw() == 0 && t.total_spent().raw() > 0 {
+                                    smart_wallet_early_exits += 1;
+                                }
+                            }
+                        }
+
+                        let tape = features::ScoringTapeDerived::from_tape_points(
+                            &tape_points,
+                            smart_wallet_early_exits,
+                        );
+
                         let current_mcap_sol =
                             bucket_for_score.pool().market_cap().amount().to_float();
 
                         let regular_buyer_count = early_buyers.regulars.len() as u64;
                         let sniper_count = early_buyers.snipers.len() as u64;
-                        let buyers_for_position = early_buyers.all();
 
                         let token_features = features::assemble(
                             general_create.mint,
@@ -943,6 +970,7 @@ async fn main() {
                             sold,
                             bundle,
                             smart_count,
+                            tape,
                         );
 
                         let engine = ScoreEngine::new(&filter_config.scoring);
@@ -956,7 +984,8 @@ async fn main() {
                         eprintln!(
                             "[SCORE] {} tier={:?} score={} buyers={}+{} vol={:.2} \
                              mcap_init={:.1} mcap_now={:.1} bundle_sim={:.2} \
-                             bundle_id={:.2} dev_cat={:?} smart={} items={:?}",
+                             bundle_id={:.2} dev_cat={:?} smart={} bv_persist={:.2} \
+                             sell_press={:.2} absorb={:.2} dumps={} sm_exits={} items={:?}",
                             general_create.mint,
                             breakdown.tier,
                             breakdown.total,
@@ -969,6 +998,11 @@ async fn main() {
                             token_features.bundle.identical_size_ratio,
                             dev_category,
                             smart_count,
+                            token_features.buyer_velocity_persistence,
+                            token_features.sell_pressure_score,
+                            token_features.absorb_quality_score,
+                            token_features.repeat_dump_slices,
+                            token_features.smart_wallet_early_exits,
                             breakdown.items,
                         );
 

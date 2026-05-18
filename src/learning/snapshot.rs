@@ -18,6 +18,23 @@ pub struct LearningTradeSnapshot {
     pub buy_volume_sol: f64,
     pub score_total: i32,
     pub tier: String,
+
+    #[serde(default)]
+    pub buyer_velocity_persistence: f64,
+    #[serde(default)]
+    pub buyer_velocity_new_per_slice: Vec<u64>,
+    #[serde(default)]
+    pub sell_pressure_score: f64,
+    #[serde(default)]
+    pub absorb_quality_score: f64,
+    #[serde(default)]
+    pub sell_volume_window_sol: f64,
+    #[serde(default)]
+    pub sell_events_window: u64,
+    #[serde(default)]
+    pub repeat_dump_slices: u32,
+    #[serde(default)]
+    pub smart_wallet_early_exits: u32,
 }
 
 impl LearningTradeSnapshot {
@@ -40,6 +57,14 @@ impl LearningTradeSnapshot {
             buy_volume_sol: f.buy_volume_sol,
             score_total: breakdown.total,
             tier: format!("{:?}", breakdown.tier),
+            buyer_velocity_persistence: f.buyer_velocity_persistence,
+            buyer_velocity_new_per_slice: f.buyer_velocity_new_per_slice.clone(),
+            sell_pressure_score: f.sell_pressure_score,
+            absorb_quality_score: f.absorb_quality_score,
+            sell_volume_window_sol: f.sell_volume_window_sol,
+            sell_events_window: f.sell_events_window,
+            repeat_dump_slices: f.repeat_dump_slices,
+            smart_wallet_early_exits: f.smart_wallet_early_exits,
         }
     }
 }

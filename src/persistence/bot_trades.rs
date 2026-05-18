@@ -8,6 +8,8 @@ pub struct BotTradeEntry {
     pub close_reason: String,
     pub closed_at: i64,
     pub exit_mcap_sol: f64,
+    /// JSON of `V3TapeWire` at entry (empty string if unknown).
+    pub entry_meta: String,
 }
 
 #[derive(serde::Serialize, sqlx::FromRow)]
@@ -20,6 +22,7 @@ pub struct BotTradeRow {
     pub close_reason: String,
     pub closed_at: i64,
     pub exit_mcap_sol: f64,
+    pub entry_meta: String,
 }
 
 #[async_trait::async_trait]

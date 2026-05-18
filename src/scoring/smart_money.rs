@@ -56,6 +56,11 @@ enum Msg {
         wallets: Vec<Address>,
         respond_to: oneshot::Sender<u32>,
     },
+    /// Wallets from `wallets` that qualify as "smart" in the registry.
+    FilterSmart {
+        wallets: Vec<Address>,
+        respond_to: oneshot::Sender<Vec<Address>>,
+    },
     Snapshot {
         respond_to: oneshot::Sender<SmartMoneySnapshot>,
     },
@@ -81,6 +86,18 @@ impl SmartMoneyHandle {
             })
             .await;
         rx.await.unwrap_or(0)
+    }
+
+    pub async fn filter_smart_wallets(&self, wallets: Vec<Address>) -> Vec<Address> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .tx
+            .send(Msg::FilterSmart {
+                wallets,
+                respond_to: tx,
+            })
+            .await;
+        rx.await.unwrap_or_default()
     }
 
     pub async fn snapshot(&self) -> SmartMoneySnapshot {
@@ -135,6 +152,20 @@ pub fn spawn(config: PersistenceConfig) -> SmartMoneyHandle {
                                 }
                             }
                             let _ = respond_to.send(count);
+                        }
+                        Msg::FilterSmart {
+                            wallets,
+                            respond_to,
+                        } => {
+                            let now = unix_now();
+                            let mut out = Vec::new();
+                            for w in wallets {
+                                if let Some(rec) = state.get(&w.to_string())
+                                    && is_smart(rec, now, ttl) {
+                                    out.push(w);
+                                }
+                            }
+                            let _ = respond_to.send(out);
                         }
                         Msg::Snapshot { respond_to } => {
                             let now = unix_now();

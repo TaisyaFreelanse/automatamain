@@ -37,6 +37,17 @@ pub struct Position {
     pub early_buyers: Vec<Address>,
     /// Self-learning: scoring-time feature snapshot (logged on full close).
     pub learning_snapshot: Option<LearningTradeSnapshot>,
+    // --- Adaptive time-kill (V3): entry snapshot + short mcap derivative ----------
+    pub tk_entry_buyers: u64,
+    pub tk_entry_smart: u32,
+    pub tk_entry_b2s: f64,
+    pub tk_last_secs: u64,
+    pub tk_last_mcap: f64,
+    pub tk_prev_secs: u64,
+    pub tk_prev_mcap: f64,
+    /// Last adaptive time-kill tier label: weak | neutral | strong | fixed.
+    pub last_time_kill_tier: String,
+    pub last_time_kill_after_secs: u64,
 }
 
 impl Position {
@@ -63,6 +74,15 @@ impl Position {
             dev_address: None,
             early_buyers: Vec::new(),
             learning_snapshot: None,
+            tk_entry_buyers: 0,
+            tk_entry_smart: 0,
+            tk_entry_b2s: 0.0,
+            tk_last_secs: 0,
+            tk_last_mcap: 0.0,
+            tk_prev_secs: 0,
+            tk_prev_mcap: 0.0,
+            last_time_kill_tier: String::new(),
+            last_time_kill_after_secs: 0,
         }
     }
 
@@ -72,5 +92,37 @@ impl Position {
             return 0.0;
         }
         (self.pool.market_cap().amount().to_float() / enter_mcap - 1.0) * 100.0
+    }
+
+    /// Advance second-resolution mcap samples for adaptive time-kill velocity.
+    pub fn time_kill_note_mcap_sample(&mut self, wall_secs: u64, mcap: f64) {
+        if self.tk_last_secs == 0 {
+            self.tk_last_secs = wall_secs;
+            self.tk_last_mcap = mcap;
+            self.tk_prev_secs = wall_secs;
+            self.tk_prev_mcap = mcap;
+            return;
+        }
+        if wall_secs == self.tk_last_secs {
+            self.tk_last_mcap = mcap;
+            return;
+        }
+        self.tk_prev_secs = self.tk_last_secs;
+        self.tk_prev_mcap = self.tk_last_mcap;
+        self.tk_last_secs = wall_secs;
+        self.tk_last_mcap = mcap;
+    }
+
+    /// % move of bonding mcap **per second**, normalized by entry mcap (≈ PnL%/s scale).
+    pub fn time_kill_mcap_velocity_pct_per_sec(&self, enter_mcap: f64) -> f64 {
+        if enter_mcap <= 0.0 {
+            return 0.0;
+        }
+        let dt = self
+            .tk_last_secs
+            .saturating_sub(self.tk_prev_secs)
+            .max(1) as f64;
+        let dm = self.tk_last_mcap - self.tk_prev_mcap;
+        (dm / enter_mcap) * 100.0 / dt
     }
 }
