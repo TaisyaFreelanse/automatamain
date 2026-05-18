@@ -11,7 +11,7 @@ use sips::instructions::{
     compute_budget::{ComputeUnitLimit, ComputeUnitPrice},
     pump::instructions::PumpInstruction,
     raw_instruction::Instruction as SipsInstruction,
-    token_program_2022::TokenProgram2022,
+    spl_token::SplTokenProgram,
 };
 use solana_address::Address as SolAddress;
 use solana_client::nonblocking::rpc_client::RpcClient;
@@ -310,7 +310,7 @@ impl SolanaBroker {
             match fetch_token_account_raw(&self.rpc_client, ata_str).await {
                 Ok(0) => {
                     let mut ixs = self.compute_budget_prelude();
-                    let close_ix = TokenProgram2022::close_account(
+                    let close_ix = SplTokenProgram::close_account(
                         ata_sol.into(),
                         self.wallet_address.into(),
                         self.wallet_address.into(),
@@ -446,7 +446,7 @@ impl Broker for SolanaBroker {
             mint.into(),
             self.wallet_address.into(),
             self.wallet_address.into(),
-            TokenProgram2022::PROGRAM,
+            SplTokenProgram::PROGRAM,
         );
 
         // Derive our ATA so we can read its raw token balance before/after the
@@ -484,7 +484,7 @@ impl Broker for SolanaBroker {
             mint.into(),
             self.wallet_address.into(),
             creator_for_vault.into(),
-            TokenProgram2022::PROGRAM,
+            SplTokenProgram::PROGRAM,
             sol_amount_in,
             min_token_out,
         );
@@ -783,7 +783,7 @@ impl Broker for SolanaBroker {
                 mint.into(),
                 self.wallet_address.into(),
                 creator_for_vault.into(),
-                TokenProgram2022::PROGRAM,
+                SplTokenProgram::PROGRAM,
                 token_amount_in,
                 min_sol_out,
                 cashback_enabled,
@@ -792,13 +792,13 @@ impl Broker for SolanaBroker {
             ixs.push(ix.into());
         }
 
-        // Atomic rent recovery on full exits. Token-2022 `CloseAccount`
+        // Atomic rent recovery on full exits. SPL Token `CloseAccount`
         // refunds the rent-exempt SOL deposit (~0.00203928 SOL per token
         // account) back to `destination` (our wallet) and burns the
         // account. It only succeeds if the account's token balance is 0,
         // which is why we suppress it whenever the SELL was clamped.
         if do_close_ata {
-            let close_ix = TokenProgram2022::close_account(
+            let close_ix = SplTokenProgram::close_account(
                 ata_sol.into(),
                 self.wallet_address.into(),
                 self.wallet_address.into(),
@@ -1255,16 +1255,15 @@ fn pump_max_sellable_tokens_for_sol(target_sol_out: u64, curve: &BondingCurveSta
 }
 
 /// Derive the SPL associated token account address for `(wallet, mint)`
-/// under the Token-2022 program (which pump-fun uses). Returns both the
-/// typed `SolAddress` (for ix-building) and its base58 string form (for RPC
-/// calls that go through string parsing — avoids hard-coupling this module
-/// to a specific `solana-pubkey` version).
+/// under the **legacy SPL Token** program (`Tokenkeg…`), which pump.fun
+/// bonding-curve mints use. Returns both the typed `SolAddress` (for ix-building)
+/// and its base58 string form (for RPC calls that go through string parsing).
 fn derive_ata_address(wallet: &SolAddress, mint: &SolAddress) -> (SolAddress, String) {
     let wallet_sips: sips::address::Address = (*wallet).into();
     let mint_sips: sips::address::Address = (*mint).into();
     let (ata_sips, _bump) = sips::helper::ata(
         &wallet_sips,
-        &TokenProgram2022::PROGRAM,
+        &SplTokenProgram::PROGRAM,
         &mint_sips,
     );
     let ata_sol: SolAddress = ata_sips.into();
