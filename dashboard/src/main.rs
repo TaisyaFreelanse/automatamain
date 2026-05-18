@@ -2,7 +2,12 @@
 
 use eframe::egui;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::mpsc, thread, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
 
 // ── Wire types ────────────────────────────────────────────────────────────────
 
@@ -317,6 +322,8 @@ struct Dashboard {
     /// dashboard tolerant of WS gaps without spamming the backend.
     last_http_poll: Option<std::time::Instant>,
     config_panel: ConfigPanel,
+    /// Brief "Copied" banner after copying a mint to the clipboard.
+    mint_copy_flash_until: Option<Instant>,
 }
 
 impl Dashboard {
@@ -350,6 +357,7 @@ impl Dashboard {
             tx_log: std::collections::VecDeque::with_capacity(256),
             last_http_poll: None,
             config_panel: ConfigPanel::new(),
+            mint_copy_flash_until: None,
         }
     }
 
@@ -665,6 +673,33 @@ fn short_addr(addr: &str) -> String {
     } else {
         addr.to_string()
     }
+}
+
+/// Short mint + 📋 copies `full_mint` (not the abbreviated label).
+fn render_mint_with_copy(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    full_mint: &str,
+    mint_copy_flash_until: &mut Option<Instant>,
+) {
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(short_addr(full_mint))
+                .monospace()
+                .color(egui::Color32::from_rgb(200, 210, 230)),
+        );
+        let tip = format!(
+            "Copy mint\n\n{full_mint}\n\nSolscan:\nhttps://solscan.io/token/{full_mint}\n\nJupiter:\nhttps://jup.ag/tokens/{full_mint}"
+        );
+        if ui
+            .add(egui::Button::new("📋").small())
+            .on_hover_text(tip)
+            .clicked()
+        {
+            ctx.copy_text(full_mint.to_string());
+            *mint_copy_flash_until = Some(Instant::now() + Duration::from_millis(1600));
+        }
+    });
 }
 
 fn render_open_reason(ui: &mut egui::Ui, reason: &OpenReason, sol_price: Option<f64>) {
@@ -1158,6 +1193,20 @@ impl eframe::App for Dashboard {
 
         // ── Central panel ─────────────────────────────────────────────────────
         egui::CentralPanel::default().show(ctx, |ui| {
+            if let Some(until) = self.mint_copy_flash_until {
+                if Instant::now() < until {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(120, 200, 130),
+                            "✓ Copied",
+                        );
+                    });
+                    ctx.request_repaint_after(Duration::from_millis(120));
+                } else {
+                    self.mint_copy_flash_until = None;
+                }
+            }
+
             let third = (ui.available_height() / 3.0).max(80.0);
 
             // ── Open positions ────────────────────────────────────────────────
@@ -1183,8 +1232,11 @@ impl eframe::App for Dashboard {
                             ui.end_row();
                             for addr in &open_addresses {
                                 if let Some(pos) = self.open.get(addr) {
-                                    ui.label(
-                                        egui::RichText::new(short_addr(&pos.address)).monospace(),
+                                    render_mint_with_copy(
+                                        ui,
+                                        ctx,
+                                        pos.address.as_str(),
+                                        &mut self.mint_copy_flash_until,
                                     );
                                     ui.colored_label(
                                         pnl_color(pos.pnl),
@@ -1260,9 +1312,11 @@ impl eframe::App for Dashboard {
                                     _ => egui::Color32::GRAY,
                                 };
                                 ui.colored_label(mode_col, row.mode.to_uppercase());
-                                ui.label(
-                                    egui::RichText::new(short_addr(&row.mint))
-                                        .monospace(),
+                                render_mint_with_copy(
+                                    ui,
+                                    &tx_ctx,
+                                    &row.mint,
+                                    &mut self.mint_copy_flash_until,
                                 );
                                 ui.label(format!("{:.4}", row.amount_sol));
 
@@ -1349,16 +1403,21 @@ impl eframe::App for Dashboard {
                                     egui::RichText::new(format_age(row.closed_at))
                                         .color(egui::Color32::GRAY),
                                 );
-                                let short = short_addr(&row.mint);
-                                let btn = egui::Button::new(
-                                    egui::RichText::new(short)
-                                        .monospace()
-                                        .color(egui::Color32::from_rgb(120, 180, 255)),
-                                )
-                                .frame(false);
-                                if ui.add(btn).on_hover_text("Click for chart").clicked() {
-                                    let _ = cmd_tx.try_send(DashCmd::FetchChart(row.mint.clone()));
-                                }
+                                ui.horizontal(|ui| {
+                                    render_mint_with_copy(
+                                        ui,
+                                        ctx,
+                                        &row.mint,
+                                        &mut self.mint_copy_flash_until,
+                                    );
+                                    if ui
+                                        .add(egui::Button::new("📈").small())
+                                        .on_hover_text("Open chart")
+                                        .clicked()
+                                    {
+                                        let _ = cmd_tx.try_send(DashCmd::FetchChart(row.mint.clone()));
+                                    }
+                                });
                                 ui.colored_label(
                                     pnl_color(row.realized_pnl_pct),
                                     format!("{:+.2}%", row.realized_pnl_pct),
