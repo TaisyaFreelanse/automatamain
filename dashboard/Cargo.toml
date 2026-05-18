@@ -3,6 +3,17 @@ name = "dashboard"
 version = "0.1.0"
 edition = "2024"
 
+# macOS `.app` via `cargo install cargo-bundle` then `cargo bundle --release -p dashboard` from repo root
+[package.metadata.bundle]
+name = "Position Dashboard"
+identifier = "com.automatamain.dashboard"
+category = "public.app-category.developer-tools"
+short_description = "Trading position dashboard"
+copyright = ""
+
+# Glob is resolved from the directory where you run `cargo bundle` (repo root).
+resources = ["dashboard_config.json"]
+
 [dependencies]
 eframe = "0.29"
 egui = "0.29"

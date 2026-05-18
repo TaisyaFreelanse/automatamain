@@ -33,7 +33,10 @@ use crate::{
 
 use super::{
     broker::{Broker, BrokerError, BuyReceipt, SellReceipt},
-    jupiter_sell::{decode_jupiter_swap_transaction, jupiter_build_swap_exact_in},
+    jupiter_sell::{
+        decode_jupiter_swap_transaction, jupiter_build_swap_exact_in,
+        jupiter_build_swap_wsol_to_mint_exact_in,
+    },
 };
 
 // ── State per open position ───────────────────────────────────────────────────
@@ -262,6 +265,100 @@ impl SolanaBroker {
         }
     }
 
+    /// Entry after `BondingCurve::complete` (pump `buy` returns Custom 6005).
+    /// Swaps SOL → mint via Jupiter v6 (`ExactIn` on wrapped SOL).
+    async fn buy_tokens_post_graduation(
+        &self,
+        mint: SolAddress,
+        amount_sol: f64,
+        mint_token: MintTokenKind,
+    ) -> Result<BuyReceipt, BrokerError> {
+        let slippage_bps_u16: u16 = self
+            .exec_cfg
+            .slippage_bps
+            .min(5000)
+            .try_into()
+            .unwrap_or(500);
+
+        let sol_lamports: u64 = (amount_sol * 1_000_000_000.0).round() as u64;
+        if sol_lamports == 0 {
+            return Err(BrokerError::Custom(
+                "Jupiter BUY: amount_sol rounds to 0 lamports".into(),
+            ));
+        }
+
+        let (_ata_sol, ata_str) =
+            derive_ata_address(&self.wallet_address, &mint, mint_token.program());
+        let pre_raw: u64 = fetch_token_account_raw(&self.rpc_client, &ata_str)
+            .await
+            .unwrap_or(0);
+
+        let mint_s = mint.to_string();
+        let build = jupiter_build_swap_wsol_to_mint_exact_in(
+            &mint_s,
+            sol_lamports,
+            slippage_bps_u16,
+            &self.wallet_address.to_string(),
+        )
+        .await?;
+
+        let tx_bytes = STANDARD
+            .decode(build.swap_transaction_b64.trim())
+            .map_err(|e| BrokerError::Custom(format!("Jupiter swapTransaction base64: {e}")))?;
+        let template = decode_jupiter_swap_transaction(&tx_bytes)?;
+
+        let sig_str = self
+            .send_versioned_jupiter_with_retries(&template, "BUY-JUPITER")
+            .await?
+            .to_string();
+
+        {
+            let mut bal = self.balance.lock().unwrap();
+            *bal -= amount_sol;
+        }
+
+        let actual_tokens_received = match poll_token_balance_increase(
+            &self.rpc_client,
+            &ata_str,
+            pre_raw,
+            Duration::from_millis(15_000),
+        )
+        .await
+        {
+            Ok((post_raw, decimals)) => {
+                let delta_raw = post_raw.saturating_sub(pre_raw);
+                let scale = 10u64.pow(decimals as u32) as f64;
+                let actual = delta_raw as f64 / scale;
+                eprintln!(
+                    "[BROKER BUY-JUPITER] {mint}: filled tokens={:.6} (raw_delta={}, decimals={}, \
+                     jupiter_quote_out_raw={})",
+                    actual, delta_raw, decimals, build.out_lamports,
+                );
+                actual
+            }
+            Err(e) => {
+                eprintln!(
+                    "[BROKER BUY-JUPITER] {mint}: ATA balance delta unavailable ({e}); \
+                     using Jupiter quote out_raw={}",
+                    build.out_lamports,
+                );
+                match fetch_token_account_raw_with_decimals(&self.rpc_client, &ata_str).await {
+                    Ok((_raw, decimals)) => {
+                        let scale = 10f64.powi(i32::from(decimals));
+                        (build.out_lamports as f64 / scale).max(0.0)
+                    }
+                    Err(_) => (build.out_lamports as f64 / 1_000_000.0).max(0.0),
+                }
+            }
+        };
+
+        Ok(BuyReceipt {
+            sol_spent: amount_sol,
+            tokens_received: actual_tokens_received,
+            signature: Some(sig_str),
+        })
+    }
+
     /// Full or partial exit after the bonding curve has migrated (pump `Sell`
     /// returns 6005). Uses Jupiter Swap API v6 (`quote` + `swap`).
     async fn sell_tokens_post_graduation(
@@ -434,6 +531,18 @@ impl Broker for SolanaBroker {
 
         let mint_token = fetch_mint_token_kind(&self.rpc_client, &mint).await?;
 
+        // Graduated token: pump `buy` returns `BondingCurveComplete` (Anchor 6005).
+        if let Ok(curve) = fetch_bonding_curve_state(&self.rpc_client, &mint).await {
+            if curve.curve_complete {
+                eprintln!(
+                    "[BROKER BUY] {mint}: bonding curve COMPLETE — routing BUY via Jupiter"
+                );
+                return self
+                    .buy_tokens_post_graduation(mint, amount_sol, mint_token)
+                    .await;
+            }
+        }
+
         // Slippage-aware min_token_out from current pool price.
         let price_sol_per_token = pool.price().amount().to_float().max(f64::MIN_POSITIVE);
         let expected_tokens = amount_sol / price_sol_per_token;
@@ -501,7 +610,20 @@ impl Broker for SolanaBroker {
         ixs.push(create_ata_ix.into());
         ixs.push(ix.into());
 
-        let sig_str = self.send_with_retries(ixs, "BUY").await?;
+        let sig_str = match self.send_with_retries(ixs, "BUY").await {
+            Ok(s) => s,
+            Err(BrokerError::TransactionFailed(ref msg))
+                if is_bonding_curve_complete_pump_error(msg) =>
+            {
+                eprintln!(
+                    "[BROKER BUY] {mint}: pump BUY failed BondingCurveComplete (6005) — retrying via Jupiter"
+                );
+                return self
+                    .buy_tokens_post_graduation(mint, amount_sol, mint_token)
+                    .await;
+            }
+            Err(e) => return Err(e),
+        };
 
         // Optimistically debit so subsequent `balance_sol()` calls reflect the
         // spend without waiting on the periodic RPC refresh.

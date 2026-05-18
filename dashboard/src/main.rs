@@ -1,9 +1,13 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
 
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -1955,10 +1959,51 @@ struct DashboardConfig {
     http_url: String,
 }
 
+/// Resolves `dashboard_config.json` for dev (cwd), portable runs (next to the binary),
+/// and macOS `.app` bundles (`Contents/Resources/`), where the process cwd is not the project dir.
+///
+/// `cargo-bundle` may place files that used `../` in globs under `Resources/_up_/…`; we check that too.
+fn resolve_dashboard_config_path() -> PathBuf {
+    if let Ok(p) = std::env::var("DASHBOARD_CONFIG") {
+        return PathBuf::from(p);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let resources = dir.join("../Resources");
+            for rel in [
+                "dashboard_config.json",
+                "_up_/dashboard_config.json",
+            ] {
+                let p = resources.join(rel);
+                if p.is_file() {
+                    return p;
+                }
+            }
+            let beside = dir.join("dashboard_config.json");
+            if beside.is_file() {
+                return beside;
+            }
+        }
+    }
+    PathBuf::from("dashboard_config.json")
+}
+
 fn load_config() -> DashboardConfig {
-    let content =
-        std::fs::read_to_string("dashboard_config.json").expect("dashboard_config.json not found");
-    serde_json::from_str(&content).expect("invalid dashboard_config.json")
+    let path = resolve_dashboard_config_path();
+    let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "dashboard_config.json not found (tried {}): {}",
+            path.display(),
+            e
+        )
+    });
+    serde_json::from_str(&content).unwrap_or_else(|e| {
+        panic!(
+            "invalid dashboard_config.json ({}): {}",
+            path.display(),
+            e
+        )
+    })
 }
 
 fn main() -> eframe::Result<()> {

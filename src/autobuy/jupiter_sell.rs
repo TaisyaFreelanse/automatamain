@@ -1,5 +1,5 @@
-//! Jupiter Swap API v6 — sells after pump.fun bonding curve completion (Anchor
-//! `BondingCurveComplete` / custom `6005`), when on-curve `Sell` is rejected.
+//! Jupiter Swap API v6 — trades after pump.fun bonding curve completion (Anchor
+//! `BondingCurveComplete` / custom `6005`), when on-curve `buy`/`sell` is rejected.
 
 use std::sync::OnceLock;
 
@@ -34,18 +34,21 @@ pub(crate) fn decode_jupiter_swap_transaction(
 
 pub(crate) struct JupiterSwapBuild {
     pub swap_transaction_b64: String,
+    /// Output mint's smallest units (WSOL lamports when selling into SOL).
     pub out_lamports: u64,
 }
 
-pub(crate) async fn jupiter_build_swap_exact_in(
+/// Generic ExactIn quote + swap (input/output mints are caller-defined).
+pub(crate) async fn jupiter_build_swap_exact_in_mints(
     input_mint: &str,
+    output_mint: &str,
     amount_raw: u64,
     slippage_bps: u16,
     user_pubkey: &str,
 ) -> Result<JupiterSwapBuild, BrokerError> {
     let h = http();
     let quote_url = format!(
-        "{JUPITER_QUOTE}?inputMint={input_mint}&outputMint={WSOL_MINT}\
+        "{JUPITER_QUOTE}?inputMint={input_mint}&outputMint={output_mint}\
          &amount={amount_raw}&slippageBps={slippage_bps}&swapMode=ExactIn"
     );
 
@@ -98,6 +101,34 @@ pub(crate) async fn jupiter_build_swap_exact_in(
 
     Ok(JupiterSwapBuild {
         swap_transaction_b64,
-        out_lamports,
+        out_lamports: out_lamports,
     })
+}
+
+/// Sell path: token mint → wrapped SOL.
+pub(crate) async fn jupiter_build_swap_exact_in(
+    input_mint: &str,
+    amount_raw: u64,
+    slippage_bps: u16,
+    user_pubkey: &str,
+) -> Result<JupiterSwapBuild, BrokerError> {
+    jupiter_build_swap_exact_in_mints(input_mint, WSOL_MINT, amount_raw, slippage_bps, user_pubkey)
+        .await
+}
+
+/// Buy path after graduation: wrapped SOL → token mint (`bondingCurveComplete` / 6005 on pump buy).
+pub(crate) async fn jupiter_build_swap_wsol_to_mint_exact_in(
+    output_mint: &str,
+    sol_lamports_in: u64,
+    slippage_bps: u16,
+    user_pubkey: &str,
+) -> Result<JupiterSwapBuild, BrokerError> {
+    jupiter_build_swap_exact_in_mints(
+        WSOL_MINT,
+        output_mint,
+        sol_lamports_in,
+        slippage_bps,
+        user_pubkey,
+    )
+    .await
 }
