@@ -148,12 +148,11 @@ learning:
   analyze_interval_secs: 3600
   min_trades_for_update: 30
 
-# Execution mode. Demo = MockBroker (simulated, uses start_balance_sol).
-# Live = SolanaBroker — reads wallet from PRIVATE_KEY env, mainnet RPC from
-# SOLANA_RPC_URL (or SOLANA_HTTP) env, and routes real buy/sell tx with the
-# slippage/priority/retry knobs below.
+# Execution mode. Default: live (SolanaBroker). Demo = MockBroker (simulated).
+# Live reads wallet from PRIVATE_KEY env, mainnet RPC from SOLANA_RPC_URL
+# (or SOLANA_HTTP) env, and routes real buy/sell tx with the knobs below.
 execution:
-  mode: demo            # demo | live
+  mode: live            # demo | live
   live:
     slippage_bps: 500                   # 5%
     priority_fee_micro_lamports: 200000 # per CU (0 disables)

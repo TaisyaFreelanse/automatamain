@@ -18,9 +18,9 @@ use crate::autobuy::{
 #[serde(rename_all = "lowercase")]
 pub enum ExecutionMode {
     /// In-memory simulated trading (no RPC, no wallet).
-    #[default]
     Demo,
     /// Real on-chain execution via Solana RPC + signed transactions.
+    #[default]
     Live,
 }
 
