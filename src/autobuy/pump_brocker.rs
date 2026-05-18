@@ -6,12 +6,16 @@ use std::{
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use sips::instructions::{
-    associated_token_program::AssociatedTokenProgram,
-    compute_budget::{ComputeUnitLimit, ComputeUnitPrice},
-    pump::instructions::PumpInstruction,
-    raw_instruction::Instruction as SipsInstruction,
-    spl_token::SplTokenProgram,
+use sips::{
+    address::Address as SipsAddress,
+    instructions::{
+        associated_token_program::AssociatedTokenProgram,
+        compute_budget::{ComputeUnitLimit, ComputeUnitPrice},
+        pump::instructions::PumpInstruction,
+        raw_instruction::Instruction as SipsInstruction,
+        spl_token::SplTokenProgram,
+        token_program_2022::TokenProgram2022,
+    },
 };
 use solana_address::Address as SolAddress;
 use solana_client::nonblocking::rpc_client::RpcClient;
@@ -269,6 +273,7 @@ impl SolanaBroker {
         sold_raw: u64,
         do_close_ata: bool,
         slip: f64,
+        mint_token: MintTokenKind,
     ) -> Result<SellReceipt, BrokerError> {
         let slippage_bps_u16: u16 = self
             .exec_cfg
@@ -310,12 +315,12 @@ impl SolanaBroker {
             match fetch_token_account_raw(&self.rpc_client, ata_str).await {
                 Ok(0) => {
                     let mut ixs = self.compute_budget_prelude();
-                    let close_ix = SplTokenProgram::close_account(
+                    let close_ix = mint_token.close_account_ix(
                         ata_sol.into(),
                         self.wallet_address.into(),
                         self.wallet_address.into(),
                     );
-                    ixs.push(close_ix.into());
+                    ixs.push(close_ix);
                     let _close_sig = self.send_with_retries(ixs, "CLOSE-ATA").await?;
                 }
                 Ok(left) => {
@@ -427,6 +432,8 @@ impl Broker for SolanaBroker {
         )
         .await?;
 
+        let mint_token = fetch_mint_token_kind(&self.rpc_client, &mint).await?;
+
         // Slippage-aware min_token_out from current pool price.
         let price_sol_per_token = pool.price().amount().to_float().max(f64::MIN_POSITIVE);
         let expected_tokens = amount_sol / price_sol_per_token;
@@ -446,7 +453,7 @@ impl Broker for SolanaBroker {
             mint.into(),
             self.wallet_address.into(),
             self.wallet_address.into(),
-            SplTokenProgram::PROGRAM,
+            mint_token.program(),
         );
 
         // Derive our ATA so we can read its raw token balance before/after the
@@ -454,7 +461,8 @@ impl Broker for SolanaBroker {
         // manager would size partial sells off the slippage floor
         // (`min_token_out_f`), which severely under-counts the real position
         // and leaves most tokens stranded in the ATA after a "100% sell".
-        let (_ata_sol, ata_str) = derive_ata_address(&self.wallet_address, &mint);
+        let (_ata_sol, ata_str) =
+            derive_ata_address(&self.wallet_address, &mint, mint_token.program());
         // ATA may not exist yet (idempotent create runs in this same tx), so
         // absence/error -> 0. Decimals are not needed pre-send.
         let pre_raw: u64 = fetch_token_account_raw(&self.rpc_client, &ata_str)
@@ -484,7 +492,7 @@ impl Broker for SolanaBroker {
             mint.into(),
             self.wallet_address.into(),
             creator_for_vault.into(),
-            SplTokenProgram::PROGRAM,
+            mint_token.program(),
             sol_amount_in,
             min_token_out,
         );
@@ -553,12 +561,15 @@ impl Broker for SolanaBroker {
         pool: &dyn Pool,
         close_account_after: bool,
     ) -> Result<SellReceipt, BrokerError> {
+        let mint_token = fetch_mint_token_kind(&self.rpc_client, &mint).await?;
+
         // Derive the ATA up-front: needed for both the optional CloseAccount
         // ix and (on full exits) for sizing the SELL off the *current* raw
         // balance — which is the only number that lets `CloseAccount`
         // succeed atomically (Token-2022 refuses to close a non-empty
         // account).
-        let (ata_sol, ata_str) = derive_ata_address(&self.wallet_address, &mint);
+        let (ata_sol, ata_str) =
+            derive_ata_address(&self.wallet_address, &mint, mint_token.program());
 
         // Resolve actual token amount dynamically:
         //   * full exit  -> read raw ATA balance now and sell exactly that;
@@ -742,6 +753,7 @@ impl Broker for SolanaBroker {
                     token_amount_raw,
                     do_close_ata,
                     slip,
+                    mint_token,
                 )
                 .await;
         }
@@ -783,7 +795,7 @@ impl Broker for SolanaBroker {
                 mint.into(),
                 self.wallet_address.into(),
                 creator_for_vault.into(),
-                SplTokenProgram::PROGRAM,
+                mint_token.program(),
                 token_amount_in,
                 min_sol_out,
                 cashback_enabled,
@@ -798,12 +810,12 @@ impl Broker for SolanaBroker {
         // account. It only succeeds if the account's token balance is 0,
         // which is why we suppress it whenever the SELL was clamped.
         if do_close_ata {
-            let close_ix = SplTokenProgram::close_account(
+            let close_ix = mint_token.close_account_ix(
                 ata_sol.into(),
                 self.wallet_address.into(),
                 self.wallet_address.into(),
             );
-            ixs.push(close_ix.into());
+            ixs.push(close_ix);
             eprintln!("[BROKER SELL] {mint}: appending CloseAccount(ata={ata_str}) for rent refund");
         }
 
@@ -843,6 +855,7 @@ impl Broker for SolanaBroker {
                         token_amount_raw,
                         do_close_ata,
                         slip,
+                        mint_token,
                     )
                     .await;
             }
@@ -1254,18 +1267,82 @@ fn pump_max_sellable_tokens_for_sol(target_sol_out: u64, curve: &BondingCurveSta
     new_vtr.saturating_sub(vtr).min(u64::MAX as u128) as u64
 }
 
-/// Derive the SPL associated token account address for `(wallet, mint)`
-/// under the **legacy SPL Token** program (`Tokenkeg…`), which pump.fun
-/// bonding-curve mints use. Returns both the typed `SolAddress` (for ix-building)
-/// and its base58 string form (for RPC calls that go through string parsing).
-fn derive_ata_address(wallet: &SolAddress, mint: &SolAddress) -> (SolAddress, String) {
-    let wallet_sips: sips::address::Address = (*wallet).into();
-    let mint_sips: sips::address::Address = (*mint).into();
-    let (ata_sips, _bump) = sips::helper::ata(
-        &wallet_sips,
-        &SplTokenProgram::PROGRAM,
-        &mint_sips,
+/// Legacy SPL (`Tokenkeg…`) vs Token-2022 (`Tokenz…`), from mint account owner on RPC.
+#[derive(Clone, Copy, Debug)]
+enum MintTokenKind {
+    LegacySpl,
+    Token2022,
+}
+
+impl MintTokenKind {
+    fn program(self) -> SipsAddress {
+        match self {
+            Self::LegacySpl => SplTokenProgram::PROGRAM,
+            Self::Token2022 => TokenProgram2022::PROGRAM,
+        }
+    }
+
+    fn close_account_ix(
+        self,
+        ata: SipsAddress,
+        destination: SipsAddress,
+        authority: SipsAddress,
+    ) -> SolanaIx {
+        match self {
+            Self::LegacySpl => SplTokenProgram::close_account(ata, destination, authority).into(),
+            Self::Token2022 => TokenProgram2022::close_account(ata, destination, authority).into(),
+        }
+    }
+}
+
+/// Reads mint account owner at confirmed commitment.
+async fn fetch_mint_token_kind(
+    rpc: &RpcClient,
+    mint: &SolAddress,
+) -> Result<MintTokenKind, BrokerError> {
+    const LEGACY: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+    const TOKEN22: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+
+    let mint_str = mint.to_string();
+    let mint_pk = mint_str
+        .parse()
+        .map_err(|_| BrokerError::Custom(format!("invalid mint pubkey: {mint_str}")))?;
+
+    let resp = rpc
+        .get_account_with_commitment(&mint_pk, CommitmentConfig::confirmed())
+        .await
+        .map_err(|e| BrokerError::Custom(format!("get_account mint {mint_str}: {e}")))?;
+
+    let acc = resp
+        .value
+        .ok_or_else(|| BrokerError::Custom(format!("mint account not found: {mint_str}")))?;
+
+    let owner = acc.owner.to_string();
+    let kind = match owner.as_str() {
+        LEGACY => MintTokenKind::LegacySpl,
+        TOKEN22 => MintTokenKind::Token2022,
+        _ => {
+            return Err(BrokerError::Custom(format!(
+                "mint {mint_str} owner {owner} is not SPL Token (Tokenkeg) or Token-2022 (Tokenz)"
+            )));
+        }
+    };
+    eprintln!(
+        "[BROKER] mint={mint_str} token_program={kind:?} (mint_owner={owner})",
     );
+    Ok(kind)
+}
+
+/// Derive the SPL associated token account `(wallet, mint)` for the given
+/// token program id (`Tokenkeg…` or `Tokenz…`).
+fn derive_ata_address(
+    wallet: &SolAddress,
+    mint: &SolAddress,
+    token_program: SipsAddress,
+) -> (SolAddress, String) {
+    let wallet_sips: SipsAddress = (*wallet).into();
+    let mint_sips: SipsAddress = (*mint).into();
+    let (ata_sips, _bump) = sips::helper::ata(&wallet_sips, &token_program, &mint_sips);
     let ata_sol: SolAddress = ata_sips.into();
     let s = ata_sol.to_string();
     (ata_sol, s)
