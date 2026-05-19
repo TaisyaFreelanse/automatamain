@@ -43,6 +43,9 @@ impl FromStr for PumpEvent {
         };
 
         let blob = general_purpose::STANDARD.decode(s)?;
+        if blob.len() < 8 {
+            return Err(Error::InvalidLogEvent);
+        }
 
         // 1. Make `data` mutable so we can pass `&mut data` to deserialize
         let (discriminator, mut data) = blob.split_at(8);

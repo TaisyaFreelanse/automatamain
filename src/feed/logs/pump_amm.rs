@@ -75,6 +75,9 @@ impl FromStr for PumpAmmEvent {
             .ok_or(Error::InvalidLogEvent)?;
 
         let blob = general_purpose::STANDARD.decode(s)?;
+        if blob.len() < 8 {
+            return Err(Error::InvalidLogEvent);
+        }
         let (disc, data) = blob.split_at(8);
 
         match disc {
