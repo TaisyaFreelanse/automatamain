@@ -28,6 +28,7 @@ use solana_transaction::versioned::VersionedTransaction;
 use crate::{
     autobuy::execution::LiveExecutionConfig,
     generalize::{general_commands::TradeAction, general_pool::Pool},
+    helper::Amount,
     launchpads::pump::general::bounding_curve,
 };
 
@@ -356,6 +357,7 @@ impl SolanaBroker {
             sol_spent: amount_sol,
             tokens_received: actual_tokens_received,
             signature: Some(sig_str),
+            entry_mcap_fill_sol: None,
         })
     }
 
@@ -885,10 +887,34 @@ impl Broker for SolanaBroker {
             }
         };
 
+        let entry_mcap_fill_sol = match fetch_bonding_curve_state(&self.rpc_client, &mint).await {
+            Ok(curve) => {
+                let m = bonding_curve_mcap_sol(&curve);
+                if m > 0.0 {
+                    eprintln!(
+                        "[BROKER BUY] {mint}: entry mcap from RPC bonding curve (post-fill): \
+                         {:.4} SOL",
+                        m
+                    );
+                    Some(m)
+                } else {
+                    None
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[BROKER BUY] {mint}: bonding_curve read for entry mcap failed ({e}); \
+                     manager uses WS pool mcap"
+                );
+                None
+            }
+        };
+
         Ok(BuyReceipt {
             sol_spent: amount_sol,
             tokens_received: actual_tokens_received,
             signature: Some(sig_str),
+            entry_mcap_fill_sol,
         })
     }
 
@@ -1497,6 +1523,18 @@ struct BondingCurveState {
     /// Anchor `BondingCurve::complete` — when true, liquidity has migrated off
     /// the bonding curve; pump `Sell` fails with `BondingCurveComplete` (6005).
     curve_complete: bool,
+}
+
+/// Bonding-curve mcap in SOL from virtual reserves (same formula as
+/// `launchpads::pump::pool::Bonding::market_cap`).
+fn bonding_curve_mcap_sol(curve: &BondingCurveState) -> f64 {
+    if curve.virtual_token_reserves == 0 {
+        return 0.0;
+    }
+    let mcap_raw = (curve.virtual_sol_reserves as u128)
+        .saturating_mul(1_000_000_000_000_000u128)
+        / (curve.virtual_token_reserves as u128);
+    Amount::from_raw_native(mcap_raw.min(u64::MAX as u128) as u64).to_float()
 }
 
 /// Decode pump-fun bonding curve account fields we care about.

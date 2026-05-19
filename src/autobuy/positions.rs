@@ -51,8 +51,20 @@ pub struct Position {
 }
 
 impl Position {
-    pub fn new(pool: Box<dyn Pool>, buy_amount: Amount, current_time: u64) -> Self {
-        let enter_mcap = pool.market_cap().amount();
+    /// `entry_mcap_fill_sol`: when `Some` (e.g. RPC snapshot right after a pump
+    /// buy lands), use as `enter_mcap` instead of `pool.market_cap()` so entry
+    /// matches the fill, not a possibly newer WS pool tick.
+    pub fn new(
+        pool: Box<dyn Pool>,
+        buy_amount: Amount,
+        current_time: u64,
+        entry_mcap_fill_sol: Option<f64>,
+    ) -> Self {
+        let enter_mcap = if let Some(m) = entry_mcap_fill_sol.filter(|m| *m > 0.0) {
+            Amount::from_float_native(m)
+        } else {
+            pool.market_cap().amount()
+        };
         Self {
             highest_mcap: enter_mcap.to_float(),
             enter_mcap,

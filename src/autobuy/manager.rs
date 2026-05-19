@@ -573,7 +573,12 @@ impl PositionManagerActor {
                         .as_secs();
 
                     let tokens = Amount::from_float_native(receipt.tokens_received);
-                    let mut position = Position::new(latest_pool, tokens, current_time);
+                    let mut position = Position::new(
+                        latest_pool,
+                        tokens,
+                        current_time,
+                        receipt.entry_mcap_fill_sol,
+                    );
                     position.exit_profit_floor = self.config.exit_profit_floor;
                     position.spent_sol = amount_sol;
                     position.dev_address = dev_address;
@@ -590,7 +595,14 @@ impl PositionManagerActor {
                     position.tk_entry_b2s = tk_b2s;
                     position.learning_snapshot = learning_snapshot;
                     let enter_mcap = position.enter_mcap.to_float();
-                    eprintln!("[BUY] Opened {mint} | mcap={enter_mcap:.1} SOL | spent={amount_sol:.4} SOL");
+                    let mcap_src = if receipt.entry_mcap_fill_sol.is_some() {
+                        "on-chain fill"
+                    } else {
+                        "WS pool cache"
+                    };
+                    eprintln!(
+                        "[BUY] Opened {mint} | mcap={enter_mcap:.1} SOL ({mcap_src}) | spent={amount_sol:.4} SOL"
+                    );
                     self.positions.insert(mint, position);
                     self.strategy.note_position_opened();
 

@@ -13,6 +13,12 @@ pub struct BuyReceipt {
     pub tokens_received: f64,
     /// On-chain transaction signature (None for demo / mock).
     pub signature: Option<String>,
+    /// For pump bonding buys: implied mcap in SOL from on-chain virtual
+    /// reserves **after** the confirmed fill. The manager should prefer this
+    /// over `pool.market_cap()` from the WS cache, which can lag the fill or
+    /// already reflect later trades — otherwise TP/% and dashboards misread
+    /// the true entry vs fast 1s candles.
+    pub entry_mcap_fill_sol: Option<f64>,
 }
 
 pub struct SellReceipt {

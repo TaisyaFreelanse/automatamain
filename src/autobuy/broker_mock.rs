@@ -59,7 +59,12 @@ impl Broker for MockBroker {
             MockPosition { tokens: tokens_received, entry_mcap },
         );
 
-        Ok(BuyReceipt { sol_spent: amount_sol, tokens_received, signature: None })
+        Ok(BuyReceipt {
+            sol_spent: amount_sol,
+            tokens_received,
+            signature: None,
+            entry_mcap_fill_sol: None,
+        })
     }
 
     async fn sell(
