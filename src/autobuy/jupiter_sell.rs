@@ -1,5 +1,10 @@
-//! Jupiter Swap API v6 — trades after pump.fun bonding curve completion (Anchor
-//! `BondingCurveComplete` / custom `6005`), when on-curve `buy`/`sell` is rejected.
+//! Jupiter Swap API v1 (`api.jup.ag/swap/v1`) — trades after pump.fun bonding
+//! curve completion (Anchor `BondingCurveComplete` / custom `6005`), when
+//! on-curve `buy`/`sell` is rejected.
+//!
+//! Legacy `quote-api.jup.ag/v6` is deprecated / may not resolve; see Jupiter
+//! portal migration docs. Optional env `JUPITER_API_KEY` sets `x-api-key` for
+//! higher rate limits.
 
 use std::sync::OnceLock;
 
@@ -10,8 +15,10 @@ use solana_transaction::versioned::VersionedTransaction;
 use super::broker::BrokerError;
 
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
-const JUPITER_QUOTE: &str = "https://quote-api.jup.ag/v6/quote";
-const JUPITER_SWAP: &str = "https://quote-api.jup.ag/v6/swap";
+/// Jupiter migrated off `quote-api.jup.ag` (often fails DNS / deprecated). Use Swap API v1.
+/// Docs: https://developers.jup.ag/docs/swap/get-quote
+const JUPITER_QUOTE: &str = "https://api.jup.ag/swap/v1/quote";
+const JUPITER_SWAP: &str = "https://api.jup.ag/swap/v1/swap";
 
 fn http() -> &'static Client {
     static HTTP: OnceLock<Client> = OnceLock::new();
@@ -21,6 +28,20 @@ fn http() -> &'static Client {
             .build()
             .expect("jupiter http client")
     })
+}
+
+fn jupiter_request(
+    client: &'static Client,
+    method: reqwest::Method,
+    url: &str,
+) -> reqwest::RequestBuilder {
+    let mut b = client.request(method, url).header("Accept", "application/json");
+    if let Ok(key) = std::env::var("JUPITER_API_KEY") {
+        if !key.trim().is_empty() {
+            b = b.header("x-api-key", key.trim());
+        }
+    }
+    b
 }
 
 /// Deserialize Jupiter `swapTransaction` payload (raw bytes after base64 decode).
@@ -52,8 +73,7 @@ pub(crate) async fn jupiter_build_swap_exact_in_mints(
          &amount={amount_raw}&slippageBps={slippage_bps}&swapMode=ExactIn"
     );
 
-    let quote: Value = h
-        .get(quote_url)
+    let quote: Value = jupiter_request(h, reqwest::Method::GET, &quote_url)
         .send()
         .await
         .map_err(|e| BrokerError::Custom(format!("Jupiter quote request: {e}")))?
@@ -81,8 +101,8 @@ pub(crate) async fn jupiter_build_swap_exact_in_mints(
         "prioritizationFeeLamports": "auto",
     });
 
-    let swap: Value = h
-        .post(JUPITER_SWAP)
+    let swap: Value = jupiter_request(h, reqwest::Method::POST, JUPITER_SWAP)
+        .header("Content-Type", "application/json")
         .json(&body)
         .send()
         .await
