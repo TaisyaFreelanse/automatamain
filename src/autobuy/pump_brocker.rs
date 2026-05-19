@@ -496,6 +496,222 @@ impl SolanaBroker {
             }
         }
     }
+
+    /// After a liquidity-clamped "100%" sell, keep submitting pump `Sell` legs
+    /// until the ATA balance hits zero (or the curve graduates — then Jupiter),
+    /// then `CloseAccount` when the ATA is empty.
+    async fn drain_pump_ata_after_clamped_full_exit(
+        &self,
+        mint: SolAddress,
+        ata_str: &str,
+        ata_sol: SolAddress,
+        mint_token: MintTokenKind,
+        pool: &dyn Pool,
+        slip: f64,
+        mut cumulative_sol: f64,
+        mut last_sig: String,
+    ) -> Result<(f64, String), BrokerError> {
+        const MAX_DRAIN_LEGS: u32 = 50;
+        for leg in 0u32..MAX_DRAIN_LEGS {
+            let pre_raw = fetch_token_account_raw(&self.rpc_client, ata_str)
+                .await
+                .unwrap_or(0);
+            if pre_raw == 0 {
+                eprintln!(
+                    "[BROKER SELL] {mint}: clamp-drain done (raw=0) after {leg} extra leg(s)"
+                );
+                break;
+            }
+
+            let curve_state_opt = match fetch_bonding_curve_state(&self.rpc_client, &mint).await {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!(
+                        "[BROKER SELL] {mint}: clamp-drain stopped: bonding_curve read failed: {e}"
+                    );
+                    break;
+                }
+            };
+
+            if curve_state_opt
+                .as_ref()
+                .is_some_and(|c| c.curve_complete)
+            {
+                eprintln!(
+                    "[BROKER SELL] {mint}: curve graduated during clamp-drain; routing {pre_raw} raw via Jupiter"
+                );
+                let jup = self
+                    .sell_tokens_post_graduation(
+                        mint,
+                        ata_str,
+                        ata_sol,
+                        pre_raw,
+                        pre_raw,
+                        true,
+                        slip,
+                        mint_token,
+                    )
+                    .await?;
+                cumulative_sol += jup.sol_received;
+                if let Some(s) = jup.signature {
+                    last_sig = s;
+                }
+                break;
+            }
+
+            let creator_for_vault: SolAddress = match &curve_state_opt {
+                Some(s) => s.creator,
+                None => pool.creators()[0],
+            };
+
+            let mut token_amount_raw = pre_raw;
+            let mut leg_clamped = false;
+            if let Some(curve) = &curve_state_opt {
+                let safety_cap_lamports =
+                    ((curve.real_sol_reserves as u128) * 90 / 100) as u64;
+                let projected_sol_out = pump_sol_out_for_tokens(token_amount_raw, curve);
+                if projected_sol_out > safety_cap_lamports {
+                    let max_sellable =
+                        pump_max_sellable_tokens_for_sol(safety_cap_lamports, curve);
+                    let clamped = max_sellable.min(token_amount_raw);
+                    if clamped < token_amount_raw {
+                        eprintln!(
+                            "[BROKER SELL] {mint}: clamp-drain leg {leg}: {} -> {} raw",
+                            token_amount_raw, clamped
+                        );
+                        token_amount_raw = clamped;
+                        leg_clamped = true;
+                    }
+                }
+            }
+
+            if token_amount_raw == 0 {
+                eprintln!(
+                    "[BROKER SELL] {mint}: clamp-drain leg {leg}: nothing sellable after clamp; stopping"
+                );
+                break;
+            }
+
+            let final_token_amount_ui = token_amount_raw as f64 / 1_000_000.0;
+            let expected_sol = match &curve_state_opt {
+                Some(c) => pump_sol_out_for_tokens(token_amount_raw, c) as f64 / 1e9,
+                None => final_token_amount_ui * pool.price().amount().to_float().max(0.0),
+            };
+            let expected_sol_after_slip = (expected_sol * (1.0 - slip)).max(0.0);
+
+            let cashback_enabled = curve_state_opt
+                .as_ref()
+                .map(|c| c.is_cashback_coin)
+                .unwrap_or(false);
+            if cashback_enabled {
+                eprintln!(
+                    "[BROKER SELL] {mint}: clamp-drain leg {leg}: cashback coin — user_volume_accumulator"
+                );
+            }
+
+            let mut ixs = self.compute_budget_prelude();
+            let token_amount_in = sips::helper::Amount::<6>::from_raw(token_amount_raw);
+            let min_sol_out = sips::helper::Amount::<9>::from_float(0.0_f64);
+            let ix = PumpInstruction::sell(
+                mint.into(),
+                self.wallet_address.into(),
+                creator_for_vault.into(),
+                mint_token.program(),
+                token_amount_in,
+                min_sol_out,
+                cashback_enabled,
+            );
+            ixs.push(ix.into());
+
+            let label = format!("SELL-DRAIN-{leg}");
+            let sig = match self.send_with_retries(ixs, &label).await {
+                Ok(s) => s,
+                Err(BrokerError::TransactionFailed(ref msg))
+                    if is_bonding_curve_complete_pump_error(msg) =>
+                {
+                    eprintln!(
+                        "[BROKER SELL] {mint}: clamp-drain leg {leg}: BondingCurveComplete — Jupiter"
+                    );
+                    let jup = self
+                        .sell_tokens_post_graduation(
+                            mint,
+                            ata_str,
+                            ata_sol,
+                            pre_raw,
+                            pre_raw,
+                            true,
+                            slip,
+                            mint_token,
+                        )
+                        .await?;
+                    cumulative_sol += jup.sol_received;
+                    if let Some(s) = jup.signature {
+                        last_sig = s;
+                    }
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
+
+            poll_ata_confirms_sell(
+                &self.rpc_client,
+                ata_str,
+                pre_raw,
+                token_amount_raw,
+                false,
+                mint,
+                Duration::from_secs(45),
+            )
+            .await?;
+
+            cumulative_sol += expected_sol_after_slip;
+            last_sig = sig;
+
+            if !leg_clamped && token_amount_raw >= pre_raw.saturating_sub(sell_raw_delta_slack(pre_raw))
+            {
+                // One full-balance leg with no clamp; if anything remains it's dust / rounding.
+                let after = fetch_token_account_raw(&self.rpc_client, ata_str)
+                    .await
+                    .unwrap_or(0);
+                if after > 0 && after <= 1000 {
+                    eprintln!(
+                        "[BROKER SELL] {mint}: clamp-drain leg {leg}: {after} raw dust left; stopping sells"
+                    );
+                    break;
+                }
+            }
+        }
+
+        let rem = fetch_token_account_raw(&self.rpc_client, ata_str)
+            .await
+            .unwrap_or(0);
+        if rem == 0 {
+            let mut ixs = self.compute_budget_prelude();
+            ixs.push(mint_token.close_account_ix(
+                ata_sol.into(),
+                self.wallet_address.into(),
+                self.wallet_address.into(),
+            ));
+            let csig = self.send_with_retries(ixs, "SELL-CLOSE-ATA").await?;
+            poll_ata_confirms_sell(
+                &self.rpc_client,
+                ata_str,
+                0,
+                1,
+                true,
+                mint,
+                Duration::from_secs(30),
+            )
+            .await?;
+            last_sig = csig;
+        } else {
+            eprintln!(
+                "[BROKER SELL] {mint}: warning: {rem} raw tokens remain after clamp-drain; CloseAccount skipped"
+            );
+        }
+
+        Ok((cumulative_sol, last_sig))
+    }
 }
 
 #[async_trait]
@@ -841,15 +1057,17 @@ impl Broker for SolanaBroker {
             0.0
         };
 
-        // If we had to clamp a "100% close", the ATA will retain dust and
-        // Token-2022 will refuse to close it — so we suppress CloseAccount
-        // here and let the next sell cycle (or a manual sweep) handle it.
+        // Full exit + clamp: first tx sells only the clamped chunk (no CloseAccount
+        // here — token program refuses Close with non-zero balance). We then run
+        // `drain_pump_ata_after_clamped_full_exit` to sell remaining chunks until
+        // the ATA is empty, then CloseAccount in a separate tx.
         let do_close_ata = close_account_after && !sell_was_clamped;
         if close_account_after && sell_was_clamped {
             eprintln!(
-                "[BROKER SELL] {mint}: full-exit clamped by curve liquidity; skipping \
-                 CloseAccount this round (residual ~{:.6} UI tokens will remain in ATA)",
-                actual_token_amount - final_token_amount_ui,
+                "[BROKER SELL] {mint}: full-exit clamped (first leg {:.6} of {:.6} UI tokens); \
+                 will drain remaining on-chain then close ATA if possible",
+                final_token_amount_ui,
+                actual_token_amount,
             );
         }
 
@@ -926,11 +1144,9 @@ impl Broker for SolanaBroker {
             ixs.push(ix.into());
         }
 
-        // Atomic rent recovery on full exits. SPL Token `CloseAccount`
-        // refunds the rent-exempt SOL deposit (~0.00203928 SOL per token
-        // account) back to `destination` (our wallet) and burns the
-        // account. It only succeeds if the account's token balance is 0,
-        // which is why we suppress it whenever the SELL was clamped.
+        // Atomic rent recovery on full exits when the first tx sold the full
+        // unclamped amount (sell + close same bundle). Clamped full exits drain
+        // first, then close in `drain_pump_ata_after_clamped_full_exit`.
         if do_close_ata {
             let close_ix = mint_token.close_account_ix(
                 ata_sol.into(),
@@ -995,6 +1211,23 @@ impl Broker for SolanaBroker {
         )
         .await?;
 
+        let mut sol_received_total = expected_sol_after_slip;
+        let mut last_sig = sig_str;
+        if close_account_after && sell_was_clamped {
+            (sol_received_total, last_sig) = self
+                .drain_pump_ata_after_clamped_full_exit(
+                    mint,
+                    ata_str.as_str(),
+                    ata_sol,
+                    mint_token,
+                    pool,
+                    slip,
+                    sol_received_total,
+                    last_sig,
+                )
+                .await?;
+        }
+
         // Balance/holdings will be updated authoritatively via `on_trade`.
         // We optimistically credit the (slippage-discounted) expected SOL so
         // `balance_sol()` reflects the proceeds before the WS event arrives.
@@ -1004,8 +1237,8 @@ impl Broker for SolanaBroker {
         // `min_sol_out=0`) so PnL tooling doesn't think every sell was a
         // total loss while we wait for the WS event.
         Ok(SellReceipt {
-            sol_received: expected_sol_after_slip,
-            signature: Some(sig_str),
+            sol_received: sol_received_total,
+            signature: Some(last_sig),
         })
     }
 
