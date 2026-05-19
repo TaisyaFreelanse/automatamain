@@ -1,7 +1,5 @@
-#![cfg_attr(
-    all(not(debug_assertions), target_os = "windows"),
-    windows_subsystem = "windows"
-)]
+// No extra console window when launching the .exe on Windows (debug + release).
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use eframe::egui;
 use serde::{Deserialize, Serialize};
