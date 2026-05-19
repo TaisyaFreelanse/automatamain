@@ -71,7 +71,7 @@ fn learning_default_enabled() -> bool {
     true
 }
 fn learning_default_every() -> u64 {
-    150
+    100
 }
 fn learning_default_interval() -> u64 {
     3600

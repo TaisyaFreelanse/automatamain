@@ -144,7 +144,7 @@ persistence:
 # nudges scoring thresholds (merged at runtime, max ~±15% via merge clamps).
 learning:
   enabled: true
-  analyze_every_trades: 150
+  analyze_every_trades: 100
   analyze_interval_secs: 3600
   min_trades_for_update: 30
 
