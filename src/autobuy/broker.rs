@@ -22,10 +22,27 @@ pub struct BuyReceipt {
 }
 
 pub struct SellReceipt {
-    /// SOL received from the sale.
-    pub sol_received: f64,
-    /// On-chain transaction signature (None for demo / mock).
+    /// Net SOL change to the wallet from confirmed on-chain tx meta
+    /// (`post_balances - pre_balances` for the wallet account), in SOL.
+    /// Includes fees, rent refunds from `CloseAccount`, etc.
+    pub sol_received_actual: f64,
+    /// Bonding-curve / Jupiter estimate (e.g. quote × slippage discount)
+    /// before execution — for comparison with [`Self::sol_received_actual`].
+    pub sol_received_estimated: f64,
+    /// Primary signature for this logical sell (last leg if multi-tx drain).
     pub signature: Option<String>,
+}
+
+impl SellReceipt {
+    /// Demo / mock broker: model and “on-chain” are the same number.
+    #[must_use]
+    pub fn mock(sol: f64, signature: Option<String>) -> Self {
+        Self {
+            sol_received_actual: sol,
+            sol_received_estimated: sol,
+            signature,
+        }
+    }
 }
 
 // ── Error ─────────────────────────────────────────────────────────────────────

@@ -100,7 +100,7 @@ impl Broker for MockBroker {
 
         *self.balance.lock().unwrap() += sol_received;
 
-        Ok(SellReceipt { sol_received, signature: None })
+        Ok(SellReceipt::mock(sol_received, None))
     }
 
     async fn balance_sol(&self) -> Result<f64, BrokerError> {

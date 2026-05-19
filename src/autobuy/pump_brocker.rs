@@ -38,6 +38,7 @@ use super::{
         decode_jupiter_swap_transaction, jupiter_build_swap_exact_in,
         jupiter_build_swap_wsol_to_mint_exact_in,
     },
+    wallet_tx_sol,
 };
 
 // ── State per open position ───────────────────────────────────────────────────
@@ -102,6 +103,32 @@ impl SolanaBroker {
             balance: Mutex::new(initial_balance_sol),
             positions: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Net wallet SOL delta from confirmed tx meta (`post - pre` lamports), or
+    /// `fallback_sol` when `getTransaction` / balance alignment fails.
+    async fn wallet_net_sol_or_fallback(
+        &self,
+        sig_str: &str,
+        fallback_sol: f64,
+        label: &str,
+    ) -> f64 {
+        match wallet_tx_sol::wallet_net_sol_received_f64(
+            self.rpc_client.as_ref(),
+            sig_str,
+            &self.wallet_address,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "[BROKER SELL] {label}: on-chain SOL delta for sig={sig_str} failed ({e}); \
+                     using fallback {fallback_sol:.6} SOL"
+                );
+                fallback_sol
+            }
+        }
     }
 
     /// Build the ComputeBudget prelude (priority fee + CU limit).
@@ -411,6 +438,7 @@ impl SolanaBroker {
         .await?;
 
         if do_close_ata {
+            let mut close_sig_opt: Option<String> = None;
             match fetch_token_account_raw(&self.rpc_client, ata_str).await {
                 Ok(0) => {
                     let mut ixs = self.compute_budget_prelude();
@@ -420,7 +448,7 @@ impl SolanaBroker {
                         self.wallet_address.into(),
                     );
                     ixs.push(close_ix);
-                    let _close_sig = self.send_with_retries(ixs, "CLOSE-ATA").await?;
+                    close_sig_opt = Some(self.send_with_retries(ixs, "CLOSE-ATA").await?);
                 }
                 Ok(left) => {
                     eprintln!(
@@ -435,17 +463,47 @@ impl SolanaBroker {
                     );
                 }
             }
+
+            let sol_gross = build.out_lamports as f64 / 1e9;
+            let sol_estimated = (sol_gross * (1.0 - slip)).max(0.0);
+            let sig_jup_str = sig.to_string();
+            let mut sol_actual = self
+                .wallet_net_sol_or_fallback(&sig_jup_str, sol_estimated, "SELL-JUPITER-META")
+                .await;
+            let mut last_sig = sig_jup_str.clone();
+            if let Some(cs) = close_sig_opt {
+                let close_delta = self
+                    .wallet_net_sol_or_fallback(&cs, 0.0, "CLOSE-ATA-META")
+                    .await;
+                sol_actual += close_delta;
+                last_sig = cs;
+            }
+
+            {
+                let mut bal = self.balance.lock().unwrap();
+                *bal += sol_actual;
+            }
+            return Ok(SellReceipt {
+                sol_received_actual: sol_actual,
+                sol_received_estimated: sol_estimated,
+                signature: Some(last_sig),
+            });
         }
 
         let sol_gross = build.out_lamports as f64 / 1e9;
-        let sol_received = (sol_gross * (1.0 - slip)).max(0.0);
+        let sol_estimated = (sol_gross * (1.0 - slip)).max(0.0);
+        let sig_jup_str = sig.to_string();
+        let sol_actual = self
+            .wallet_net_sol_or_fallback(&sig_jup_str, sol_estimated, "SELL-JUPITER-META")
+            .await;
         {
             let mut bal = self.balance.lock().unwrap();
-            *bal += sol_received;
+            *bal += sol_actual;
         }
         Ok(SellReceipt {
-            sol_received,
-            signature: Some(sig.to_string()),
+            sol_received_actual: sol_actual,
+            sol_received_estimated: sol_estimated,
+            signature: Some(sig_jup_str),
         })
     }
 
@@ -510,9 +568,11 @@ impl SolanaBroker {
         mint_token: MintTokenKind,
         pool: &dyn Pool,
         slip: f64,
-        mut cumulative_sol: f64,
-        mut last_sig: String,
-    ) -> Result<(f64, String), BrokerError> {
+        first_confirmed_sig: String,
+    ) -> Result<(f64, f64, String), BrokerError> {
+        let mut cumulative_actual: f64 = 0.0;
+        let mut cumulative_est: f64 = 0.0;
+        let mut last_sig = first_confirmed_sig;
         const MAX_DRAIN_LEGS: u32 = 50;
         for leg in 0u32..MAX_DRAIN_LEGS {
             let pre_raw = fetch_token_account_raw(&self.rpc_client, ata_str)
@@ -554,7 +614,8 @@ impl SolanaBroker {
                         mint_token,
                     )
                     .await?;
-                cumulative_sol += jup.sol_received;
+                cumulative_actual += jup.sol_received_actual;
+                cumulative_est += jup.sol_received_estimated;
                 if let Some(s) = jup.signature {
                     last_sig = s;
                 }
@@ -646,7 +707,8 @@ impl SolanaBroker {
                             mint_token,
                         )
                         .await?;
-                    cumulative_sol += jup.sol_received;
+                    cumulative_actual += jup.sol_received_actual;
+                    cumulative_est += jup.sol_received_estimated;
                     if let Some(s) = jup.signature {
                         last_sig = s;
                     }
@@ -666,7 +728,15 @@ impl SolanaBroker {
             )
             .await?;
 
-            cumulative_sol += expected_sol_after_slip;
+            let leg_actual = self
+                .wallet_net_sol_or_fallback(
+                    &sig,
+                    expected_sol_after_slip,
+                    &format!("SELL-DRAIN-{leg}-META"),
+                )
+                .await;
+            cumulative_actual += leg_actual;
+            cumulative_est += expected_sol_after_slip;
             last_sig = sig;
 
             if !leg_clamped && token_amount_raw >= pre_raw.saturating_sub(sell_raw_delta_slack(pre_raw))
@@ -705,6 +775,10 @@ impl SolanaBroker {
                 Duration::from_secs(30),
             )
             .await?;
+            let close_actual = self
+                .wallet_net_sol_or_fallback(&csig, 0.0, "SELL-CLOSE-ATA-META")
+                .await;
+            cumulative_actual += close_actual;
             last_sig = csig;
         } else {
             eprintln!(
@@ -712,7 +786,7 @@ impl SolanaBroker {
             );
         }
 
-        Ok((cumulative_sol, last_sig))
+        Ok((cumulative_actual, cumulative_est, last_sig))
     }
 }
 
@@ -1237,10 +1311,17 @@ impl Broker for SolanaBroker {
         )
         .await?;
 
-        let mut sol_received_total = expected_sol_after_slip;
-        let mut last_sig = sig_str;
+        let sol_est_first = expected_sol_after_slip;
+        let sol_act_first = self
+            .wallet_net_sol_or_fallback(&sig_str, sol_est_first, "SELL-META")
+            .await;
+
+        let mut sol_received_actual = sol_act_first;
+        let mut sol_received_estimated = sol_est_first;
+        let mut last_sig = sig_str.clone();
+
         if close_account_after && sell_was_clamped {
-            (sol_received_total, last_sig) = self
+            let (dr_act, dr_est, ls) = self
                 .drain_pump_ata_after_clamped_full_exit(
                     mint,
                     ata_str.as_str(),
@@ -1248,22 +1329,19 @@ impl Broker for SolanaBroker {
                     mint_token,
                     pool,
                     slip,
-                    sol_received_total,
-                    last_sig,
+                    sig_str.clone(),
                 )
                 .await?;
+            sol_received_actual += dr_act;
+            sol_received_estimated += dr_est;
+            last_sig = ls;
         }
 
-        // Balance/holdings will be updated authoritatively via `on_trade`.
-        // We optimistically credit the (slippage-discounted) expected SOL so
-        // `balance_sol()` reflects the proceeds before the WS event arrives.
-        // Optimistic credit at the *expected* price is fine here — the real
-        // value is reconciled on `on_trade` / `refresh_onchain_balance`.
-        // Note: we report `expected_sol_after_slip` (not the on-chain
-        // `min_sol_out=0`) so PnL tooling doesn't think every sell was a
-        // total loss while we wait for the WS event.
+        // Holdings are reconciled via `on_trade`; receipt SOL fields are
+        // on-chain actual vs model estimate for PnL / dashboards.
         Ok(SellReceipt {
-            sol_received: sol_received_total,
+            sol_received_actual,
+            sol_received_estimated,
             signature: Some(last_sig),
         })
     }

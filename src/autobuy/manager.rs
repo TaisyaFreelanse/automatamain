@@ -540,6 +540,7 @@ impl PositionManagerActor {
                                 mint: mint.to_string(),
                                 signature: r.signature.clone(),
                                 amount_sol: r.sol_spent,
+                                amount_sol_estimated: None,
                                 status: "sent".into(),
                                 reason: None,
                                 mode: self.broker.mode_label().to_string(),
@@ -556,6 +557,7 @@ impl PositionManagerActor {
                                 mint: mint.to_string(),
                                 signature: None,
                                 amount_sol,
+                                amount_sol_estimated: None,
                                 status: "failed".into(),
                                 reason: Some(e.to_string()),
                                 mode: self.broker.mode_label().to_string(),
@@ -653,7 +655,7 @@ impl PositionManagerActor {
                             None
                         };
 
-                        let return_value = match self
+                        let (return_value, sell_estimated_for_log) = match self
                             .broker
                             .sell(mint, sell_qty, pos.pool.as_ref(), close_ata)
                             .await
@@ -663,7 +665,8 @@ impl PositionManagerActor {
                                     kind: TxEventKind::Sell,
                                     mint: mint.to_string(),
                                     signature: r.signature.clone(),
-                                    amount_sol: r.sol_received,
+                                    amount_sol: r.sol_received_actual,
+                                    amount_sol_estimated: Some(r.sol_received_estimated),
                                     status: "confirmed".into(),
                                     reason: Some(reason.clone()),
                                     mode: self.broker.mode_label().to_string(),
@@ -671,7 +674,7 @@ impl PositionManagerActor {
                                     v3_tape: None,
                                     time_kill_detail: time_kill_detail.clone(),
                                 });
-                                r.sol_received
+                                (r.sol_received_actual, r.sol_received_estimated)
                             }
                             Err(e) => {
                                 eprintln!("[SELL] Broker error for {mint}: {e}");
@@ -680,6 +683,7 @@ impl PositionManagerActor {
                                     mint: mint.to_string(),
                                     signature: None,
                                     amount_sol: 0.0,
+                                    amount_sol_estimated: None,
                                     status: "failed".into(),
                                     reason: Some(format!("{}: {}", reason, e)),
                                     mode: self.broker.mode_label().to_string(),
@@ -694,7 +698,8 @@ impl PositionManagerActor {
 
                         println!(
                             "[SELL] {mint} | reason={reason} | pnl={actual_pnl:+.2}% \
-                             | sold={percent:.0}% of holdings | returned={return_value:.4} SOL"
+                             | sold={percent:.0}% of holdings | returned={return_value:.4} SOL \
+                             (est {sell_estimated_for_log:.4} SOL)"
                         );
 
                         pos.total_returned += return_value;
@@ -1280,7 +1285,11 @@ pub enum WsFeedMessage {
         kind: TxEventKind,
         mint: String,
         signature: Option<String>,
+        /// For sells: on-chain wallet lamport delta / 1e9 (fees, rent refund included).
         amount_sol: f64,
+        /// For sells: bonding-curve / Jupiter estimate before execution (`None` for buys).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        amount_sol_estimated: Option<f64>,
         status: String,
         reason: Option<String>,
         mode: String,

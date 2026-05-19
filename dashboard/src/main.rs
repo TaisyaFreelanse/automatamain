@@ -125,6 +125,8 @@ pub enum WsMsg {
         mint: String,
         signature: Option<String>,
         amount_sol: f64,
+        #[serde(default)]
+        amount_sol_estimated: Option<f64>,
         status: String,
         reason: Option<String>,
         mode: String,
@@ -149,6 +151,7 @@ pub struct TxLogRow {
     pub mint: String,
     pub signature: Option<String>,
     pub amount_sol: f64,
+    pub amount_sol_estimated: Option<f64>,
     pub status: String,
     pub reason: Option<String>,
     pub mode: String,
@@ -519,6 +522,7 @@ impl Dashboard {
                         mint,
                         signature,
                         amount_sol,
+                        amount_sol_estimated,
                         status,
                         reason,
                         mode,
@@ -534,6 +538,7 @@ impl Dashboard {
                             mint,
                             signature,
                             amount_sol,
+                            amount_sol_estimated,
                             status,
                             reason,
                             mode,
@@ -1393,15 +1398,16 @@ impl eframe::App for Dashboard {
                 .max_height(third.min(180.0))
                 .show(ui, |ui| {
                     egui::Grid::new("tx_log_grid")
-                        .num_columns(7)
+                        .num_columns(8)
                         .striped(true)
-                        .min_col_width(56.0)
+                        .min_col_width(52.0)
                         .show(ui, |ui| {
                             ui.label(egui::RichText::new("Time").strong());
                             ui.label(egui::RichText::new("Kind").strong());
                             ui.label(egui::RichText::new("Mode").strong());
                             ui.label(egui::RichText::new("Mint").strong());
-                            ui.label(egui::RichText::new("SOL").strong());
+                            ui.label(egui::RichText::new("SOL act.").strong());
+                            ui.label(egui::RichText::new("SOL est.").strong());
                             ui.label(egui::RichText::new("V3 / time kill").strong());
                             ui.label(egui::RichText::new("Status").strong());
                             ui.end_row();
@@ -1436,6 +1442,21 @@ impl eframe::App for Dashboard {
                                     &mut self.mint_copy_flash_until,
                                 );
                                 ui.label(format!("{:.4}", row.amount_sol));
+                                match (row.kind, row.amount_sol_estimated) {
+                                    (TxEventKind::Sell, Some(est)) => {
+                                        ui.label(format!("{:.4}", est)).on_hover_text(
+                                            "Estimated from bonding curve / Jupiter quote × slippage; \
+                                             act. = wallet lamport delta from tx meta.",
+                                        );
+                                    }
+                                    _ => {
+                                        ui.label(
+                                            egui::RichText::new("—")
+                                                .small()
+                                                .color(egui::Color32::GRAY),
+                                        );
+                                    }
+                                }
 
                                 match row.kind {
                                     TxEventKind::Buy => {
@@ -1846,6 +1867,7 @@ async fn ws_loop(
                                                             mint,
                                                             signature,
                                                             amount_sol,
+                                                            amount_sol_estimated,
                                                             status,
                                                             reason,
                                                             mode,
@@ -1857,6 +1879,7 @@ async fn ws_loop(
                                                             mint,
                                                             signature,
                                                             amount_sol,
+                                                            amount_sol_estimated,
                                                             status,
                                                             reason,
                                                             mode,
