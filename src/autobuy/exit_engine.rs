@@ -38,27 +38,45 @@ impl ExitProfile {
 }
 
 /// Per-profile TP / trailing parameters (V4 doc tables, calibrated to live tape).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// YAML may override a subset; omitted fields fall back to [`default_profile_weak`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExitTpProfile {
+    #[serde(default = "def_tpprof_tp1_pct")]
     pub tp1_pct: f64,
+    #[serde(default = "def_tpprof_tp1_sell_pct")]
     pub tp1_sell_pct: f64,
+    #[serde(default = "def_tpprof_tp2_pct")]
     pub tp2_pct: f64,
+    #[serde(default = "def_tpprof_tp2_sell_pct")]
     pub tp2_sell_pct: f64,
+    #[serde(default = "def_tpprof_tp3_pct")]
     pub tp3_pct: f64,
+    #[serde(default = "def_tpprof_tp3_sell_pct")]
     pub tp3_sell_pct: f64,
+    #[serde(default = "def_tpprof_tp4_pct")]
     pub tp4_pct: f64,
+    #[serde(default = "def_tpprof_tp4_sell_pct")]
     pub tp4_sell_pct: f64,
+    #[serde(default = "def_tpprof_tp5_pct")]
     pub tp5_pct: f64,
+    #[serde(default = "def_tpprof_tp5_sell_pct")]
     pub tp5_sell_pct: f64,
-    /// Trailing drawdown from peak mcap (%).
+    #[serde(default = "def_tpprof_trailing_stop_drawdown_pct")]
     pub trailing_stop_drawdown_pct: f64,
-    /// Activate trailing + raise profit floor at this PnL (%).
+    #[serde(default = "def_tpprof_trailing_activate_profit_pct")]
     pub trailing_activate_profit_pct: f64,
-    /// Profit floor after trailing arms (positive %).
+    #[serde(default = "def_tpprof_trailing_floor_profit_pct")]
     pub trailing_floor_profit_pct: f64,
-    /// Smart stop: raise floor to this value once PnL reaches `smart_stop_activate_profit_pct`.
+    #[serde(default = "def_tpprof_smart_stop_activate_profit_pct")]
     pub smart_stop_activate_profit_pct: f64,
+    #[serde(default = "def_tpprof_smart_stop_floor_profit_pct")]
     pub smart_stop_floor_profit_pct: f64,
+}
+
+impl Default for ExitTpProfile {
+    fn default() -> Self {
+        default_profile_weak()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -145,6 +163,52 @@ fn default_profile_weak() -> ExitTpProfile {
         smart_stop_activate_profit_pct: 50.0,
         smart_stop_floor_profit_pct: 5.0,
     }
+}
+
+fn def_tpprof_tp1_pct() -> f64 {
+    default_profile_weak().tp1_pct
+}
+fn def_tpprof_tp1_sell_pct() -> f64 {
+    default_profile_weak().tp1_sell_pct
+}
+fn def_tpprof_tp2_pct() -> f64 {
+    default_profile_weak().tp2_pct
+}
+fn def_tpprof_tp2_sell_pct() -> f64 {
+    default_profile_weak().tp2_sell_pct
+}
+fn def_tpprof_tp3_pct() -> f64 {
+    default_profile_weak().tp3_pct
+}
+fn def_tpprof_tp3_sell_pct() -> f64 {
+    default_profile_weak().tp3_sell_pct
+}
+fn def_tpprof_tp4_pct() -> f64 {
+    default_profile_weak().tp4_pct
+}
+fn def_tpprof_tp4_sell_pct() -> f64 {
+    default_profile_weak().tp4_sell_pct
+}
+fn def_tpprof_tp5_pct() -> f64 {
+    default_profile_weak().tp5_pct
+}
+fn def_tpprof_tp5_sell_pct() -> f64 {
+    default_profile_weak().tp5_sell_pct
+}
+fn def_tpprof_trailing_stop_drawdown_pct() -> f64 {
+    default_profile_weak().trailing_stop_drawdown_pct
+}
+fn def_tpprof_trailing_activate_profit_pct() -> f64 {
+    default_profile_weak().trailing_activate_profit_pct
+}
+fn def_tpprof_trailing_floor_profit_pct() -> f64 {
+    default_profile_weak().trailing_floor_profit_pct
+}
+fn def_tpprof_smart_stop_activate_profit_pct() -> f64 {
+    default_profile_weak().smart_stop_activate_profit_pct
+}
+fn def_tpprof_smart_stop_floor_profit_pct() -> f64 {
+    default_profile_weak().smart_stop_floor_profit_pct
 }
 
 fn default_profile_neutral() -> ExitTpProfile {
