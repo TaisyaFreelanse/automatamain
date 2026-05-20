@@ -12,6 +12,7 @@ pub mod anti_bundle;
 pub mod config;
 pub mod dev_ranker;
 pub mod features;
+pub mod live_position;
 pub mod score_engine;
 pub mod smart_money;
 pub mod strategy_controller;

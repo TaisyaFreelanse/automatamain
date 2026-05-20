@@ -1,10 +1,14 @@
 use solana_address::Address;
 
 use crate::{
-    autobuy::{exit_engine::ExitProfile, open_reason::OpenReason},
+    autobuy::{
+        exit_engine::{ExitProfile, PositionPhase},
+        open_reason::OpenReason,
+    },
     generalize::general_pool::Pool,
     helper::Amount,
     learning::LearningTradeSnapshot,
+    scoring::features::EarlyTapePoint,
 };
 
 pub struct Position {
@@ -54,9 +58,15 @@ pub struct Position {
     // --- Exit Engine V4 -------------------------------------------------------
     pub exit_profile: ExitProfile,
     pub hold_mode: bool,
+    pub exit_phase: PositionPhase,
     pub live_score: i32,
     pub live_prev_velocity: f64,
+    pub live_buyers_per_sec: f64,
+    pub live_prev_buyers_per_sec: f64,
     pub last_live_score_at: u64,
+    pub peak_profit_pct: f64,
+    pub live_tape_prev: Option<EarlyTapePoint>,
+    pub live_tape_curr: Option<EarlyTapePoint>,
 }
 
 impl Position {
@@ -107,9 +117,15 @@ impl Position {
             last_time_kill_after_secs: 0,
             exit_profile: ExitProfile::Neutral,
             hold_mode: false,
+            exit_phase: PositionPhase::Exploration,
             live_score: 0,
             live_prev_velocity: 0.0,
+            live_buyers_per_sec: 0.0,
+            live_prev_buyers_per_sec: 0.0,
             last_live_score_at: 0,
+            peak_profit_pct: 0.0,
+            live_tape_prev: None,
+            live_tape_curr: None,
         }
     }
 

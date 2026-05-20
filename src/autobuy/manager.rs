@@ -2,14 +2,17 @@ use crate::{
     autobuy::{
         broker::{Broker, BuyReceipt},
         exit_engine::{
-            adaptive_trailing, build_live_metrics, calculate_live_score,
-            momentum_decay_detected, resolve_entry_profile, ExitEngineV4Config, ExitProfile,
-            TkEntryThresholds,
+            adaptive_moonbag_sell_pct, adaptive_trailing, apply_phase_to_tp,
+            calculate_live_score, live_metrics_from_snapshot, live_metrics_lite,
+            maybe_upgrade_runner, momentum_decay_detected, profit_lock_staircase_floor,
+            resolve_entry_profile, transition_position_phase, ExitEngineV4Config, ExitProfile,
+            PositionPhase, TkEntryThresholds,
         },
         positions::Position,
     },
     generalize::general_pool::Pool,
     helper::Amount,
+    launchpads::token_bucket::TokenBucket,
     learning::{LearningLogPg, LearningTradeSnapshot},
     persistence::{
         bot_trades::{BotTradeEntry, BotTradeRepository},
@@ -17,6 +20,7 @@ use crate::{
     scoring::{
         config::StrategyConfig,
         dev_ranker::{DevRankerHandle, TokenOutcome},
+        live_position::snapshot_live_position,
         smart_money::SmartMoneyHandle,
         strategy_controller::{BuyDecision, StrategyController, StrategySnapshot},
     },
@@ -297,6 +301,13 @@ pub struct OpenPositionWire {
 pub enum PositionMessage {
     /// Pool state update arriving from websocket / network
     UpdatePool(Box<dyn Pool>),
+    /// Full token bucket (pool + swarm) for live exit metrics.
+    UpdateTokenBucket(TokenBucket),
+    /// Async live tape refresh result (from `UpdateTokenBucket` / `Tick`).
+    ApplyLiveSnapshot {
+        mint: solana_address::Address,
+        live: crate::scoring::live_position::LivePositionSnapshot,
+    },
     /// Pause or resume opening new positions (existing ones keep being managed)
     SetPaused(bool),
     /// Request to open a position (executed after 800 ms delay)
@@ -378,6 +389,8 @@ pub struct PositionManagerActor {
     closed_mints: HashSet<solana_address::Address>,
     /// Stores the most recent pool state (used for slippage simulation)
     pool_cache: HashMap<solana_address::Address, Box<dyn Pool>>,
+    /// Latest bonding-curve bucket per mint (live score / tape).
+    bucket_cache: HashMap<solana_address::Address, TokenBucket>,
     tx: mpsc::Sender<PositionMessage>,
     rx: mpsc::Receiver<PositionMessage>,
     last_print_time: u64,
@@ -421,6 +434,7 @@ impl PositionManagerActor {
             pending_buys: HashSet::new(),
             closed_mints: HashSet::new(),
             pool_cache: HashMap::new(),
+            bucket_cache: HashMap::new(),
             tx: tx.clone(),
             rx,
             last_print_time: 0,
@@ -447,6 +461,75 @@ impl PositionManagerActor {
                     self.pool_cache.insert(mint, pool.clone_box());
                     if let Some(pos) = self.positions.get_mut(&mint) {
                         pos.pool = pool;
+                    }
+                }
+
+                PositionMessage::UpdateTokenBucket(bucket) => {
+                    let mint = bucket.pool().mint();
+                    self.pool_cache
+                        .insert(mint, bucket.pool().clone_box());
+                    self.bucket_cache.insert(mint, bucket.clone());
+                    if let Some(pos) = self.positions.get_mut(&mint) {
+                        pos.pool = bucket.pool().clone_box();
+                    }
+                    if self.positions.contains_key(&mint) {
+                        self.spawn_live_snapshot_refresh(mint);
+                    }
+                }
+
+                PositionMessage::ApplyLiveSnapshot { mint, live } => {
+                    if let Some(pos) = self.positions.get_mut(&mint) {
+                        let prev_tape = pos.live_tape_curr.clone();
+                        pos.live_tape_prev = prev_tape;
+                        pos.live_tape_curr = Some(live.tape.clone());
+                        let held = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs()
+                            .saturating_sub(pos.entry_time);
+                        let enter_mcap = pos.enter_mcap.to_float();
+                        let vel = pos.time_kill_mcap_velocity_pct_per_sec(enter_mcap);
+                        let profit = pos.pnl();
+                        let entry_vel = pos
+                            .learning_snapshot
+                            .as_ref()
+                            .map(|s| s.velocity_pct)
+                            .unwrap_or(0.0);
+                        let v4 = &self.config.exit_v4;
+                        let metrics = live_metrics_from_snapshot(
+                            &live,
+                            pos.live_prev_buyers_per_sec,
+                            vel,
+                            pos.live_prev_velocity,
+                            entry_vel,
+                            profit,
+                            v4,
+                        );
+                        pos.live_prev_buyers_per_sec = pos.live_buyers_per_sec;
+                        pos.live_buyers_per_sec = live.buyers_per_sec;
+                        pos.live_prev_velocity = vel;
+                        pos.live_score = calculate_live_score(&metrics);
+                        pos.last_live_score_at = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
+                        pos.exit_phase = transition_position_phase(
+                            pos.exit_phase,
+                            pos.live_score,
+                            metrics.momentum_decay,
+                            profit,
+                            v4,
+                        );
+                        let (profile, hold) = maybe_upgrade_runner(
+                            v4,
+                            pos.exit_profile,
+                            &metrics,
+                            pos.live_score,
+                            pos.hold_mode,
+                        );
+                        pos.exit_profile = profile;
+                        pos.hold_mode = hold;
+                        let _ = held;
                     }
                 }
 
@@ -684,10 +767,14 @@ impl PositionManagerActor {
                         );
                         position.exit_profile = profile;
                         position.hold_mode = hold;
+                        position.exit_phase = PositionPhase::Exploration;
                         eprintln!(
-                            "[EXIT V4] {mint} profile={} hold={hold}",
+                            "[EXIT V4] {mint} profile={} phase=exploration hold={hold}",
                             profile.as_str()
                         );
+                    }
+                    if self.bucket_cache.contains_key(&mint) {
+                        self.spawn_live_snapshot_refresh(mint);
                     }
                     position.learning_snapshot = learning_snapshot;
                     position.open_reason = Some(open_reason.clone());
@@ -947,6 +1034,14 @@ impl PositionManagerActor {
 
                 // ----------------------------------------------------------------
                 PositionMessage::Tick => {
+                    if self.config.exit_v4.enabled {
+                        let mints: Vec<_> = self.positions.keys().copied().collect();
+                        for mint in mints {
+                            if self.bucket_cache.contains_key(&mint) {
+                                self.spawn_live_snapshot_refresh(mint);
+                            }
+                        }
+                    }
                     self.process_positions().await;
                 }
                 PositionMessage::GetPnl { mint, responder } => {
@@ -1134,6 +1229,40 @@ impl PositionManagerActor {
         }
     }
 
+    fn spawn_live_snapshot_refresh(&self, mint: solana_address::Address) {
+        let Some(bucket) = self.bucket_cache.get(&mint).cloned() else {
+            return;
+        };
+        let Some(pos) = self.positions.get(&mint) else {
+            return;
+        };
+        let entry_time = pos.entry_time;
+        let early_buyers = pos.early_buyers.clone();
+        let prev = pos.live_tape_curr.clone();
+        let tol = self.config.exit_v4.bundle_similar_tolerance;
+        let tx = self.tx.clone();
+        let smart_money = self.smart_money.clone();
+        tokio::spawn(async move {
+            let held = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .saturating_sub(entry_time);
+            let live = snapshot_live_position(
+                &bucket,
+                prev.as_ref(),
+                held,
+                smart_money.as_ref(),
+                &early_buyers,
+                tol,
+            )
+            .await;
+            let _ = tx
+                .send(PositionMessage::ApplyLiveSnapshot { mint, live })
+                .await;
+        });
+    }
+
     /// V3 adaptive time-kill: weak vs strong window from entry snapshot + short mcap tape.
     /// Returns `(kill_after_secs, tier_label)` where `tier_label` is `strong` / `weak` / `neutral`, or `fixed` when adaptive is off.
     fn time_kill_window_profile(
@@ -1228,18 +1357,41 @@ impl PositionManagerActor {
             pos.time_kill_note_mcap_sample(current_time, current_mcap);
 
             let profit = pos.pnl();
+            if profit > pos.peak_profit_pct {
+                pos.peak_profit_pct = profit;
+            }
             let enter_mcap = pos.enter_mcap.to_float();
             let vel = pos.time_kill_mcap_velocity_pct_per_sec(enter_mcap);
 
             if v4_enabled
                 && current_time.saturating_sub(pos.last_live_score_at)
                     >= v4_cfg.live_score_refresh_secs
+                && pos.live_tape_curr.is_none()
             {
                 let snap = pos.learning_snapshot.as_ref();
-                let metrics = build_live_metrics(pos, vel, profit, snap);
+                let metrics = live_metrics_lite(pos, vel, profit, snap, &v4_cfg);
                 pos.live_score = calculate_live_score(&metrics);
                 pos.live_prev_velocity = vel;
                 pos.last_live_score_at = current_time;
+                pos.exit_phase = transition_position_phase(
+                    pos.exit_phase,
+                    pos.live_score,
+                    metrics.momentum_decay,
+                    profit,
+                    &v4_cfg,
+                );
+                let (profile, hold) =
+                    maybe_upgrade_runner(&v4_cfg, pos.exit_profile, &metrics, pos.live_score, pos.hold_mode);
+                pos.exit_profile = profile;
+                pos.hold_mode = hold;
+            }
+
+            if v4_enabled && v4_cfg.profit_staircase_enabled {
+                if let Some(floor) = profit_lock_staircase_floor(pos.peak_profit_pct) {
+                    if pos.exit_profit_floor < floor {
+                        pos.exit_profit_floor = floor;
+                    }
+                }
             }
 
             let held_secs = current_time.saturating_sub(pos.entry_time);
@@ -1249,7 +1401,8 @@ impl PositionManagerActor {
             pos.last_time_kill_after_secs = kill_after_secs;
 
             let tp_cfg = if v4_enabled {
-                v4_cfg.profile_params(pos.exit_profile).clone()
+                let base = v4_cfg.profile_params(pos.exit_profile).clone();
+                apply_phase_to_tp(base, pos.exit_phase)
             } else {
                 crate::autobuy::exit_engine::ExitTpProfile {
                     tp1_pct: global_cfg.tp1_pct,
@@ -1271,11 +1424,7 @@ impl PositionManagerActor {
             };
 
             let trailing_drawdown_pct = if v4_enabled {
-                adaptive_trailing(
-                    tp_cfg.trailing_stop_drawdown_pct,
-                    pos.live_score,
-                    profit,
-                )
+                adaptive_trailing(pos.exit_profile, pos.live_score, profit)
             } else {
                 tp_cfg.trailing_stop_drawdown_pct
             };
@@ -1290,15 +1439,27 @@ impl PositionManagerActor {
             });
 
             // --- 0. Phase 2: momentum decay full exit ---
-            if v4_cfg.momentum_decay_exit_enabled {
+            if v4_enabled && v4_cfg.momentum_decay_exit_enabled {
                 let sell_p = pos
                     .learning_snapshot
                     .as_ref()
                     .map(|s| s.sell_pressure_score)
                     .unwrap_or(0.0);
-                if momentum_decay_detected(vel, pos.live_prev_velocity, sell_p, vel) {
+                if momentum_decay_detected(
+                    pos.live_buyers_per_sec,
+                    pos.live_prev_buyers_per_sec,
+                    sell_p,
+                    vel,
+                )
+                    || pos.exit_phase == PositionPhase::Distribution && pos.live_score <= v4_cfg.phase_distribution_max_score
+                {
                     pos.is_closing = true;
-                    actions.push((*mint, 100.0, "MOMENTUM DECAY".to_string()));
+                    let reason = if pos.exit_phase == PositionPhase::Distribution {
+                        format!("MOMENTUM DECAY [{}]", pos.exit_phase.as_str())
+                    } else {
+                        "MOMENTUM DECAY".to_string()
+                    };
+                    actions.push((*mint, 100.0, reason));
                     continue;
                 }
             }
@@ -1381,9 +1542,22 @@ impl PositionManagerActor {
             // Both cannot be queued simultaneously thanks to the flag above.
             let tp_label = |n: u8, pct: f64| {
                 if v4_enabled {
-                    format!("TP{n} ({:.0}%) [{}]", pct, pos.exit_profile.as_str())
+                    format!(
+                        "TP{n} ({:.0}%) [{}|{}]",
+                        pct,
+                        pos.exit_profile.as_str(),
+                        pos.exit_phase.as_str()
+                    )
                 } else {
                     format!("TP{n}")
+                }
+            };
+
+            let moonbag_sell = |base: f64| {
+                if v4_enabled && v4_cfg.adaptive_moonbag_enabled {
+                    adaptive_moonbag_sell_pct(base, pos.live_score, pos.exit_phase)
+                } else {
+                    base
                 }
             };
 
@@ -1414,7 +1588,7 @@ impl PositionManagerActor {
                 pos.pending_partial_sell = true;
                 actions.push((
                     *mint,
-                    tp_cfg.tp3_sell_pct,
+                    moonbag_sell(tp_cfg.tp3_sell_pct),
                     tp_label(3, tp_cfg.tp3_pct),
                 ));
                 continue;
@@ -1425,7 +1599,7 @@ impl PositionManagerActor {
                 pos.pending_partial_sell = true;
                 actions.push((
                     *mint,
-                    tp_cfg.tp4_sell_pct,
+                    moonbag_sell(tp_cfg.tp4_sell_pct),
                     tp_label(4, tp_cfg.tp4_pct),
                 ));
                 continue;
@@ -1436,7 +1610,7 @@ impl PositionManagerActor {
                 pos.pending_partial_sell = true;
                 actions.push((
                     *mint,
-                    tp_cfg.tp5_sell_pct,
+                    moonbag_sell(tp_cfg.tp5_sell_pct),
                     tp_label(5, tp_cfg.tp5_pct),
                 ));
             }

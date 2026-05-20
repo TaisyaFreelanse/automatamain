@@ -1,11 +1,15 @@
-//! Adaptive Exit Engine V4 — Phase 1: entry profiles, lite live score, hold/runner,
-//! adaptive trailing. Phase 2+ (momentum-decay full exit, profit staircase) behind flags.
+//! Adaptive Exit Engine V4 — full doc architecture:
+//! Exploration → Momentum → Expansion → Distribution, live score, profiles,
+//! HOLD/RUNNER, adaptive trailing, momentum decay, profit staircase, re-expansion, moonbag.
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
     autobuy::positions::Position,
     learning::LearningTradeSnapshot,
+    scoring::{
+        live_position::LivePositionSnapshot,
+    },
 };
 
 /// Entry snapshot thresholds (mirrors `SmartBuyConfig` time-kill fields).
@@ -33,6 +37,28 @@ impl ExitProfile {
             ExitProfile::Neutral => "neutral",
             ExitProfile::Strong => "strong",
             ExitProfile::Runner => "runner",
+        }
+    }
+}
+
+/// Position lifecycle state (doc §2); transitions driven by live score + decay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PositionPhase {
+    #[default]
+    Exploration,
+    Momentum,
+    Expansion,
+    Distribution,
+}
+
+impl PositionPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PositionPhase::Exploration => "exploration",
+            PositionPhase::Momentum => "momentum",
+            PositionPhase::Expansion => "expansion",
+            PositionPhase::Distribution => "distribution",
         }
     }
 }
@@ -94,9 +120,9 @@ pub struct ExitEngineV4Config {
     pub strong: ExitTpProfile,
     #[serde(default = "default_profile_runner")]
     pub runner: ExitTpProfile,
-    /// HOLD / runner: minimum entry score_total (doc 13 is too high for our scale).
-    #[serde(default = "default_hold_min_entry_score")]
-    pub hold_min_entry_score: i32,
+    /// HOLD MODE (doc §4).
+    #[serde(default = "default_hold_min_live_score")]
+    pub hold_min_live_score: i32,
     #[serde(default = "default_hold_min_b2s")]
     pub hold_min_b2s: f64,
     #[serde(default = "default_hold_min_smart")]
@@ -105,12 +131,70 @@ pub struct ExitEngineV4Config {
     pub hold_max_bundle_similar: f64,
     #[serde(default = "default_hold_momentum_overheated_pct")]
     pub hold_momentum_overheated_pct: f64,
+    /// FSM thresholds (live score).
+    #[serde(default = "default_phase_momentum_min")]
+    pub phase_momentum_min_score: i32,
+    #[serde(default = "default_phase_expansion_min")]
+    pub phase_expansion_min_score: i32,
+    #[serde(default = "default_phase_distribution_max")]
+    pub phase_distribution_max_score: i32,
     /// Strong tier: skip time-kill if any TP fired and PnL is above this (%).
     #[serde(default = "default_strong_time_kill_min_after_tp")]
     pub strong_time_kill_min_profit_after_tp: f64,
-    /// Phase 2: full exit on momentum decay (off in Phase 1).
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub momentum_decay_exit_enabled: bool,
+    #[serde(default = "default_true")]
+    pub profit_staircase_enabled: bool,
+    #[serde(default = "default_true")]
+    pub runtime_runner_upgrade_enabled: bool,
+    #[serde(default = "default_runner_upgrade_min_live_score")]
+    pub runner_upgrade_min_live_score: i32,
+    #[serde(default = "default_true")]
+    pub re_expansion_enabled: bool,
+    #[serde(default = "default_re_expansion_min_score")]
+    pub re_expansion_min_score: i32,
+    #[serde(default = "default_re_expansion_min_profit_pct")]
+    pub re_expansion_min_profit_pct: f64,
+    #[serde(default = "default_true")]
+    pub adaptive_moonbag_enabled: bool,
+    #[serde(default = "default_bundle_tolerance")]
+    pub bundle_similar_tolerance: f64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_hold_min_live_score() -> i32 {
+    13
+}
+
+fn default_phase_momentum_min() -> i32 {
+    5
+}
+
+fn default_phase_expansion_min() -> i32 {
+    10
+}
+
+fn default_phase_distribution_max() -> i32 {
+    3
+}
+
+fn default_runner_upgrade_min_live_score() -> i32 {
+    11
+}
+
+fn default_re_expansion_min_score() -> i32 {
+    8
+}
+
+fn default_re_expansion_min_profit_pct() -> f64 {
+    20.0
+}
+
+fn default_bundle_tolerance() -> f64 {
+    0.08
 }
 
 fn default_exit_v4_enabled() -> bool {
@@ -121,16 +205,12 @@ fn default_live_score_refresh_secs() -> u64 {
     4
 }
 
-fn default_hold_min_entry_score() -> i32 {
-    7
-}
-
 fn default_hold_min_b2s() -> f64 {
-    2.0
+    2.2
 }
 
 fn default_hold_min_smart() -> u32 {
-    3
+    5
 }
 
 fn default_hold_max_bundle_similar() -> f64 {
@@ -280,13 +360,24 @@ impl Default for ExitEngineV4Config {
             neutral: default_profile_neutral(),
             strong: default_profile_strong(),
             runner: default_profile_runner(),
-            hold_min_entry_score: default_hold_min_entry_score(),
+            hold_min_live_score: default_hold_min_live_score(),
             hold_min_b2s: default_hold_min_b2s(),
             hold_min_smart: default_hold_min_smart(),
             hold_max_bundle_similar: default_hold_max_bundle_similar(),
             hold_momentum_overheated_pct: default_hold_momentum_overheated_pct(),
+            phase_momentum_min_score: default_phase_momentum_min(),
+            phase_expansion_min_score: default_phase_expansion_min(),
+            phase_distribution_max_score: default_phase_distribution_max(),
             strong_time_kill_min_profit_after_tp: default_strong_time_kill_min_after_tp(),
-            momentum_decay_exit_enabled: false,
+            momentum_decay_exit_enabled: default_true(),
+            profit_staircase_enabled: default_true(),
+            runtime_runner_upgrade_enabled: default_true(),
+            runner_upgrade_min_live_score: default_runner_upgrade_min_live_score(),
+            re_expansion_enabled: default_true(),
+            re_expansion_min_score: default_re_expansion_min_score(),
+            re_expansion_min_profit_pct: default_re_expansion_min_profit_pct(),
+            adaptive_moonbag_enabled: default_true(),
+            bundle_similar_tolerance: default_bundle_tolerance(),
         }
     }
 }
@@ -302,7 +393,7 @@ impl ExitEngineV4Config {
     }
 }
 
-/// Lite in-position metrics (no TokenBucket — tape + mcap velocity).
+/// In-position metrics (live TokenBucket tape when available).
 #[derive(Clone, Debug, Default)]
 pub struct LiveMetrics {
     pub buyers_per_sec: f64,
@@ -310,7 +401,11 @@ pub struct LiveMetrics {
     pub buy_sell_ratio: f64,
     pub holder_growth_rate: f64,
     pub volume_delta: f64,
+    pub liquidity_delta: f64,
+    pub sell_pressure_score: f64,
+    pub smart_wallet_exits: u32,
     pub momentum_decay: bool,
+    pub volume_decay: bool,
     pub bundle_detected: bool,
     pub momentum_overheated: bool,
 }
@@ -336,13 +431,108 @@ pub fn calculate_live_score(metrics: &LiveMetrics) -> i32 {
     if metrics.volume_delta > 0.0 {
         score += 1;
     }
+    if metrics.liquidity_delta > 0.0 {
+        score += 1;
+    }
+    if metrics.sell_pressure_score > 1.2 {
+        score -= 2;
+    }
+    if metrics.smart_wallet_exits >= 2 {
+        score -= 3;
+    } else if metrics.smart_wallet_exits >= 1 {
+        score -= 1;
+    }
     if metrics.momentum_decay {
         score -= 4;
+    }
+    if metrics.volume_decay {
+        score -= 2;
     }
     if metrics.bundle_detected {
         score -= 3;
     }
     score
+}
+
+pub fn live_metrics_from_snapshot(
+    snap: &LivePositionSnapshot,
+    buyers_per_sec_prev: f64,
+    vel_now: f64,
+    vel_prev: f64,
+    entry_velocity_pct: f64,
+    profit_pct: f64,
+    cfg: &ExitEngineV4Config,
+) -> LiveMetrics {
+    let volume_decay = snap.volume_delta < 0.0 && vel_now < vel_prev * 0.85;
+    let momentum_decay = momentum_decay_detected(
+        snap.buyers_per_sec,
+        buyers_per_sec_prev,
+        snap.sell_pressure_score,
+        snap.volume_delta,
+    ) || (vel_prev > 0.01
+        && vel_now < vel_prev * 0.7
+        && snap.sell_pressure_score > 1.2
+        && snap.volume_delta < 0.0);
+    let bundle_detected = snap.bundle_similar > cfg.hold_max_bundle_similar
+        || snap.bundle_identical > 0.2;
+    LiveMetrics {
+        buyers_per_sec: snap.buyers_per_sec,
+        smart_wallet_count: snap.smart_wallet_count,
+        buy_sell_ratio: snap.buy_sell_ratio,
+        holder_growth_rate: snap.holder_growth_rate,
+        volume_delta: snap.volume_delta,
+        liquidity_delta: snap.liquidity_delta,
+        sell_pressure_score: snap.sell_pressure_score,
+        smart_wallet_exits: snap.smart_wallet_exits,
+        momentum_decay,
+        volume_decay,
+        bundle_detected,
+        momentum_overheated: entry_velocity_pct >= cfg.hold_momentum_overheated_pct
+            || profit_pct >= 120.0,
+    }
+}
+
+/// Fallback when TokenBucket is not yet in cache (mcap velocity + entry snapshot).
+pub fn live_metrics_lite(
+    pos: &Position,
+    vel_pct_per_sec: f64,
+    profit_pct: f64,
+    snap: Option<&LearningTradeSnapshot>,
+    cfg: &ExitEngineV4Config,
+) -> LiveMetrics {
+    let sell_pressure = snap.map(|s| s.sell_pressure_score).unwrap_or(0.0);
+    let entry_vel = snap.map(|s| s.velocity_pct).unwrap_or(0.0);
+    let bundle_similar = snap.map(|s| s.bundle_similar).unwrap_or(0.0);
+    let bundle_identical = snap.map(|s| s.bundle_identical).unwrap_or(0.0);
+    let smart_exits = snap.map(|s| s.smart_wallet_early_exits).unwrap_or(0);
+    let b2s = if pos.tk_entry_b2s > 0.0 {
+        pos.tk_entry_b2s
+    } else {
+        snap.map(|s| s.buy_to_sell_ratio).unwrap_or(1.0)
+    };
+    let buyers_per_sec = (vel_pct_per_sec * 12.0).max(0.0)
+        + if pos.tk_entry_buyers >= 35 { 2.5 } else { 0.0 };
+    let volume_delta = vel_pct_per_sec;
+    let momentum_decay = momentum_decay_detected(
+        vel_pct_per_sec,
+        pos.live_prev_velocity,
+        sell_pressure,
+        volume_delta,
+    );
+    LiveMetrics {
+        buyers_per_sec,
+        smart_wallet_count: pos.tk_entry_smart,
+        buy_sell_ratio: b2s,
+        holder_growth_rate: vel_pct_per_sec.max(0.0) * 20.0,
+        volume_delta,
+        liquidity_delta: vel_pct_per_sec,
+        sell_pressure_score: sell_pressure,
+        smart_wallet_exits: smart_exits,
+        momentum_decay,
+        volume_decay: volume_delta < 0.0,
+        bundle_detected: bundle_similar > cfg.hold_max_bundle_similar || bundle_identical > 0.25,
+        momentum_overheated: entry_vel >= cfg.hold_momentum_overheated_pct || profit_pct >= 120.0,
+    }
 }
 
 pub fn momentum_decay_detected(
@@ -357,76 +547,150 @@ pub fn momentum_decay_detected(
 
 pub fn should_enable_hold_mode(
     cfg: &ExitEngineV4Config,
+    metrics: &LiveMetrics,
     live_score: i32,
-    smart_wallets: u32,
-    buy_sell_ratio: f64,
-    bundle_detected: bool,
-    momentum_overheated: bool,
-    entry_score: i32,
 ) -> bool {
-    let score_gate = live_score >= 8 || entry_score >= cfg.hold_min_entry_score;
-    score_gate
-        && smart_wallets >= cfg.hold_min_smart
-        && buy_sell_ratio >= cfg.hold_min_b2s
-        && !bundle_detected
-        && !momentum_overheated
+    live_score >= cfg.hold_min_live_score
+        && metrics.smart_wallet_count >= cfg.hold_min_smart
+        && metrics.buy_sell_ratio > cfg.hold_min_b2s
+        && !metrics.bundle_detected
+        && !metrics.momentum_overheated
 }
 
-/// Adaptive trailing % — capped by profile baseline, boosted for high live score.
-pub fn adaptive_trailing(
-    profile_base_pct: f64,
-    live_score: i32,
-    profit_pct: f64,
-) -> f64 {
-    let mut pct = profile_base_pct;
-    if live_score >= 12 {
-        pct = pct.max(30.0);
-    } else if live_score >= 9 {
-        pct = pct.max(24.0);
-    } else if profit_pct > 50.0 {
-        pct = pct.max(18.0);
-    } else {
-        pct = pct.max(14.0);
-    }
-    pct.min(42.0)
-}
-
-pub fn build_live_metrics(
-    pos: &Position,
-    vel_pct_per_sec: f64,
-    profit_pct: f64,
-    snap: Option<&LearningTradeSnapshot>,
-) -> LiveMetrics {
-    let smart = pos.tk_entry_smart;
-    let b2s = if pos.tk_entry_b2s > 0.0 {
-        pos.tk_entry_b2s
-    } else {
-        snap.map(|s| s.buy_to_sell_ratio).unwrap_or(1.0)
+/// Doc §6 adaptive trailing (weak 12–15%, strong 20–25%, runner 35–45%).
+pub fn adaptive_trailing(profile: ExitProfile, live_score: i32, profit_pct: f64) -> f64 {
+    let profile_floor = match profile {
+        ExitProfile::Weak => 14.0,
+        ExitProfile::Neutral => 18.0,
+        ExitProfile::Strong => 22.0,
+        ExitProfile::Runner => 38.0,
     };
-    let sell_pressure = snap.map(|s| s.sell_pressure_score).unwrap_or(0.0);
-    let bundle_similar = snap.map(|s| s.bundle_similar).unwrap_or(0.0);
-    let bundle_identical = snap.map(|s| s.bundle_identical).unwrap_or(0.0);
-    let entry_vel = snap.map(|s| s.velocity_pct).unwrap_or(0.0);
+    let doc: f64 = if live_score >= 15 {
+        40.0
+    } else if live_score >= 11 {
+        24.0
+    } else if profit_pct > 50.0 {
+        18.0
+    } else {
+        14.0
+    };
+    doc.max(profile_floor).min(45.0)
+}
 
-    let buyers_per_sec = (vel_pct_per_sec * 12.0).max(0.0)
-        + if pos.tk_entry_buyers >= 35 { 2.5 } else { 0.0 };
-    let holder_growth_rate = vel_pct_per_sec.max(0.0) * 20.0;
-    let volume_delta = vel_pct_per_sec;
-    let momentum_decay =
-        momentum_decay_detected(vel_pct_per_sec, pos.live_prev_velocity, sell_pressure, volume_delta);
-    let bundle_detected = bundle_similar > 0.4 || bundle_identical > 0.25;
-    let momentum_overheated = entry_vel >= 55.0 || profit_pct >= 120.0;
-
-    LiveMetrics {
-        buyers_per_sec,
-        smart_wallet_count: smart,
-        buy_sell_ratio: b2s,
-        holder_growth_rate,
-        volume_delta,
-        momentum_decay,
-        bundle_detected,
-        momentum_overheated,
+/// Doc §8 profit lock staircase — minimum locked profit vs session peak PnL.
+pub fn profit_lock_staircase_floor(peak_profit_pct: f64) -> Option<f64> {
+    if peak_profit_pct >= 400.0 {
+        Some(180.0)
+    } else if peak_profit_pct >= 200.0 {
+        Some(90.0)
+    } else if peak_profit_pct >= 100.0 {
+        Some(40.0)
+    } else if peak_profit_pct >= 50.0 {
+        Some(15.0)
+    } else {
+        None
     }
+}
+
+pub fn transition_position_phase(
+    current: PositionPhase,
+    live_score: i32,
+    momentum_decay: bool,
+    profit_pct: f64,
+    cfg: &ExitEngineV4Config,
+) -> PositionPhase {
+    if cfg.re_expansion_enabled
+        && current == PositionPhase::Distribution
+        && live_score >= cfg.re_expansion_min_score
+        && profit_pct >= cfg.re_expansion_min_profit_pct
+    {
+        return PositionPhase::Expansion;
+    }
+    if momentum_decay || live_score <= cfg.phase_distribution_max_score {
+        return PositionPhase::Distribution;
+    }
+    if live_score >= cfg.phase_expansion_min_score {
+        return PositionPhase::Expansion;
+    }
+    if live_score >= cfg.phase_momentum_min_score {
+        return PositionPhase::Momentum;
+    }
+    PositionPhase::Exploration
+}
+
+/// Phase adjusts TP/trailing behaviour on top of exit profile.
+pub fn apply_phase_to_tp(mut base: ExitTpProfile, phase: PositionPhase) -> ExitTpProfile {
+    match phase {
+        PositionPhase::Exploration => {}
+        PositionPhase::Momentum => {
+            base.trailing_activate_profit_pct *= 1.05;
+        }
+        PositionPhase::Expansion => {
+            base.trailing_stop_drawdown_pct = (base.trailing_stop_drawdown_pct * 1.12).min(45.0);
+            base.tp3_sell_pct *= 0.85;
+            base.tp4_sell_pct *= 0.85;
+            base.tp5_sell_pct *= 0.85;
+        }
+        PositionPhase::Distribution => {
+            base.tp1_sell_pct = (base.tp1_sell_pct * 1.2).min(55.0);
+            base.tp2_sell_pct = (base.tp2_sell_pct * 1.15).min(50.0);
+            base.trailing_activate_profit_pct *= 0.85;
+        }
+    }
+    base
+}
+
+/// Doc §9 adaptive moonbag — smaller partial sells on TP3+ when tape is strong.
+pub fn adaptive_moonbag_sell_pct(base_sell: f64, live_score: i32, phase: PositionPhase) -> f64 {
+    if !matches!(phase, PositionPhase::Expansion | PositionPhase::Momentum) {
+        return base_sell;
+    }
+    if live_score >= 12 {
+        base_sell * 0.5
+    } else if live_score >= 9 {
+        base_sell * 0.75
+    } else {
+        base_sell
+    }
+}
+
+/// ML / tier bias at entry (uses scoring tier string).
+pub fn ml_profile_bias(tier: &str, base: ExitProfile) -> ExitProfile {
+    let t = tier.to_ascii_lowercase();
+    if t.contains("aplus") || t.contains("a+") {
+        if base == ExitProfile::Weak {
+            ExitProfile::Strong
+        } else {
+            ExitProfile::Runner
+        }
+    } else if t == "a" {
+        if matches!(base, ExitProfile::Weak | ExitProfile::Neutral) {
+            ExitProfile::Strong
+        } else {
+            base
+        }
+    } else {
+        base
+    }
+}
+
+pub fn maybe_upgrade_runner(
+    cfg: &ExitEngineV4Config,
+    current: ExitProfile,
+    metrics: &LiveMetrics,
+    live_score: i32,
+    hold_already: bool,
+) -> (ExitProfile, bool) {
+    if !cfg.runtime_runner_upgrade_enabled || hold_already {
+        return (current, hold_already);
+    }
+    if live_score >= cfg.runner_upgrade_min_live_score
+        && should_enable_hold_mode(cfg, metrics, live_score)
+        && matches!(current, ExitProfile::Strong | ExitProfile::Neutral)
+    {
+        return (ExitProfile::Runner, true);
+    }
+    (current, hold_already)
 }
 
 /// Entry-time profile from tk snapshot + optional hold upgrade.
@@ -439,10 +703,6 @@ pub fn resolve_entry_profile(
     let entry_score = snap.map(|s| s.score_total).unwrap_or(0);
     let b2s = pos.tk_entry_b2s.max(snap.map(|s| s.buy_to_sell_ratio).unwrap_or(0.0));
     let smart = pos.tk_entry_smart.max(snap.map(|s| s.smart_wallet_count).unwrap_or(0));
-    let bundle_similar = snap.map(|s| s.bundle_similar).unwrap_or(0.0);
-    let bundle_identical = snap.map(|s| s.bundle_identical).unwrap_or(0.0);
-    let entry_vel = snap.map(|s| s.velocity_pct).unwrap_or(0.0);
-
     let mut strong = 0u32;
     let mut weak = 0u32;
     if smart >= 1 {
@@ -472,35 +732,16 @@ pub fn resolve_entry_profile(
         ExitProfile::Neutral
     };
 
-    let bundle_detected =
-        bundle_similar > v4.hold_max_bundle_similar || bundle_identical > 0.2;
-    let momentum_overheated = entry_vel >= v4.hold_momentum_overheated_pct;
-    let live_stub = LiveMetrics {
-        smart_wallet_count: smart,
-        buy_sell_ratio: b2s,
-        buyers_per_sec: if pos.tk_entry_buyers >= 38 { 5.0 } else { 2.0 },
-        holder_growth_rate: 2.0,
-        volume_delta: 1.0,
-        momentum_decay: false,
-        bundle_detected,
-        momentum_overheated,
-    };
-    let live_score = calculate_live_score(&live_stub);
+    let metrics = live_metrics_lite(pos, 0.0, 0.0, snap, v4);
+    let live_score = calculate_live_score(&metrics).max(entry_score / 2);
+    let hold = should_enable_hold_mode(v4, &metrics, live_score);
 
-    let hold = should_enable_hold_mode(
-        v4,
-        live_score,
-        smart,
-        b2s,
-        bundle_detected,
-        momentum_overheated,
-        entry_score,
-    );
-
-    let profile = if hold && matches!(base, ExitProfile::Strong | ExitProfile::Neutral) {
+    let tier = snap.map(|s| s.tier.as_str()).unwrap_or("");
+    let biased = ml_profile_bias(tier, base);
+    let profile = if hold && matches!(biased, ExitProfile::Strong | ExitProfile::Neutral) {
         ExitProfile::Runner
     } else {
-        base
+        biased
     };
 
     (profile, hold)
@@ -530,7 +771,14 @@ mod tests {
 
     #[test]
     fn adaptive_trailing_caps() {
-        assert!(adaptive_trailing(14.0, 15, 10.0) <= 42.0);
-        assert!(adaptive_trailing(14.0, 15, 10.0) >= 14.0);
+        let t = adaptive_trailing(ExitProfile::Weak, 15, 10.0);
+        assert!(t <= 45.0);
+        assert!(t >= 14.0);
+    }
+
+    #[test]
+    fn profit_staircase() {
+        assert_eq!(profit_lock_staircase_floor(55.0), Some(15.0));
+        assert_eq!(profit_lock_staircase_floor(120.0), Some(40.0));
     }
 }

@@ -52,18 +52,28 @@ buy_config:
   fill_mcap_abort_enabled: true
   fill_mcap_abort_max_ratio: 2.0
 
-  # Adaptive Exit Engine V4 (Phase 1): weak/neutral/strong/runner profiles,
-  # lite live score in-position, hold mode, adaptive trailing.
+  # Adaptive Exit Engine V4 (full doc): FSM phases, live tape, HOLD, staircase, decay.
   exit_v4:
     enabled: true
-    live_score_refresh_secs: 4
-    hold_min_entry_score: 7
-    hold_min_b2s: 2.0
-    hold_min_smart: 3
+    live_score_refresh_secs: 3
+    hold_min_live_score: 13
+    hold_min_b2s: 2.2
+    hold_min_smart: 5
     hold_max_bundle_similar: 0.35
     hold_momentum_overheated_pct: 55.0
+    phase_momentum_min_score: 5
+    phase_expansion_min_score: 10
+    phase_distribution_max_score: 3
     strong_time_kill_min_profit_after_tp: 8.0
-    momentum_decay_exit_enabled: false
+    momentum_decay_exit_enabled: true
+    profit_staircase_enabled: true
+    runtime_runner_upgrade_enabled: true
+    runner_upgrade_min_live_score: 11
+    re_expansion_enabled: true
+    re_expansion_min_score: 8
+    re_expansion_min_profit_pct: 20.0
+    adaptive_moonbag_enabled: true
+    bundle_similar_tolerance: 0.08
     weak:
       tp1_pct: 30.0
       tp1_sell_pct: 40.0
@@ -84,7 +94,11 @@ buy_config:
       tp1_sell_pct: 30.0
       tp2_pct: 50.0
       tp2_sell_pct: 15.0
-      trailing_stop_drawdown_pct: 26.0
+      tp3_pct: 100.0
+      tp3_sell_pct: 10.0
+      tp4_pct: 150.0
+      tp4_sell_pct: 10.0
+      trailing_stop_drawdown_pct: 24.0
       trailing_activate_profit_pct: 60.0
       trailing_floor_profit_pct: 35.0
     runner:
@@ -94,7 +108,11 @@ buy_config:
       tp2_sell_pct: 10.0
       tp3_pct: 150.0
       tp3_sell_pct: 15.0
-      trailing_stop_drawdown_pct: 32.0
+      tp4_pct: 300.0
+      tp4_sell_pct: 15.0
+      tp5_pct: 400.0
+      tp5_sell_pct: 10.0
+      trailing_stop_drawdown_pct: 38.0
       trailing_activate_profit_pct: 55.0
       trailing_floor_profit_pct: 30.0
 

@@ -1230,7 +1230,7 @@ async fn main() {
 
                     {
                         let _ = tx
-                            .send(PositionMessage::UpdatePool(bucket.pool().clone_box()))
+                            .send(PositionMessage::UpdateTokenBucket((*bucket).clone()))
                             .await;
                     }
 
