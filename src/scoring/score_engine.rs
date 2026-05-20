@@ -89,14 +89,14 @@ impl<'a> ScoreEngine<'a> {
             DevCategory::Neutral | DevCategory::Stale => {}
         }
 
-        if f.smart_wallet_count >= 3 {
+        if f.smart_wallet_count >= t.smart_wallet_3plus_min {
             add(
                 "smart_wallets_3plus",
                 w.smart_wallets_3plus,
                 &mut total,
                 &mut items,
             );
-        } else if f.smart_wallet_count >= 1 {
+        } else if f.smart_wallet_count >= t.smart_wallet_1plus_min {
             add(
                 "smart_wallets_1plus",
                 w.smart_wallets_1plus,

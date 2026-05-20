@@ -47,10 +47,10 @@ buy_config:
   time_kill_vel_flat: 0.025
   time_kill_early_green_pct: 8.0
   time_kill_peak_dd_for_weak: 0.055
-  trailing_stop_drawdown_pct: 30.0
+  trailing_stop_drawdown_pct: 26.0
   # After buy: if on-chain post-fill mcap > score_mcap * ratio, sell immediately (no OPEN).
   fill_mcap_abort_enabled: true
-  fill_mcap_abort_max_ratio: 1.5
+  fill_mcap_abort_max_ratio: 2.0
 
 # Score Engine A+/A/SKIP. The bot computes a combined score from dev quality,
 # liquidity, buyers, momentum, volume, smart wallets, and anti-bundle signals
@@ -70,8 +70,7 @@ scoring:
   a_threshold: 6
   # --- Live-only gates (ignored when execution.mode: demo) ---------------
   # Require bonding-curve mcap growth into the "good" band during the window.
-  # TEMP: off — mcap in logs stays ~flat vs window; re-enable after better mcap signal / logging.
-  require_momentum_good: false
+  require_momentum_good: true
   # Live: tier must be at least this. Use `A` so both A and A+ can buy when
   # `require_momentum_good` passes; set `APlus` only if you want top-tier-only.
   minimum_tier_for_buy: A
@@ -81,7 +80,7 @@ scoring:
     dev_ranker_a_plus: 3
     dev_ranker_a: 1
     dev_ranker_bad: -3
-    smart_wallets_3plus: 3
+    smart_wallets_3plus: 4
     smart_wallets_1plus: 1
     buyers_10plus: 2
     buyers_6plus: 1
@@ -104,13 +103,15 @@ scoring:
     dev_strong_min_pnl_pct: 20.0
     buyers_high: 10
     buyers_mid: 6
-    buyers_low: 3
-    buy_to_sell_high: 1.5
+    buyers_low: 4
+    buy_to_sell_high: 1.7
     # Legacy: low band 4% (pre-V2). V2 A/B used 12% — set back to 12.0 when legacy_scoring: false.
     momentum_good_low_pct: 4.0
     momentum_good_high_pct: 30.0
-    momentum_overheated_pct: 60.0
-    volume_ok_sol: 10.0
+    momentum_overheated_pct: 55.0
+    volume_ok_sol: 12.0
+    smart_wallet_3plus_min: 4
+    smart_wallet_1plus_min: 1
     bundle_similar_ratio: 0.7
     bundle_identical_ratio: 0.5
     # Legacy default 0.05 (V2 used 0.10 for similar-cluster sensitivity).

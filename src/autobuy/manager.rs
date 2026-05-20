@@ -257,7 +257,7 @@ impl Default for SmartBuyConfig {
             time_kill_vel_flat: default_time_kill_vel_flat(),
             time_kill_early_green_pct: default_time_kill_early_green_pct(),
             time_kill_peak_dd_for_weak: default_time_kill_peak_dd_weak(),
-            trailing_stop_drawdown_pct: 30.0, // exit if mcap drops 30% from peak
+            trailing_stop_drawdown_pct: 26.0, // exit if mcap drops 26% from peak
             fill_mcap_abort_enabled: default_fill_mcap_abort_enabled(),
             fill_mcap_abort_max_ratio: default_fill_mcap_abort_max_ratio(),
         }

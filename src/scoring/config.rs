@@ -68,7 +68,7 @@ impl Default for ScoringConfig {
             buyer_velocity_slices: default_buyer_velocity_slices(),
             a_plus_threshold: default_a_plus(),
             a_threshold: default_a(),
-            require_momentum_good: false,
+            require_momentum_good: true,
             minimum_tier_for_buy: MinBuyTier::A,
             legacy_scoring: false,
             weights: ScoringWeights::default(),
@@ -132,7 +132,7 @@ impl Default for ScoringWeights {
             dev_ranker_a_plus: 3,
             dev_ranker_a: 1,
             dev_ranker_bad: -3,
-            smart_wallets_3plus: 3,
+            smart_wallets_3plus: 4,
             smart_wallets_1plus: 1,
             buyers_10plus: 2,
             buyers_6plus: 1,
@@ -209,12 +209,12 @@ impl Default for FeatureThresholds {
             dev_strong_min_pnl_pct: 20.0,
             buyers_high: 10,
             buyers_mid: 6,
-            buyers_low: 3,
-            buy_to_sell_high: 1.5,
+            buyers_low: 4,
+            buy_to_sell_high: 1.7,
             momentum_good_low_pct: 12.0,
             momentum_good_high_pct: 30.0,
-            momentum_overheated_pct: 60.0,
-            volume_ok_sol: 10.0,
+            momentum_overheated_pct: 55.0,
+            volume_ok_sol: 12.0,
             bundle_similar_ratio: 0.7,
             bundle_identical_ratio: 0.5,
             // Wider default so near-identical bundle sizes count toward `similar_size_ratio`.
@@ -226,7 +226,7 @@ impl Default for FeatureThresholds {
 }
 
 fn default_smart_wallet_3plus_min() -> u32 {
-    3
+    4
 }
 fn default_smart_wallet_1plus_min() -> u32 {
     1
