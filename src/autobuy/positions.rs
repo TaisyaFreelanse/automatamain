@@ -1,7 +1,7 @@
 use solana_address::Address;
 
 use crate::{
-    autobuy::open_reason::OpenReason,
+    autobuy::{exit_engine::ExitProfile, open_reason::OpenReason},
     generalize::general_pool::Pool,
     helper::Amount,
     learning::LearningTradeSnapshot,
@@ -51,6 +51,12 @@ pub struct Position {
     /// Last adaptive time-kill tier label: weak | neutral | strong | fixed.
     pub last_time_kill_tier: String,
     pub last_time_kill_after_secs: u64,
+    // --- Exit Engine V4 -------------------------------------------------------
+    pub exit_profile: ExitProfile,
+    pub hold_mode: bool,
+    pub live_score: i32,
+    pub live_prev_velocity: f64,
+    pub last_live_score_at: u64,
 }
 
 impl Position {
@@ -99,6 +105,11 @@ impl Position {
             tk_prev_mcap: 0.0,
             last_time_kill_tier: String::new(),
             last_time_kill_after_secs: 0,
+            exit_profile: ExitProfile::Neutral,
+            hold_mode: false,
+            live_score: 0,
+            live_prev_velocity: 0.0,
+            last_live_score_at: 0,
         }
     }
 

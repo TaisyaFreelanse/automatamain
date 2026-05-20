@@ -1,6 +1,11 @@
 use crate::{
     autobuy::{
         broker::{Broker, BuyReceipt},
+        exit_engine::{
+            adaptive_trailing, build_live_metrics, calculate_live_score,
+            momentum_decay_detected, resolve_entry_profile, ExitEngineV4Config, ExitProfile,
+            TkEntryThresholds,
+        },
         positions::Position,
     },
     generalize::general_pool::Pool,
@@ -210,6 +215,9 @@ pub struct SmartBuyConfig {
     /// Max allowed `fill_mcap / score_mcap` (e.g. 1.5 = abort if fill is 50%+ above score).
     #[serde(default = "default_fill_mcap_abort_max_ratio")]
     pub fill_mcap_abort_max_ratio: f64,
+    /// Adaptive Exit Engine V4 (profiles, live score, hold/runner, adaptive trailing).
+    #[serde(default)]
+    pub exit_v4: ExitEngineV4Config,
 }
 
 fn default_fill_mcap_abort_enabled() -> bool {
@@ -260,6 +268,7 @@ impl Default for SmartBuyConfig {
             trailing_stop_drawdown_pct: 26.0, // exit if mcap drops 26% from peak
             fill_mcap_abort_enabled: default_fill_mcap_abort_enabled(),
             fill_mcap_abort_max_ratio: default_fill_mcap_abort_max_ratio(),
+            exit_v4: ExitEngineV4Config::default(),
         }
     }
 }
@@ -659,6 +668,27 @@ impl PositionManagerActor {
                     position.tk_entry_buyers = tk_b;
                     position.tk_entry_smart = tk_s;
                     position.tk_entry_b2s = tk_b2s;
+                    let snap_ref = learning_snapshot.as_ref();
+                    if self.config.exit_v4.enabled {
+                        let tk = TkEntryThresholds {
+                            strong_min_buyers: self.config.time_kill_strong_min_buyers,
+                            strong_min_b2s: self.config.time_kill_strong_min_b2s,
+                            weak_max_buyers: self.config.time_kill_weak_max_buyers,
+                            weak_max_b2s: self.config.time_kill_weak_max_b2s,
+                        };
+                        let (profile, hold) = resolve_entry_profile(
+                            tk,
+                            &self.config.exit_v4,
+                            &position,
+                            snap_ref,
+                        );
+                        position.exit_profile = profile;
+                        position.hold_mode = hold;
+                        eprintln!(
+                            "[EXIT V4] {mint} profile={} hold={hold}",
+                            profile.as_str()
+                        );
+                    }
                     position.learning_snapshot = learning_snapshot;
                     position.open_reason = Some(open_reason.clone());
                     let enter_mcap = position.enter_mcap.to_float();
@@ -1178,6 +1208,10 @@ impl PositionManagerActor {
             .unwrap()
             .as_secs();
 
+        let v4_enabled = self.config.exit_v4.enabled;
+        let v4_cfg = self.config.exit_v4.clone();
+        let global_cfg = self.config.clone();
+
         let mut actions: Vec<(solana_address::Address, f64, String)> = Vec::new();
 
         for (mint, pos) in self.positions.iter_mut() {
@@ -1194,12 +1228,57 @@ impl PositionManagerActor {
             pos.time_kill_note_mcap_sample(current_time, current_mcap);
 
             let profit = pos.pnl();
+            let enter_mcap = pos.enter_mcap.to_float();
+            let vel = pos.time_kill_mcap_velocity_pct_per_sec(enter_mcap);
+
+            if v4_enabled
+                && current_time.saturating_sub(pos.last_live_score_at)
+                    >= v4_cfg.live_score_refresh_secs
+            {
+                let snap = pos.learning_snapshot.as_ref();
+                let metrics = build_live_metrics(pos, vel, profit, snap);
+                pos.live_score = calculate_live_score(&metrics);
+                pos.live_prev_velocity = vel;
+                pos.last_live_score_at = current_time;
+            }
 
             let held_secs = current_time.saturating_sub(pos.entry_time);
             let (kill_after_secs, tk_tier) =
-                Self::time_kill_window_profile(&self.config, pos, profit, current_mcap, held_secs);
+                Self::time_kill_window_profile(&global_cfg, pos, profit, current_mcap, held_secs);
             pos.last_time_kill_tier = tk_tier.to_string();
             pos.last_time_kill_after_secs = kill_after_secs;
+
+            let tp_cfg = if v4_enabled {
+                v4_cfg.profile_params(pos.exit_profile).clone()
+            } else {
+                crate::autobuy::exit_engine::ExitTpProfile {
+                    tp1_pct: global_cfg.tp1_pct,
+                    tp1_sell_pct: global_cfg.tp1_sell_pct,
+                    tp2_pct: global_cfg.tp2_pct,
+                    tp2_sell_pct: global_cfg.tp2_sell_pct,
+                    tp3_pct: global_cfg.tp3_pct,
+                    tp3_sell_pct: global_cfg.tp3_sell_pct,
+                    tp4_pct: global_cfg.tp4_pct,
+                    tp4_sell_pct: global_cfg.tp4_sell_pct,
+                    tp5_pct: global_cfg.tp5_pct,
+                    tp5_sell_pct: global_cfg.tp5_sell_pct,
+                    trailing_stop_drawdown_pct: global_cfg.trailing_stop_drawdown_pct,
+                    trailing_activate_profit_pct: 80.0,
+                    trailing_floor_profit_pct: 35.0,
+                    smart_stop_activate_profit_pct: 50.0,
+                    smart_stop_floor_profit_pct: 5.0,
+                }
+            };
+
+            let trailing_drawdown_pct = if v4_enabled {
+                adaptive_trailing(
+                    tp_cfg.trailing_stop_drawdown_pct,
+                    pos.live_score,
+                    profit,
+                )
+            } else {
+                tp_cfg.trailing_stop_drawdown_pct
+            };
 
             let _ = self.event_tx.try_send(WsFeedMessage::PositionUpdate {
                 address: mint.to_string(),
@@ -1210,9 +1289,33 @@ impl PositionManagerActor {
                 time_kill_after_secs: Some(pos.last_time_kill_after_secs),
             });
 
+            // --- 0. Phase 2: momentum decay full exit ---
+            if v4_cfg.momentum_decay_exit_enabled {
+                let sell_p = pos
+                    .learning_snapshot
+                    .as_ref()
+                    .map(|s| s.sell_pressure_score)
+                    .unwrap_or(0.0);
+                if momentum_decay_detected(vel, pos.live_prev_velocity, sell_p, vel) {
+                    pos.is_closing = true;
+                    actions.push((*mint, 100.0, "MOMENTUM DECAY".to_string()));
+                    continue;
+                }
+            }
+
             // --- 1. Time Kill (adaptive window: weak 20–25s, strong 45–70s) ---
-            if current_time >= pos.entry_time + kill_after_secs
-                && profit < self.config.time_kill_min_profit_pct
+            let mut skip_time_kill = false;
+            if v4_enabled
+                && (pos.exit_profile == ExitProfile::Strong
+                    || pos.exit_profile == ExitProfile::Runner)
+                && (pos.tp1_triggered || pos.tp2_triggered)
+                && profit >= v4_cfg.strong_time_kill_min_profit_after_tp
+            {
+                skip_time_kill = true;
+            }
+            if !skip_time_kill
+                && current_time >= pos.entry_time + kill_after_secs
+                && profit < global_cfg.time_kill_min_profit_pct
             {
                 pos.is_closing = true;
                 actions.push((*mint, 100.0, "TIME KILL".to_string()));
@@ -1240,32 +1343,33 @@ impl PositionManagerActor {
                 continue;
             }
 
-            // --- 4. Trailing Stop ---
+            // --- 4. Trailing Stop (V4: adaptive drawdown %) ---
             if pos.trailing_active {
-                // FIX Bug 3: use config-driven drawdown percentage, not hardcoded 0.70.
-                let keep_fraction = 1.0 - self.config.trailing_stop_drawdown_pct / 100.0;
+                let keep_fraction = 1.0 - trailing_drawdown_pct / 100.0;
                 let trailing_stop_mcap = pos.highest_mcap * keep_fraction;
                 if current_mcap <= trailing_stop_mcap {
                     pos.is_closing = true;
-                    actions.push((*mint, 100.0, "TRAILING EXIT".to_string()));
+                    let reason = if v4_enabled {
+                        format!("TRAILING EXIT ({:.0}% trail)", trailing_drawdown_pct)
+                    } else {
+                        "TRAILING EXIT".to_string()
+                    };
+                    actions.push((*mint, 100.0, reason));
                     continue;
                 }
             }
 
-            // --- Profit-protection level upgrades ---
-            if profit >= 80.0 {
+            // --- Profit-protection level upgrades (profile-aware) ---
+            if profit >= tp_cfg.trailing_activate_profit_pct {
                 if !pos.trailing_active {
                     pos.trailing_active = true;
-                    // Raise floor: do not give back more than 35 % from peak.
-                    // FIX Bug 4: positive floor value is intentional here — it means
-                    // "exit if profit drops below +35%", consistent with the unified
-                    // convention used in the stop-loss check above.
-                    pos.exit_profit_floor = 35.0;
+                    pos.exit_profit_floor = tp_cfg.trailing_floor_profit_pct;
                 }
-            } else if profit >= 50.0
-                && pos.exit_profit_floor < 5.0 {
-                    pos.exit_profit_floor = 5.0; // Smart Stop: lock in at least +5%
-                }
+            } else if profit >= tp_cfg.smart_stop_activate_profit_pct
+                && pos.exit_profit_floor < tp_cfg.smart_stop_floor_profit_pct
+            {
+                pos.exit_profit_floor = tp_cfg.smart_stop_floor_profit_pct;
+            }
 
             // FIX Bug 5: only queue one partial sell at a time.
             // If a partial sell is already in-flight, skip TP checks this tick.
@@ -1275,38 +1379,66 @@ impl PositionManagerActor {
 
             // FIX Bug 1: check TP1 before TP2 so they fire in the correct order.
             // Both cannot be queued simultaneously thanks to the flag above.
-            if profit >= self.config.tp1_pct && !pos.tp1_triggered {
+            let tp_label = |n: u8, pct: f64| {
+                if v4_enabled {
+                    format!("TP{n} ({:.0}%) [{}]", pct, pos.exit_profile.as_str())
+                } else {
+                    format!("TP{n}")
+                }
+            };
+
+            if profit >= tp_cfg.tp1_pct && !pos.tp1_triggered {
                 pos.tp1_triggered = true;
                 pos.pending_partial_sell = true;
-                actions.push((*mint, self.config.tp1_sell_pct, "TP1".to_string()));
-                continue; // don't evaluate TP2 until TP1 ExecuteSell clears the flag
+                actions.push((
+                    *mint,
+                    tp_cfg.tp1_sell_pct,
+                    tp_label(1, tp_cfg.tp1_pct),
+                ));
+                continue;
             }
 
-            if profit >= self.config.tp2_pct && !pos.tp2_triggered {
+            if profit >= tp_cfg.tp2_pct && !pos.tp2_triggered {
                 pos.tp2_triggered = true;
                 pos.pending_partial_sell = true;
-                actions.push((*mint, self.config.tp2_sell_pct, "TP2".to_string()));
+                actions.push((
+                    *mint,
+                    tp_cfg.tp2_sell_pct,
+                    tp_label(2, tp_cfg.tp2_pct),
+                ));
                 continue;
             }
 
-            if profit >= self.config.tp3_pct && !pos.tp3_triggered {
+            if profit >= tp_cfg.tp3_pct && !pos.tp3_triggered {
                 pos.tp3_triggered = true;
                 pos.pending_partial_sell = true;
-                actions.push((*mint, self.config.tp3_sell_pct, "TP3 +100%".to_string()));
+                actions.push((
+                    *mint,
+                    tp_cfg.tp3_sell_pct,
+                    tp_label(3, tp_cfg.tp3_pct),
+                ));
                 continue;
             }
 
-            if profit >= self.config.tp4_pct && !pos.tp4_triggered {
+            if profit >= tp_cfg.tp4_pct && !pos.tp4_triggered {
                 pos.tp4_triggered = true;
                 pos.pending_partial_sell = true;
-                actions.push((*mint, self.config.tp4_sell_pct, "TP4 +150%".to_string()));
+                actions.push((
+                    *mint,
+                    tp_cfg.tp4_sell_pct,
+                    tp_label(4, tp_cfg.tp4_pct),
+                ));
                 continue;
             }
 
-            if profit >= self.config.tp5_pct && !pos.tp5_triggered {
+            if profit >= tp_cfg.tp5_pct && !pos.tp5_triggered {
                 pos.tp5_triggered = true;
                 pos.pending_partial_sell = true;
-                actions.push((*mint, self.config.tp5_sell_pct, "TP5 +200%".to_string()));
+                actions.push((
+                    *mint,
+                    tp_cfg.tp5_sell_pct,
+                    tp_label(5, tp_cfg.tp5_pct),
+                ));
             }
         }
 
