@@ -1,6 +1,7 @@
 use solana_address::Address;
 
 use crate::{
+    autobuy::open_reason::OpenReason,
     generalize::general_pool::Pool,
     helper::Amount,
     learning::LearningTradeSnapshot,
@@ -37,6 +38,8 @@ pub struct Position {
     pub early_buyers: Vec<Address>,
     /// Self-learning: scoring-time feature snapshot (logged on full close).
     pub learning_snapshot: Option<LearningTradeSnapshot>,
+    /// Why the position was opened (dashboard OPEN / HTTP snapshot).
+    pub open_reason: Option<OpenReason>,
     // --- Adaptive time-kill (V3): entry snapshot + short mcap derivative ----------
     pub tk_entry_buyers: u64,
     pub tk_entry_smart: u32,
@@ -86,6 +89,7 @@ impl Position {
             dev_address: None,
             early_buyers: Vec::new(),
             learning_snapshot: None,
+            open_reason: None,
             tk_entry_buyers: 0,
             tk_entry_smart: 0,
             tk_entry_b2s: 0.0,

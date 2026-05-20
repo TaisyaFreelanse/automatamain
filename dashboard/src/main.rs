@@ -88,6 +88,23 @@ pub struct V3TapeWire {
     pub sm_exits: u32,
 }
 
+/// Mirrors backend `OpenPositionWire` (`GET /positions`).
+#[derive(Deserialize, Clone, Debug)]
+pub struct OpenPositionWire {
+    pub address: String,
+    pub open_reason: OpenReason,
+    pub enter_mcap: f64,
+    pub pnl: f64,
+    pub holdings: f64,
+    pub market_cap: f64,
+    #[serde(default)]
+    pub v3_tape: Option<V3TapeWire>,
+    #[serde(default)]
+    pub time_kill_tier: Option<String>,
+    #[serde(default)]
+    pub time_kill_after_secs: Option<u64>,
+}
+
 #[derive(Deserialize, Clone, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsMsg {
@@ -221,6 +238,7 @@ enum DashCmd {
     SetBuySize(f64),
     FetchMode,
     FetchTxLog,
+    FetchOpenPositions,
     /// Switch broker mode. `confirm_live` must be true to switch to live;
     /// the dashboard enforces this via a two-step typed confirmation.
     SetMode { mode: String, confirm_live: bool },
@@ -257,6 +275,7 @@ enum AppEvent {
         restart_required: bool,
     },
     ModeSetErr(String),
+    OpenPositions(Vec<OpenPositionWire>),
 }
 
 // ── Positions ─────────────────────────────────────────────────────────────────
@@ -398,6 +417,31 @@ impl Dashboard {
         }
     }
 
+    fn wire_to_position(w: OpenPositionWire) -> Position {
+        Position {
+            address: w.address,
+            open_reason: w.open_reason,
+            pnl: w.pnl,
+            holdings: w.holdings,
+            market_cap: w.market_cap,
+            enter_mcap: w.enter_mcap,
+            v3_tape: w.v3_tape,
+            time_kill_tier: w.time_kill_tier,
+            time_kill_after_secs: w.time_kill_after_secs,
+        }
+    }
+
+    /// Authoritative restore from `GET /positions` (survives GUI restart / WS gaps).
+    fn apply_open_positions(&mut self, rows: Vec<OpenPositionWire>) {
+        let live: std::collections::HashSet<String> =
+            rows.iter().map(|w| w.address.clone()).collect();
+        self.open.retain(|k, _| live.contains(k));
+        for w in rows {
+            self.open
+                .insert(w.address.clone(), Self::wire_to_position(w));
+        }
+    }
+
     fn drain_events(&mut self) {
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
@@ -468,6 +512,7 @@ impl Dashboard {
                         self.chart_window = Some((mint, d));
                     }
                 }
+                AppEvent::OpenPositions(rows) => self.apply_open_positions(rows),
                 AppEvent::Msg(msg) => match msg {
                     WsMsg::PositionOpen {
                         address,
@@ -1112,6 +1157,7 @@ impl eframe::App for Dashboard {
         if should_poll {
             let _ = self.cmd_tx.try_send(DashCmd::FetchMode);
             let _ = self.cmd_tx.try_send(DashCmd::FetchTxLog);
+            let _ = self.cmd_tx.try_send(DashCmd::FetchOpenPositions);
             self.last_http_poll = Some(std::time::Instant::now());
         }
 
@@ -1768,6 +1814,8 @@ async fn ws_loop(
                     });
                 }
 
+                fetch_open_positions_http(&http_url, &tx, &ctx);
+
                 let (mut sink, mut stream) = ws.split();
                 loop {
                     tokio::select! {
@@ -1775,6 +1823,10 @@ async fn ws_loop(
                             match msg {
                                 Some(Ok(Message::Text(text))) => {
                                     if let Ok(parsed) = serde_json::from_str::<WsMsg>(&text) {
+                                        if let WsMsg::PositionOpen { .. } = &parsed {
+                                            // WS broadcast is lossy on reconnect; refresh OPEN from HTTP.
+                                            fetch_open_positions_http(&http_url, &tx, &ctx);
+                                        }
                                         if let WsMsg::PositionClose { .. } = &parsed {
                                             let url = format!("{}/bot-trades", http_url);
                                             let tx2 = tx.clone(); let ctx2 = ctx.clone();
@@ -1790,6 +1842,12 @@ async fn ws_loop(
                                         }
                                         let _ = tx.send(AppEvent::Msg(parsed));
                                         ctx.request_repaint();
+                                    } else {
+                                        eprintln!(
+                                            "[dashboard] WS JSON parse failed ({} bytes): {}",
+                                            text.len(),
+                                            &text[..text.len().min(200)]
+                                        );
                                     }
                                 }
                                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
@@ -1893,6 +1951,14 @@ async fn ws_loop(
                                             }
                                     });
                                 }
+                                Some(DashCmd::FetchOpenPositions) => {
+                                    let url = http_url.clone();
+                                    let tx2 = tx.clone();
+                                    let ctx2 = ctx.clone();
+                                    tokio::spawn(async move {
+                                        fetch_open_positions_http(&url, &tx2, &ctx2);
+                                    });
+                                }
                                 Some(DashCmd::SetMode { mode, confirm_live }) => {
                                     let url = format!("{}/mode", http_url);
                                     let tx2 = tx.clone(); let ctx2 = ctx.clone();
@@ -1941,6 +2007,32 @@ async fn ws_loop(
 }
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
+
+fn fetch_open_positions_http(
+    http_url: &str,
+    tx: &mpsc::SyncSender<AppEvent>,
+    ctx: &egui::Context,
+) {
+    let url = format!("{}/positions", http_url);
+    let tx = tx.clone();
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        match reqwest::get(&url).await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(rows) = resp.json::<Vec<OpenPositionWire>>().await {
+                    let _ = tx.send(AppEvent::OpenPositions(rows));
+                    ctx.request_repaint();
+                } else {
+                    eprintln!("[dashboard] GET /positions: JSON decode failed");
+                }
+            }
+            Ok(resp) => {
+                eprintln!("[dashboard] GET /positions: HTTP {}", resp.status());
+            }
+            Err(e) => eprintln!("[dashboard] GET /positions: {e}"),
+        }
+    });
+}
 
 async fn fetch_buy_size(url: &str, tx: &mpsc::SyncSender<AppEvent>, ctx: &egui::Context) {
     #[derive(Deserialize)]

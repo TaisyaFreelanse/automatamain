@@ -8,7 +8,6 @@ use crate::{
     learning::{LearningLogPg, LearningTradeSnapshot},
     persistence::{
         bot_trades::{BotTradeEntry, BotTradeRepository},
-        creators::CreatorStatistics,
     },
     scoring::{
         config::StrategyConfig,
@@ -265,13 +264,23 @@ impl Default for SmartBuyConfig {
     }
 }
 
-// --- ПРИЧИНА ОТКРЫТИЯ ---
+pub use crate::autobuy::open_reason::OpenReason;
 
+/// HTTP/WS snapshot of one open position (dashboard restore on reconnect).
 #[derive(Serialize, Clone, Debug)]
-#[serde(tag = "source", rename_all = "snake_case")]
-pub enum OpenReason {
-    DevStats(CreatorStatistics),
-    TraderStats,
+pub struct OpenPositionWire {
+    pub address: String,
+    pub open_reason: OpenReason,
+    pub enter_mcap: f64,
+    pub pnl: f64,
+    pub holdings: f64,
+    pub market_cap: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub v3_tape: Option<V3TapeWire>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_kill_tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_kill_after_secs: Option<u64>,
 }
 
 // --- СООБЩЕНИЯ ---
@@ -316,6 +325,10 @@ pub enum PositionMessage {
     GetPnl {
         mint: solana_address::Address,
         responder: tokio::sync::oneshot::Sender<Option<f64>>,
+    },
+    /// Snapshot of all open positions (dashboard HTTP restore).
+    GetOpenPositions {
+        responder: tokio::sync::oneshot::Sender<Vec<OpenPositionWire>>,
     },
     /// Operator: drop a position from manager + broker caches without on-chain
     /// sell (stuck ghost / manual unwind elsewhere). Emits `PositionClose` so
@@ -647,6 +660,7 @@ impl PositionManagerActor {
                     position.tk_entry_smart = tk_s;
                     position.tk_entry_b2s = tk_b2s;
                     position.learning_snapshot = learning_snapshot;
+                    position.open_reason = Some(open_reason.clone());
                     let enter_mcap = position.enter_mcap.to_float();
                     let mcap_src = if receipt.entry_mcap_fill_sol.is_some() {
                         "on-chain fill"
@@ -911,6 +925,41 @@ impl PositionManagerActor {
 
                     // The send fails if the receiver was dropped, which we can safely ignore
                     let _ = responder.send(pnl);
+                }
+
+                PositionMessage::GetOpenPositions { responder } => {
+                    let snapshot: Vec<OpenPositionWire> = self
+                        .positions
+                        .iter()
+                        .filter_map(|(mint, pos)| {
+                            let open_reason = pos.open_reason.clone()?;
+                            let enter_mcap = pos.enter_mcap.to_float();
+                            let market_cap = pos.pool.market_cap().amount().to_float();
+                            Some(OpenPositionWire {
+                                address: mint.to_string(),
+                                open_reason,
+                                enter_mcap,
+                                pnl: pos.pnl(),
+                                holdings: pos.holdings.to_float(),
+                                market_cap,
+                                v3_tape: pos
+                                    .learning_snapshot
+                                    .as_ref()
+                                    .map(V3TapeWire::from_learning),
+                                time_kill_tier: if pos.last_time_kill_tier.is_empty() {
+                                    None
+                                } else {
+                                    Some(pos.last_time_kill_tier.clone())
+                                },
+                                time_kill_after_secs: if pos.last_time_kill_after_secs == 0 {
+                                    None
+                                } else {
+                                    Some(pos.last_time_kill_after_secs)
+                                },
+                            })
+                        })
+                        .collect();
+                    let _ = responder.send(snapshot);
                 }
             }
         }
@@ -1429,6 +1478,18 @@ impl PositionManagerHandler {
             .await;
 
         resp_rx.await.unwrap_or(None)
+    }
+
+    /// All open positions (for dashboard HTTP restore after WS reconnect).
+    pub async fn get_open_positions(&self) -> Vec<OpenPositionWire> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let _ = self
+            .tx
+            .send(PositionMessage::GetOpenPositions {
+                responder: resp_tx,
+            })
+            .await;
+        resp_rx.await.unwrap_or_default()
     }
 }
 

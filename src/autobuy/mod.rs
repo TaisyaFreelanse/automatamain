@@ -4,6 +4,7 @@ pub mod execution;
 pub mod filters;
 pub mod jupiter_sell;
 pub mod manager;
+pub mod open_reason;
 pub mod performance_tracker;
 pub mod positions;
 pub mod pump_brocker;

@@ -4,7 +4,10 @@ use loggaper::{
     autobuy::{
         broker::Broker,
         execution::{build_broker, ExecutionMode},
-        manager::{OpenReason, PositionManagerActor, PositionMessage, WsCommand, WsFeedMessage},
+        manager::{
+            OpenPositionWire, OpenReason, PositionManagerActor, PositionMessage, WsCommand,
+            WsFeedMessage,
+        },
         performance_tracker::{CreatorRegistryHandle, PerformanceTrackerHandle},
     },
     feed::metrics::{BotMetrics, BotSnapshot, FeedMetrics, FeedSnapshot, new_dedup},
@@ -584,6 +587,20 @@ async fn main() {
             Json(snapshot)
         }
 
+        async fn get_open_positions(State(state): State<ApiState>) -> impl IntoResponse {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if state
+                .manager_tx
+                .send(PositionMessage::GetOpenPositions { responder: tx })
+                .await
+                .is_err()
+            {
+                return Json(Vec::<OpenPositionWire>::new()).into_response();
+            }
+            let rows = rx.await.unwrap_or_default();
+            Json(rows).into_response()
+        }
+
         async fn get_mode(State(state): State<ApiState>) -> impl IntoResponse {
             #[derive(serde::Serialize)]
             struct ModeResponse {
@@ -767,6 +784,7 @@ async fn main() {
             .route("/metrics", get(get_metrics))
             .route("/tx-log", get(get_tx_log))
             .route("/mode", get(get_mode).put(put_mode))
+            .route("/positions", get(get_open_positions))
             .route("/positions/abandon", post(post_positions_abandon))
             .with_state(api_state);
 
