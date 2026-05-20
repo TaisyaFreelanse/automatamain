@@ -48,6 +48,9 @@ buy_config:
   time_kill_early_green_pct: 8.0
   time_kill_peak_dd_for_weak: 0.055
   trailing_stop_drawdown_pct: 30.0
+  # After buy: if on-chain post-fill mcap > score_mcap * ratio, sell immediately (no OPEN).
+  fill_mcap_abort_enabled: true
+  fill_mcap_abort_max_ratio: 1.5
 
 # Score Engine A+/A/SKIP. The bot computes a combined score from dev quality,
 # liquidity, buyers, momentum, volume, smart wallets, and anti-bundle signals

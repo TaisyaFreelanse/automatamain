@@ -1,6 +1,6 @@
 use crate::{
     autobuy::{
-        broker::Broker,
+        broker::{Broker, BuyReceipt},
         positions::Position,
     },
     generalize::general_pool::Pool,
@@ -204,6 +204,29 @@ pub struct SmartBuyConfig {
     pub time_kill_peak_dd_for_weak: f64,
     /// Trailing stop: how far (%) below the peak mcap before we exit
     pub trailing_stop_drawdown_pct: f64,
+    /// When true, immediately sell after buy if on-chain post-fill mcap exceeds
+    /// score-time mcap by more than [`Self::fill_mcap_abort_max_ratio`].
+    #[serde(default = "default_fill_mcap_abort_enabled")]
+    pub fill_mcap_abort_enabled: bool,
+    /// Max allowed `fill_mcap / score_mcap` (e.g. 1.5 = abort if fill is 50%+ above score).
+    #[serde(default = "default_fill_mcap_abort_max_ratio")]
+    pub fill_mcap_abort_max_ratio: f64,
+}
+
+fn default_fill_mcap_abort_enabled() -> bool {
+    true
+}
+
+fn default_fill_mcap_abort_max_ratio() -> f64 {
+    1.5
+}
+
+/// Score-time vs post-fill mcap comparison for spike abort.
+struct FillMcapSpike {
+    score_mcap_sol: f64,
+    fill_mcap_sol: f64,
+    ratio: f64,
+    max_ratio: f64,
 }
 
 impl Default for SmartBuyConfig {
@@ -236,6 +259,8 @@ impl Default for SmartBuyConfig {
             time_kill_early_green_pct: default_time_kill_early_green_pct(),
             time_kill_peak_dd_for_weak: default_time_kill_peak_dd_weak(),
             trailing_stop_drawdown_pct: 30.0, // exit if mcap drops 30% from peak
+            fill_mcap_abort_enabled: default_fill_mcap_abort_enabled(),
+            fill_mcap_abort_max_ratio: default_fill_mcap_abort_max_ratio(),
         }
     }
 }
@@ -574,6 +599,32 @@ impl PositionManagerActor {
                         .unwrap()
                         .as_secs();
 
+                    if let Some(spike) = Self::detect_fill_mcap_spike(
+                        &self.config,
+                        learning_snapshot.as_ref(),
+                        &receipt,
+                    ) {
+                        if self
+                            .abort_buy_after_fill_mcap_spike(
+                                mint,
+                                amount_sol,
+                                &receipt,
+                                latest_pool.as_ref(),
+                                &spike,
+                                learning_snapshot.as_ref(),
+                                dev_address,
+                                current_time,
+                            )
+                            .await
+                        {
+                            continue;
+                        }
+                        eprintln!(
+                            "[BUY ABORT] {mint}: fill mcap spike detected but emergency \
+                             sell failed — opening position anyway (manual review advised)"
+                        );
+                    }
+
                     let tokens = Amount::from_float_native(receipt.tokens_received);
                     let mut position = Position::new(
                         latest_pool,
@@ -861,6 +912,145 @@ impl PositionManagerActor {
                     // The send fails if the receiver was dropped, which we can safely ignore
                     let _ = responder.send(pnl);
                 }
+            }
+        }
+    }
+
+    /// Post-fill bonding-curve mcap vs score-time mcap (`LearningTradeSnapshot::entry_mcap_sol`).
+    fn detect_fill_mcap_spike(
+        cfg: &SmartBuyConfig,
+        snapshot: Option<&LearningTradeSnapshot>,
+        receipt: &BuyReceipt,
+    ) -> Option<FillMcapSpike> {
+        if !cfg.fill_mcap_abort_enabled {
+            return None;
+        }
+        let snap = snapshot?;
+        let score_mcap = snap.entry_mcap_sol;
+        if score_mcap <= 0.0 {
+            return None;
+        }
+        // Require RPC post-fill mcap so we compare apples-to-apples with the spike
+        // during our own buy (not a stale WS tick).
+        let fill_mcap = receipt.entry_mcap_fill_sol.filter(|m| *m > 0.0)?;
+        let ratio = fill_mcap / score_mcap;
+        let max_ratio = cfg.fill_mcap_abort_max_ratio.max(1.0);
+        if ratio > max_ratio {
+            Some(FillMcapSpike {
+                score_mcap_sol: score_mcap,
+                fill_mcap_sol: fill_mcap,
+                ratio,
+                max_ratio,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Immediate 100% sell after a fill-time mcap spike. Returns `true` if the
+    /// position was **not** opened (abort succeeded or we gave up after sell).
+    async fn abort_buy_after_fill_mcap_spike(
+        &mut self,
+        mint: Address,
+        amount_sol: f64,
+        receipt: &BuyReceipt,
+        pool: &dyn Pool,
+        spike: &FillMcapSpike,
+        learning_snapshot: Option<&LearningTradeSnapshot>,
+        dev_address: Option<Address>,
+        now: u64,
+    ) -> bool {
+        let reason = format!(
+            "FILL MCAP SPIKE ABORT ({:.2}x > {:.2}x: {:.1}→{:.1} SOL)",
+            spike.ratio,
+            spike.max_ratio,
+            spike.score_mcap_sol,
+            spike.fill_mcap_sol,
+        );
+
+        eprintln!("[BUY ABORT] {mint}: {reason}");
+
+        if let Some(log) = self.learning.as_ref() {
+            let log = log.clone();
+            let mint_s = mint.to_string();
+            let dev_s = dev_address.map(|d| d.to_string());
+            let payload = json!({
+                "score_mcap_sol": spike.score_mcap_sol,
+                "fill_mcap_sol": spike.fill_mcap_sol,
+                "ratio": spike.ratio,
+                "max_ratio": spike.max_ratio,
+                "spent_sol": amount_sol,
+            });
+            let stage = "post_buy";
+            let reason_short = "fill_mcap_spike";
+            tokio::spawn(async move {
+                if let Err(e) = log
+                    .log_skipped(&mint_s, dev_s.as_deref(), stage, reason_short, payload, now as i64)
+                    .await
+                {
+                    eprintln!("[LEARNING] log_skipped fill_mcap_spike: {e}");
+                }
+            });
+        }
+
+        let sell_qty = receipt.tokens_received;
+        match self
+            .broker
+            .sell(mint, sell_qty, pool, true)
+            .await
+        {
+            Ok(r) => {
+                let _ = self.event_tx.try_send(WsFeedMessage::TxEvent {
+                    kind: TxEventKind::Sell,
+                    mint: mint.to_string(),
+                    signature: r.signature.clone(),
+                    amount_sol: r.sol_received_actual,
+                    amount_sol_estimated: Some(r.sol_received_estimated),
+                    status: "confirmed".into(),
+                    reason: Some(reason.clone()),
+                    mode: self.broker.mode_label().to_string(),
+                    ts: now_secs(),
+                    v3_tape: None,
+                    time_kill_detail: None,
+                });
+
+                let pnl_sol = r.sol_received_actual - amount_sol;
+                let pnl_pct = if amount_sol > 0.0 {
+                    (r.sol_received_actual / amount_sol - 1.0) * 100.0
+                } else {
+                    0.0
+                };
+                self.strategy.note_position_opened();
+                self.strategy.note_position_closed(pnl_sol);
+
+                if let Ok(bal) = self.broker.balance_sol().await {
+                    self.balance_state.store(bal.to_bits(), Ordering::Relaxed);
+                    let _ = self.event_tx.try_send(WsFeedMessage::BalanceUpdate { balance: bal });
+                }
+
+                let exit_mcap_sol = pool.market_cap().amount().to_float();
+                let entry = BotTradeEntry {
+                    mint: mint.to_string(),
+                    entry_mcap_sol: spike.fill_mcap_sol,
+                    invested_sol: amount_sol,
+                    realized_pnl_pct: pnl_pct,
+                    close_reason: reason,
+                    closed_at: now as i64,
+                    exit_mcap_sol,
+                    entry_meta: entry_meta_json(learning_snapshot),
+                };
+                let repo = self.bot_trades.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = repo.save_bot_trade(entry).await {
+                        eprintln!("[BOT TRADE] fill spike abort save failed: {e:?}");
+                    }
+                });
+
+                true
+            }
+            Err(e) => {
+                eprintln!("[BUY ABORT] {mint}: emergency sell failed: {e}");
+                false
             }
         }
     }
