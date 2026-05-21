@@ -3,8 +3,9 @@ use crate::{
         broker::{Broker, BuyReceipt},
         exit_engine::{
             adaptive_moonbag_sell_pct, adaptive_trailing, apply_phase_to_tp,
-            calculate_live_score, live_metrics_from_snapshot, live_metrics_lite,
-            maybe_upgrade_runner, momentum_decay_detected, profit_lock_staircase_floor,
+            calculate_live_score, entry_live_score_floor, in_exit_grace_period,
+            live_metrics_from_snapshot, live_metrics_lite, maybe_upgrade_runner,
+            momentum_decay_detected, profit_lock_staircase_floor,
             resolve_entry_profile, transition_position_phase, ExitEngineV4Config, ExitProfile,
             PositionPhase, TkEntryThresholds,
         },
@@ -508,18 +509,21 @@ impl PositionManagerActor {
                         pos.live_prev_buyers_per_sec = pos.live_buyers_per_sec;
                         pos.live_buyers_per_sec = live.buyers_per_sec;
                         pos.live_prev_velocity = vel;
-                        pos.live_score = calculate_live_score(&metrics);
+                        pos.live_score = calculate_live_score(&metrics)
+                            .max(pos.live_score_entry_floor);
                         pos.last_live_score_at = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap()
                             .as_secs();
-                        pos.exit_phase = transition_position_phase(
-                            pos.exit_phase,
-                            pos.live_score,
-                            metrics.momentum_decay,
-                            profit,
-                            v4,
-                        );
+                        if !in_exit_grace_period(held, v4) {
+                            pos.exit_phase = transition_position_phase(
+                                pos.exit_phase,
+                                pos.live_score,
+                                metrics.momentum_decay,
+                                profit,
+                                v4,
+                            );
+                        }
                         let (profile, hold) = maybe_upgrade_runner(
                             v4,
                             pos.exit_profile,
@@ -768,9 +772,15 @@ impl PositionManagerActor {
                         position.exit_profile = profile;
                         position.hold_mode = hold;
                         position.exit_phase = PositionPhase::Exploration;
+                        position.live_score_entry_floor =
+                            entry_live_score_floor(learning_snapshot.as_ref());
+                        position.live_score = position.live_score_entry_floor;
+                        position.last_live_score_at = current_time;
                         eprintln!(
-                            "[EXIT V4] {mint} profile={} phase=exploration hold={hold}",
-                            profile.as_str()
+                            "[EXIT V4] {mint} profile={} phase=exploration hold={hold} \
+                             live_floor={}",
+                            profile.as_str(),
+                            position.live_score_entry_floor
                         );
                     }
                     if self.bucket_cache.contains_key(&mint) {
@@ -1363,14 +1373,19 @@ impl PositionManagerActor {
             let enter_mcap = pos.enter_mcap.to_float();
             let vel = pos.time_kill_mcap_velocity_pct_per_sec(enter_mcap);
 
+            let held_secs = current_time.saturating_sub(pos.entry_time);
+            let in_grace = v4_enabled && in_exit_grace_period(held_secs, &v4_cfg);
+
             if v4_enabled
+                && !in_grace
                 && current_time.saturating_sub(pos.last_live_score_at)
                     >= v4_cfg.live_score_refresh_secs
                 && pos.live_tape_curr.is_none()
             {
                 let snap = pos.learning_snapshot.as_ref();
                 let metrics = live_metrics_lite(pos, vel, profit, snap, &v4_cfg);
-                pos.live_score = calculate_live_score(&metrics);
+                pos.live_score =
+                    calculate_live_score(&metrics).max(pos.live_score_entry_floor);
                 pos.live_prev_velocity = vel;
                 pos.last_live_score_at = current_time;
                 pos.exit_phase = transition_position_phase(
@@ -1394,7 +1409,6 @@ impl PositionManagerActor {
                 }
             }
 
-            let held_secs = current_time.saturating_sub(pos.entry_time);
             let (kill_after_secs, tk_tier) =
                 Self::time_kill_window_profile(&global_cfg, pos, profit, current_mcap, held_secs);
             pos.last_time_kill_tier = tk_tier.to_string();
@@ -1439,7 +1453,11 @@ impl PositionManagerActor {
             });
 
             // --- 0. Phase 2: momentum decay full exit ---
-            if v4_enabled && v4_cfg.momentum_decay_exit_enabled {
+            if v4_enabled
+                && v4_cfg.momentum_decay_exit_enabled
+                && !in_grace
+                && pos.live_tape_curr.is_some()
+            {
                 let sell_p = pos
                     .learning_snapshot
                     .as_ref()
@@ -1451,7 +1469,8 @@ impl PositionManagerActor {
                     sell_p,
                     vel,
                 )
-                    || pos.exit_phase == PositionPhase::Distribution && pos.live_score <= v4_cfg.phase_distribution_max_score
+                    || pos.exit_phase == PositionPhase::Distribution
+                        && pos.live_score <= v4_cfg.phase_distribution_max_score
                 {
                     pos.is_closing = true;
                     let reason = if pos.exit_phase == PositionPhase::Distribution {

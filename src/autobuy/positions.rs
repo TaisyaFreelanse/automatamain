@@ -64,6 +64,8 @@ pub struct Position {
     pub live_buyers_per_sec: f64,
     pub live_prev_buyers_per_sec: f64,
     pub last_live_score_at: u64,
+    /// Minimum live score from entry snapshot (`score_total / 2`).
+    pub live_score_entry_floor: i32,
     pub peak_profit_pct: f64,
     pub live_tape_prev: Option<EarlyTapePoint>,
     pub live_tape_curr: Option<EarlyTapePoint>,
@@ -123,6 +125,7 @@ impl Position {
             live_buyers_per_sec: 0.0,
             live_prev_buyers_per_sec: 0.0,
             last_live_score_at: 0,
+            live_score_entry_floor: 1,
             peak_profit_pct: 0.0,
             live_tape_prev: None,
             live_tape_curr: None,

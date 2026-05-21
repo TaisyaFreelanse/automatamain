@@ -112,6 +112,9 @@ pub struct ExitEngineV4Config {
     /// Recompute lite live score at most every N seconds per position.
     #[serde(default = "default_live_score_refresh_secs")]
     pub live_score_refresh_secs: u64,
+    /// No V4 decay exit and no lite-score phase downgrade for this long after entry.
+    #[serde(default = "default_exit_grace_secs")]
+    pub exit_grace_secs: u64,
     #[serde(default = "default_profile_weak")]
     pub weak: ExitTpProfile,
     #[serde(default = "default_profile_neutral")]
@@ -203,6 +206,20 @@ fn default_exit_v4_enabled() -> bool {
 
 fn default_live_score_refresh_secs() -> u64 {
     4
+}
+
+fn default_exit_grace_secs() -> u64 {
+    12
+}
+
+/// Floor for in-position `live_score` (matches entry profile resolution).
+pub fn entry_live_score_floor(snap: Option<&crate::learning::LearningTradeSnapshot>) -> i32 {
+    snap.map(|s| (s.score_total / 2).max(1))
+        .unwrap_or(1)
+}
+
+pub fn in_exit_grace_period(held_secs: u64, cfg: &ExitEngineV4Config) -> bool {
+    held_secs < cfg.exit_grace_secs
 }
 
 fn default_hold_min_b2s() -> f64 {
@@ -356,6 +373,7 @@ impl Default for ExitEngineV4Config {
         Self {
             enabled: default_exit_v4_enabled(),
             live_score_refresh_secs: default_live_score_refresh_secs(),
+            exit_grace_secs: default_exit_grace_secs(),
             weak: default_profile_weak(),
             neutral: default_profile_neutral(),
             strong: default_profile_strong(),
