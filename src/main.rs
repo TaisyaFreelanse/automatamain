@@ -51,8 +51,36 @@ use tokio_tungstenite::accept_async;
 /// Solana mainnet ~2.5 slots per second (≈400 ms slot time).
 const CHART_SLOTS_PER_SEC: f64 = 2.5;
 
+const CHART_MCAP_ABS_MAX: f64 = 200_000.0;
+
 fn chart_mcap_valid(mcap: f64) -> bool {
-    mcap.is_finite() && mcap > 0.0 && mcap < 1_000_000_000.0
+    mcap.is_finite() && mcap > 0.0 && mcap <= CHART_MCAP_ABS_MAX
+}
+
+fn chart_tape_median(mcaps: &[f64]) -> Option<f64> {
+    let mut v: Vec<f64> = mcaps
+        .iter()
+        .copied()
+        .filter(|m| chart_mcap_valid(*m))
+        .collect();
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(v[v.len() / 2])
+}
+
+fn chart_mcap_matches_tape(mcap: f64, median: Option<f64>) -> bool {
+    if !chart_mcap_valid(mcap) {
+        return false;
+    }
+    let Some(med) = median else {
+        return true;
+    };
+    if med <= 0.0 {
+        return true;
+    }
+    mcap >= med * 0.02 && mcap <= med * 50.0
 }
 
 fn chart_is_unix_secs(t: i64) -> bool {
@@ -557,6 +585,9 @@ async fn main() {
                 slot_series.push((row.t, row.mcap));
             }
 
+            let median = chart_tape_median(&slot_series.iter().map(|(_, m)| *m).collect::<Vec<_>>());
+            slot_series.retain(|(_, m)| chart_mcap_matches_tape(*m, median));
+
             let slot0 = slot_series.first().map(|p| p.0).unwrap_or(0);
             let mut points: Vec<ChartPoint> = slot_series
                 .iter()
@@ -580,7 +611,9 @@ async fn main() {
             let markers: Vec<ChartMarker> = marker_rows
                 .into_iter()
                 .filter_map(|m| {
-                    if !chart_mcap_valid(m.entry_mcap_sol) || !chart_mcap_valid(m.exit_mcap_sol) {
+                    if !chart_mcap_matches_tape(m.entry_mcap_sol, median)
+                        || !chart_mcap_matches_tape(m.exit_mcap_sol, median)
+                    {
                         return None;
                     }
                     let (entry_at, closed_at) = chart_normalize_marker_secs(

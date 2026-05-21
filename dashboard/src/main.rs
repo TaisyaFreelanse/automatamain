@@ -215,8 +215,37 @@ struct ChartData {
     markers: Vec<ChartMarker>,
 }
 
+/// Pump.fun tape mcaps are SOL; reject slot-sized garbage and NaN/inf.
+const CHART_MCAP_ABS_MAX: f64 = 200_000.0;
+
 fn chart_mcap_valid(mcap: f64) -> bool {
-    mcap.is_finite() && mcap > 0.0 && mcap < 1_000_000_000.0
+    mcap.is_finite() && mcap > 0.0 && mcap <= CHART_MCAP_ABS_MAX
+}
+
+fn chart_tape_median(mcaps: &[f64]) -> Option<f64> {
+    let mut v: Vec<f64> = mcaps
+        .iter()
+        .copied()
+        .filter(|m| chart_mcap_valid(*m))
+        .collect();
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(v[v.len() / 2])
+}
+
+fn chart_mcap_matches_tape(mcap: f64, median: Option<f64>) -> bool {
+    if !chart_mcap_valid(mcap) {
+        return false;
+    }
+    let Some(med) = median else {
+        return true;
+    };
+    if med <= 0.0 {
+        return true;
+    }
+    mcap >= med * 0.02 && mcap <= med * 50.0
 }
 
 fn sanitize_chart(mut chart: ChartData) -> ChartData {
@@ -233,15 +262,74 @@ fn sanitize_chart(mut chart: ChartData) -> ChartData {
         deduped.push(p);
     }
     chart.points = deduped;
+
+    let median = chart_tape_median(&chart.points.iter().map(|p| p.mcap).collect::<Vec<_>>());
+    chart.points.retain(|p| chart_mcap_matches_tape(p.mcap, median));
+
+    let series: Vec<(i64, f64)> = chart.points.iter().map(|p| (p.t, p.mcap)).collect();
+    for m in &mut chart.markers {
+        if !chart_mcap_matches_tape(m.entry_mcap, median) {
+            let v = mcap_at_time(&series, m.entry_at);
+            if chart_mcap_valid(v) {
+                m.entry_mcap = v;
+            }
+        }
+        if !chart_mcap_matches_tape(m.exit_mcap, median) {
+            let v = mcap_at_time(&series, m.closed_at);
+            if chart_mcap_valid(v) {
+                m.exit_mcap = v;
+            }
+        }
+    }
     chart.markers.retain(|m| {
-        chart_mcap_valid(m.entry_mcap)
-            && chart_mcap_valid(m.exit_mcap)
-            && m.closed_at >= m.entry_at
+        m.closed_at >= m.entry_at
             && m.entry_at >= 0
             && m.closed_at >= 0
+            && chart_mcap_matches_tape(m.entry_mcap, median)
+            && chart_mcap_matches_tape(m.exit_mcap, median)
     });
     chart.t0 = 0;
     chart
+}
+
+/// Y extent for autoscale: tape points + marker mcaps in plot units (× price_mult).
+fn chart_plot_y_bounds(
+    points: &[ChartPoint],
+    markers: &[ChartMarker],
+    price_mult: f64,
+    x_entry: f64,
+    x_exit: f64,
+) -> Option<(f64, f64)> {
+    let mut ys: Vec<f64> = points
+        .iter()
+        .filter(|p| chart_mcap_valid(p.mcap))
+        .filter(|p| {
+            let x = p.t as f64;
+            x >= x_entry - 30.0 && x <= x_exit + 30.0
+        })
+        .map(|p| p.mcap * price_mult)
+        .collect();
+    for m in markers {
+        if chart_mcap_valid(m.entry_mcap) {
+            ys.push(m.entry_mcap * price_mult);
+        }
+        if chart_mcap_valid(m.exit_mcap) {
+            ys.push(m.exit_mcap * price_mult);
+        }
+    }
+    if ys.is_empty() {
+        return None;
+    }
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for y in ys {
+        lo = lo.min(y);
+        hi = hi.max(y);
+    }
+    if !lo.is_finite() || !hi.is_finite() || hi <= lo {
+        return None;
+    }
+    Some((lo, hi))
 }
 
 /// Linear mcap at chart time `t` (seconds from tape start) from tape points.
@@ -965,7 +1053,25 @@ impl eframe::App for Dashboard {
                         .unwrap_or(series.first().map(|(_, m)| *m).unwrap_or(1.0));
                     let mut hover_tip = String::new();
 
-                    Plot::new("price_chart")
+                    let (x_lo, x_hi) = chart.markers.iter().fold(
+                        (
+                            chart.points.first().map(|p| p.t as f64).unwrap_or(0.0),
+                            chart.points.last().map(|p| p.t as f64).unwrap_or(0.0),
+                        ),
+                        |(lo, hi), m| {
+                            let xe = chart_x_sec(m.entry_at, t0);
+                            let xx = chart_x_sec(m.closed_at, t0);
+                            (lo.min(xe), hi.max(xx))
+                        },
+                    );
+                    let y_bounds = chart_plot_y_bounds(
+                        &chart.points,
+                        &chart.markers,
+                        price_mult,
+                        x_lo,
+                        x_hi,
+                    );
+                    let mut plot = Plot::new("price_chart")
                         .height(340.0)
                         .allow_drag(true)
                         .allow_zoom(true)
@@ -980,12 +1086,13 @@ impl eframe::App for Dashboard {
                             } else {
                                 format!("{name}\n{:.0}s", value.x)
                             }
-                        })
-                        .show(ui, |plot_ui| {
-                            let bounds = plot_ui.plot_bounds();
-                            let y_lo = bounds.min()[1];
-                            let y_hi = bounds.max()[1];
+                        });
+                    if let Some((y_lo, y_hi)) = y_bounds {
+                        let pad = ((y_hi - y_lo) * 0.12).max(y_hi * 0.05).max(1.0);
+                        plot = plot.include_y(y_lo - pad).include_y(y_hi + pad);
+                    }
 
+                    plot.show(ui, |plot_ui| {
                             let line_pts: PlotPoints = chart
                                 .points
                                 .iter()
@@ -1011,14 +1118,31 @@ impl eframe::App for Dashboard {
                                 }
                                 let entry_y = marker.entry_mcap * price_mult;
                                 let exit_y = marker.exit_mcap * price_mult;
+                                if !entry_y.is_finite()
+                                    || !exit_y.is_finite()
+                                    || entry_y <= 0.0
+                                    || exit_y <= 0.0
+                                {
+                                    continue;
+                                }
+
+                                let (zone_y_lo, zone_y_hi) = chart_plot_y_bounds(
+                                    &chart.points,
+                                    &[],
+                                    price_mult,
+                                    x_entry,
+                                    x_exit,
+                                )
+                                .unwrap_or((entry_y.min(exit_y), entry_y.max(exit_y)));
+                                let zone_pad = ((zone_y_hi - zone_y_lo) * 0.06).max(1.0);
 
                                 let hold_fill = egui::Color32::from_rgba_premultiplied(80, 160, 255, 28);
                                 plot_ui.polygon(
                                     Polygon::new(PlotPoints::new(vec![
-                                        [x_entry, y_lo],
-                                        [x_exit, y_lo],
-                                        [x_exit, y_hi],
-                                        [x_entry, y_hi],
+                                        [x_entry, zone_y_lo - zone_pad],
+                                        [x_exit, zone_y_lo - zone_pad],
+                                        [x_exit, zone_y_hi + zone_pad],
+                                        [x_entry, zone_y_hi + zone_pad],
                                     ]))
                                     .fill_color(hold_fill)
                                     .allow_hover(false),
