@@ -215,7 +215,36 @@ struct ChartData {
     markers: Vec<ChartMarker>,
 }
 
-/// Linear mcap at unix time `t` from trade tape points.
+fn chart_mcap_valid(mcap: f64) -> bool {
+    mcap.is_finite() && mcap > 0.0 && mcap < 1_000_000_000.0
+}
+
+fn sanitize_chart(mut chart: ChartData) -> ChartData {
+    chart.points.retain(|p| chart_mcap_valid(p.mcap));
+    chart.points.sort_by_key(|p| p.t);
+    let mut deduped: Vec<ChartPoint> = Vec::new();
+    for p in chart.points {
+        if let Some(last) = deduped.last_mut() {
+            if last.t == p.t {
+                last.mcap = p.mcap;
+                continue;
+            }
+        }
+        deduped.push(p);
+    }
+    chart.points = deduped;
+    chart.markers.retain(|m| {
+        chart_mcap_valid(m.entry_mcap)
+            && chart_mcap_valid(m.exit_mcap)
+            && m.closed_at >= m.entry_at
+            && m.entry_at >= 0
+            && m.closed_at >= 0
+    });
+    chart.t0 = 0;
+    chart
+}
+
+/// Linear mcap at chart time `t` (seconds from tape start) from tape points.
 fn mcap_at_time(points: &[(i64, f64)], t: i64) -> f64 {
     if points.is_empty() {
         return 0.0;
@@ -241,7 +270,7 @@ fn mcap_at_time(points: &[(i64, f64)], t: i64) -> f64 {
 }
 
 fn chart_x_sec(t: i64, t0: i64) -> f64 {
-    (t - t0) as f64
+    (t.saturating_sub(t0)) as f64
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
@@ -550,7 +579,7 @@ impl Dashboard {
                 }
                 AppEvent::ChartData { mint, data } => {
                     if let Some(d) = data {
-                        self.chart_window = Some((mint, d));
+                        self.chart_window = Some((mint, sanitize_chart(d)));
                     }
                 }
                 AppEvent::OpenPositions(rows) => self.apply_open_positions(rows),
@@ -977,8 +1006,11 @@ impl eframe::App for Dashboard {
                             for (i, marker) in chart.markers.iter().enumerate() {
                                 let x_entry = chart_x_sec(marker.entry_at, t0);
                                 let x_exit = chart_x_sec(marker.closed_at, t0);
-                                let entry_y = mcap_at_time(&series, marker.entry_at) * price_mult;
-                                let exit_y = mcap_at_time(&series, marker.closed_at) * price_mult;
+                                if x_exit < x_entry {
+                                    continue;
+                                }
+                                let entry_y = marker.entry_mcap * price_mult;
+                                let exit_y = marker.exit_mcap * price_mult;
 
                                 let hold_fill = egui::Color32::from_rgba_premultiplied(80, 160, 255, 28);
                                 plot_ui.polygon(
@@ -1043,8 +1075,9 @@ impl eframe::App for Dashboard {
                             }
 
                             if let Some(hover) = plot_ui.pointer_coordinate() {
-                                let mcap_plot = hover.y / price_mult;
-                                let pct = if ref_entry_mcap > 0.0 {
+                                let t_sec = hover.x.round().max(0.0) as i64;
+                                let mcap_plot = mcap_at_time(&series, t_sec);
+                                let pct = if ref_entry_mcap > 0.0 && chart_mcap_valid(mcap_plot) {
                                     (mcap_plot / ref_entry_mcap - 1.0) * 100.0
                                 } else {
                                     0.0

@@ -48,6 +48,71 @@ use tokio::{
 };
 use tokio_tungstenite::accept_async;
 
+/// Solana mainnet ~2.5 slots per second (≈400 ms slot time).
+const CHART_SLOTS_PER_SEC: f64 = 2.5;
+
+fn chart_mcap_valid(mcap: f64) -> bool {
+    mcap.is_finite() && mcap > 0.0 && mcap < 1_000_000_000.0
+}
+
+fn chart_is_unix_secs(t: i64) -> bool {
+    t >= 1_000_000_000
+}
+
+fn chart_slot_to_sec(slot: i64, slot0: i64) -> i64 {
+    let delta = slot.saturating_sub(slot0);
+    ((delta as f64) / CHART_SLOTS_PER_SEC).round().max(0.0) as i64
+}
+
+fn chart_infer_slot_by_mcap(target: f64, series: &[(i64, f64)]) -> i64 {
+    series
+        .iter()
+        .filter(|(_, m)| chart_mcap_valid(*m))
+        .min_by(|a, b| {
+            (a.1 - target)
+                .abs()
+                .partial_cmp(&(b.1 - target).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(slot, _)| *slot)
+        .unwrap_or_else(|| series.first().map(|p| p.0).unwrap_or(0))
+}
+
+fn chart_normalize_marker_secs(
+    entry_at: i64,
+    closed_at: i64,
+    entry_mcap: f64,
+    exit_mcap: f64,
+    series: &[(i64, f64)],
+    slot0: i64,
+) -> (i64, i64) {
+    let entry_unix = entry_at > 0 && chart_is_unix_secs(entry_at);
+    let close_unix = closed_at > 0 && chart_is_unix_secs(closed_at);
+
+    let exit_slot = chart_infer_slot_by_mcap(exit_mcap, series);
+    let exit_sec = chart_slot_to_sec(exit_slot, slot0);
+
+    let entry_sec = if entry_unix && close_unix && closed_at >= entry_at {
+        let held = closed_at - entry_at;
+        exit_sec.saturating_sub(held).max(0)
+    } else if entry_at > 0 && !entry_unix {
+        chart_slot_to_sec(entry_at, slot0)
+    } else {
+        let entry_slot = chart_infer_slot_by_mcap(entry_mcap, series);
+        chart_slot_to_sec(entry_slot, slot0)
+    };
+
+    let closed_sec = if close_unix && entry_unix && closed_at >= entry_at {
+        (entry_sec + (closed_at - entry_at)).max(entry_sec)
+    } else if closed_at > 0 && !close_unix {
+        chart_slot_to_sec(closed_at, slot0)
+    } else {
+        exit_sec.max(entry_sec)
+    };
+
+    (entry_sec, closed_sec)
+}
+
 #[tokio::main]
 async fn main() {
     dotenv().ok();
@@ -443,20 +508,6 @@ async fn main() {
                 markers: Vec<ChartMarker>,
             }
 
-            fn infer_entry_at(entry_mcap: f64, closed_at: i64, points: &[(i64, f64)]) -> i64 {
-                points
-                    .iter()
-                    .filter(|(t, _)| *t <= closed_at)
-                    .min_by(|a, b| {
-                        (a.1 - entry_mcap)
-                            .abs()
-                            .partial_cmp(&(b.1 - entry_mcap).abs())
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .map(|(t, _)| *t)
-                    .unwrap_or_else(|| points.first().map(|p| p.0).unwrap_or(closed_at))
-            }
-
             let point_rows = match sqlx::query_as::<_, ChartPointRow>(
                 "SELECT CAST(slot_time AS BIGINT) AS t, market_cap::float8 AS mcap \
                  FROM trades \
@@ -492,34 +543,70 @@ async fn main() {
                 }
             };
 
-            let points: Vec<ChartPoint> = point_rows
-                .into_iter()
-                .map(|p| ChartPoint { t: p.t, mcap: p.mcap })
+            let mut slot_series: Vec<(i64, f64)> = Vec::new();
+            for row in point_rows {
+                if !chart_mcap_valid(row.mcap) {
+                    continue;
+                }
+                if let Some(last) = slot_series.last_mut() {
+                    if last.0 == row.t {
+                        last.1 = row.mcap;
+                        continue;
+                    }
+                }
+                slot_series.push((row.t, row.mcap));
+            }
+
+            let slot0 = slot_series.first().map(|p| p.0).unwrap_or(0);
+            let mut points: Vec<ChartPoint> = slot_series
+                .iter()
+                .map(|(slot, mcap)| ChartPoint {
+                    t: chart_slot_to_sec(*slot, slot0),
+                    mcap: *mcap,
+                })
                 .collect();
-            let series: Vec<(i64, f64)> = points.iter().map(|p| (p.t, p.mcap)).collect();
-            let t0 = points.first().map(|p| p.t).unwrap_or(0);
+            let mut deduped: Vec<ChartPoint> = Vec::new();
+            for p in points {
+                if let Some(last) = deduped.last_mut() {
+                    if last.t == p.t {
+                        last.mcap = p.mcap;
+                        continue;
+                    }
+                }
+                deduped.push(p);
+            }
+            points = deduped;
 
             let markers: Vec<ChartMarker> = marker_rows
                 .into_iter()
-                .map(|m| {
-                    let entry_at = if m.entry_at > 0 {
-                        m.entry_at
-                    } else {
-                        infer_entry_at(m.entry_mcap_sol, m.closed_at, &series)
-                    };
-                    ChartMarker {
+                .filter_map(|m| {
+                    if !chart_mcap_valid(m.entry_mcap_sol) || !chart_mcap_valid(m.exit_mcap_sol) {
+                        return None;
+                    }
+                    let (entry_at, closed_at) = chart_normalize_marker_secs(
+                        m.entry_at,
+                        m.closed_at,
+                        m.entry_mcap_sol,
+                        m.exit_mcap_sol,
+                        &slot_series,
+                        slot0,
+                    );
+                    if closed_at < entry_at {
+                        return None;
+                    }
+                    Some(ChartMarker {
                         entry_at,
-                        closed_at: m.closed_at,
+                        closed_at,
                         entry_mcap: m.entry_mcap_sol,
                         exit_mcap: m.exit_mcap_sol,
                         pnl: m.realized_pnl_pct,
                         reason: m.close_reason,
-                    }
+                    })
                 })
                 .collect();
 
             Json(ChartResponse {
-                t0,
+                t0: 0,
                 points,
                 markers,
             })
