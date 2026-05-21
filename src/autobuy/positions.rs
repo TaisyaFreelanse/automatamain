@@ -73,6 +73,13 @@ pub struct Position {
     pub exit_mcap_ticks: Vec<f64>,
     /// Consecutive ticks with filtered PnL at or below `exit_profit_floor` (SL confirm).
     pub sl_below_floor_streak: u8,
+    /// Latest live tape sell pressure (from `ApplyLiveSnapshot`, not entry snapshot).
+    pub live_sell_pressure: f64,
+    pub live_volume_delta: f64,
+    /// Last computed tape/live decay flag (velocity + sell pressure + volume).
+    pub live_momentum_decay: bool,
+    /// Consecutive process ticks with `live_decay_signal` before momentum-decay full exit.
+    pub decay_exit_streak: u8,
 }
 
 impl Position {
@@ -135,6 +142,10 @@ impl Position {
             live_tape_curr: None,
             exit_mcap_ticks: Vec::new(),
             sl_below_floor_streak: 0,
+            live_sell_pressure: 0.0,
+            live_volume_delta: 0.0,
+            live_momentum_decay: false,
+            decay_exit_streak: 0,
         }
     }
 

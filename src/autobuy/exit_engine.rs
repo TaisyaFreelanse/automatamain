@@ -141,6 +141,9 @@ pub struct ExitEngineV4Config {
     pub phase_expansion_min_score: i32,
     #[serde(default = "default_phase_distribution_max")]
     pub phase_distribution_max_score: i32,
+    /// Consecutive ticks with a real momentum/volume decay signal before full exit.
+    #[serde(default = "default_momentum_decay_confirm_ticks")]
+    pub momentum_decay_confirm_ticks: u8,
     /// Strong tier: skip time-kill if any TP fired and PnL is above this (%).
     #[serde(default = "default_strong_time_kill_min_after_tp")]
     pub strong_time_kill_min_profit_after_tp: f64,
@@ -181,7 +184,11 @@ fn default_phase_expansion_min() -> i32 {
 }
 
 fn default_phase_distribution_max() -> i32 {
-    3
+    2
+}
+
+fn default_momentum_decay_confirm_ticks() -> u8 {
+    2
 }
 
 fn default_runner_upgrade_min_live_score() -> i32 {
@@ -445,6 +452,7 @@ impl Default for ExitEngineV4Config {
             phase_momentum_min_score: default_phase_momentum_min(),
             phase_expansion_min_score: default_phase_expansion_min(),
             phase_distribution_max_score: default_phase_distribution_max(),
+            momentum_decay_confirm_ticks: default_momentum_decay_confirm_ticks(),
             strong_time_kill_min_profit_after_tp: default_strong_time_kill_min_after_tp(),
             momentum_decay_exit_enabled: default_true(),
             profit_staircase_enabled: default_true(),
@@ -620,6 +628,54 @@ pub fn momentum_decay_detected(
 ) -> bool {
     let vel_drop = vel_prev > 0.01 && vel_now < vel_prev * 0.7;
     vel_drop && sell_pressure > 1.2 && volume_delta < 0.0
+}
+
+/// Full-exit decay: needs tape-derived decay and/or explicit velocity/sell/volume collapse.
+pub fn live_momentum_decay_for_exit(metrics: &LiveMetrics) -> bool {
+    metrics.momentum_decay || metrics.volume_decay
+}
+
+/// Tick-level decay check using latest live snapshot fields (not entry snapshot sell pressure).
+pub fn live_decay_signal_from_tape(
+    buyers_per_sec: f64,
+    prev_buyers_per_sec: f64,
+    sell_pressure: f64,
+    volume_delta: f64,
+    metrics: &LiveMetrics,
+) -> bool {
+    live_momentum_decay_for_exit(metrics)
+        || momentum_decay_detected(buyers_per_sec, prev_buyers_per_sec, sell_pressure, volume_delta)
+}
+
+/// Per live-tape refresh (and lite fallback): score, phase, decay inputs.
+pub fn log_v4_live_snapshot(
+    mint: &str,
+    held_secs: u64,
+    live_score: i32,
+    live_floor: i32,
+    phase: PositionPhase,
+    profile: ExitProfile,
+    hold_mode: bool,
+    buyers_per_sec: f64,
+    prev_buyers_per_sec: f64,
+    sell_pressure: f64,
+    volume_delta: f64,
+    mcap_vel_pct_per_sec: f64,
+    profit_pct: f64,
+    metrics: &LiveMetrics,
+    decay_streak: u8,
+    decay_confirm_ticks: u8,
+) {
+    eprintln!(
+        "[EXIT V4] {mint} held={held_secs}s live_score={live_score} floor={live_floor} \
+         phase={} profile={} hold={hold_mode} bps={buyers_per_sec:.2} prev_bps={prev_buyers_per_sec:.2} \
+         sell_press={sell_pressure:.3} vol_delta={volume_delta:.4} mcap_vel={mcap_vel_pct_per_sec:.3}%/s \
+         profit={profit_pct:.1}% mom_decay={} vol_decay={} decay_streak={decay_streak}/{decay_confirm_ticks}",
+        phase.as_str(),
+        profile.as_str(),
+        metrics.momentum_decay,
+        metrics.volume_decay,
+    );
 }
 
 pub fn should_enable_hold_mode(
@@ -857,6 +913,44 @@ mod tests {
     fn profit_staircase() {
         assert_eq!(profit_lock_staircase_floor(55.0), Some(15.0));
         assert_eq!(profit_lock_staircase_floor(120.0), Some(40.0));
+    }
+
+    #[test]
+    fn distribution_phase_needs_decay_or_very_low_score() {
+        let cfg = ExitEngineV4Config {
+            phase_distribution_max_score: 2,
+            ..ExitEngineV4Config::default()
+        };
+        assert_eq!(
+            transition_position_phase(
+                PositionPhase::Exploration,
+                3,
+                false,
+                5.0,
+                &cfg,
+            ),
+            PositionPhase::Exploration
+        );
+        assert_eq!(
+            transition_position_phase(
+                PositionPhase::Exploration,
+                2,
+                false,
+                5.0,
+                &cfg,
+            ),
+            PositionPhase::Distribution
+        );
+        assert_eq!(
+            transition_position_phase(
+                PositionPhase::Exploration,
+                8,
+                true,
+                5.0,
+                &cfg,
+            ),
+            PositionPhase::Distribution
+        );
     }
 
     #[test]

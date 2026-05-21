@@ -4,8 +4,8 @@ use crate::{
         exit_engine::{
             adaptive_moonbag_sell_pct, adaptive_trailing, apply_phase_to_tp,
             calculate_live_score, entry_live_score_floor, in_exit_grace_period, in_sl_grace_period,
-            live_metrics_from_snapshot, live_metrics_lite, maybe_upgrade_runner,
-            momentum_decay_detected, profit_lock_staircase_floor,
+            live_metrics_from_snapshot, live_metrics_lite, momentum_decay_detected,
+            log_v4_live_snapshot, maybe_upgrade_runner, profit_lock_staircase_floor,
             resolve_entry_profile, transition_position_phase, ExitEngineV4Config, ExitProfile,
             PositionPhase, TkEntryThresholds,
         },
@@ -548,6 +548,9 @@ impl PositionManagerActor {
                         pos.live_prev_buyers_per_sec = pos.live_buyers_per_sec;
                         pos.live_buyers_per_sec = live.buyers_per_sec;
                         pos.live_prev_velocity = vel;
+                        pos.live_sell_pressure = live.sell_pressure_score;
+                        pos.live_volume_delta = live.volume_delta;
+                        pos.live_momentum_decay = metrics.momentum_decay;
                         pos.live_score = calculate_live_score(&metrics)
                             .max(pos.live_score_entry_floor);
                         pos.last_live_score_at = SystemTime::now()
@@ -572,7 +575,24 @@ impl PositionManagerActor {
                         );
                         pos.exit_profile = profile;
                         pos.hold_mode = hold;
-                        let _ = held;
+                        log_v4_live_snapshot(
+                            &mint.to_string(),
+                            held,
+                            pos.live_score,
+                            pos.live_score_entry_floor,
+                            pos.exit_phase,
+                            pos.exit_profile,
+                            pos.hold_mode,
+                            pos.live_buyers_per_sec,
+                            pos.live_prev_buyers_per_sec,
+                            pos.live_sell_pressure,
+                            pos.live_volume_delta,
+                            vel,
+                            profit,
+                            &metrics,
+                            pos.decay_exit_streak,
+                            v4.momentum_decay_confirm_ticks,
+                        );
                     }
                 }
 
@@ -1467,6 +1487,11 @@ impl PositionManagerActor {
             {
                 let snap = pos.learning_snapshot.as_ref();
                 let metrics = live_metrics_lite(pos, vel, profit, snap, &v4_cfg);
+                pos.live_sell_pressure = snap
+                    .map(|s| s.sell_pressure_score)
+                    .unwrap_or(pos.live_sell_pressure);
+                pos.live_volume_delta = vel;
+                pos.live_momentum_decay = metrics.momentum_decay;
                 pos.live_score =
                     calculate_live_score(&metrics).max(pos.live_score_entry_floor);
                 pos.live_prev_velocity = vel;
@@ -1482,6 +1507,24 @@ impl PositionManagerActor {
                     maybe_upgrade_runner(&v4_cfg, pos.exit_profile, &metrics, pos.live_score, pos.hold_mode);
                 pos.exit_profile = profile;
                 pos.hold_mode = hold;
+                log_v4_live_snapshot(
+                    &mint.to_string(),
+                    held_secs,
+                    pos.live_score,
+                    pos.live_score_entry_floor,
+                    pos.exit_phase,
+                    pos.exit_profile,
+                    pos.hold_mode,
+                    pos.live_buyers_per_sec,
+                    pos.live_prev_buyers_per_sec,
+                    pos.live_sell_pressure,
+                    pos.live_volume_delta,
+                    vel,
+                    profit,
+                    &metrics,
+                    pos.decay_exit_streak,
+                    v4_cfg.momentum_decay_confirm_ticks,
+                );
             }
 
             if v4_enabled && v4_cfg.profit_staircase_enabled {
@@ -1535,26 +1578,31 @@ impl PositionManagerActor {
                 time_kill_after_secs: Some(pos.last_time_kill_after_secs),
             });
 
-            // --- 0. Phase 2: momentum decay full exit ---
-            if v4_enabled
-                && v4_cfg.momentum_decay_exit_enabled
-                && !in_grace
-                && pos.live_tape_curr.is_some()
-            {
-                let sell_p = pos
-                    .learning_snapshot
-                    .as_ref()
-                    .map(|s| s.sell_pressure_score)
-                    .unwrap_or(0.0);
-                if momentum_decay_detected(
-                    pos.live_buyers_per_sec,
-                    pos.live_prev_buyers_per_sec,
-                    sell_p,
-                    vel,
-                )
-                    || pos.exit_phase == PositionPhase::Distribution
-                        && pos.live_score <= v4_cfg.phase_distribution_max_score
-                {
+            // --- 0. Phase 2: momentum decay full exit (confirmed decay signal only) ---
+            if v4_enabled && v4_cfg.momentum_decay_exit_enabled && !in_grace {
+                let volume_decay =
+                    pos.live_volume_delta < 0.0 && vel < pos.live_prev_velocity * 0.85;
+                let decay_signal = pos.live_tape_curr.is_some()
+                    && (pos.live_momentum_decay
+                        || volume_decay
+                        || momentum_decay_detected(
+                            pos.live_buyers_per_sec,
+                            pos.live_prev_buyers_per_sec,
+                            pos.live_sell_pressure,
+                            pos.live_volume_delta,
+                        ));
+
+                if decay_signal {
+                    pos.decay_exit_streak = pos
+                        .decay_exit_streak
+                        .saturating_add(1)
+                        .min(255);
+                } else {
+                    pos.decay_exit_streak = 0;
+                }
+
+                let confirm = v4_cfg.momentum_decay_confirm_ticks.max(1);
+                if pos.live_tape_curr.is_some() && pos.decay_exit_streak >= confirm {
                     pos.is_closing = true;
                     let reason = if pos.exit_phase == PositionPhase::Distribution {
                         format!("MOMENTUM DECAY [{}]", pos.exit_phase.as_str())
@@ -1564,6 +1612,8 @@ impl PositionManagerActor {
                     actions.push((*mint, 100.0, reason));
                     continue;
                 }
+            } else if v4_enabled {
+                pos.decay_exit_streak = 0;
             }
 
             // --- 1. Time Kill (adaptive window: weak 20–25s, strong 45–70s) ---
