@@ -25,7 +25,6 @@ pub struct PumpPipeline {
     config: RpcTransactionLogsConfig,
     general_tx: Sender<(Slot, Action, TokenBucket)>,
 
-    sniper_threshold: u64,
     mayhem: bool,
 
     pump_metrics: Arc<FeedMetrics>,
@@ -57,7 +56,6 @@ impl PumpPipeline {
             ws_url,
             config,
             general_tx,
-            sniper_threshold,
             mayhem,
             pump_metrics,
             pumpswap_metrics,

@@ -285,7 +285,7 @@ impl SolanaBroker {
                     }
                     if is_account_propagation_error(&msg) {
                         propagation_backoff(attempt).await;
-                    } else {
+                } else {
                         backoff(attempt).await;
                     }
                 }
@@ -938,7 +938,7 @@ impl Broker for SolanaBroker {
             pre_raw,
             Duration::from_millis(15_000),
         )
-        .await
+            .await
         {
             Ok((post_raw, decimals)) => {
                 let delta_raw = post_raw.saturating_sub(pre_raw);
@@ -1231,13 +1231,13 @@ impl Broker for SolanaBroker {
             let token_amount_in = sips::helper::Amount::<6>::from_raw(token_amount_raw);
             let min_sol_out = sips::helper::Amount::<9>::from_float(min_sol_out_f);
 
-            let ix = PumpInstruction::sell(
-                mint.into(),
-                self.wallet_address.into(),
+        let ix = PumpInstruction::sell(
+            mint.into(),
+            self.wallet_address.into(),
                 creator_for_vault.into(),
                 mint_token.program(),
-                token_amount_in,
-                min_sol_out,
+            token_amount_in,
+            min_sol_out,
                 cashback_enabled,
             );
 
