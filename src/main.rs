@@ -50,6 +50,8 @@ use tokio_tungstenite::accept_async;
 
 /// Solana mainnet ~2.5 slots per second (≈400 ms slot time).
 const CHART_SLOTS_PER_SEC: f64 = 2.5;
+const CHART_PRE_SECS: i64 = 10;
+const CHART_POST_SECS: i64 = 120;
 
 const CHART_MCAP_ABS_MAX: f64 = 200_000.0;
 
@@ -117,28 +119,51 @@ fn chart_normalize_marker_secs(
     let entry_unix = entry_at > 0 && chart_is_unix_secs(entry_at);
     let close_unix = closed_at > 0 && chart_is_unix_secs(closed_at);
 
+    // Prefer wall-clock hold duration; do not infer exit time from exit_mcap
+    // (same mcap often repeats on the long post-trade tail).
+    if entry_unix && close_unix && closed_at >= entry_at {
+        let held = closed_at - entry_at;
+        let entry_slot = chart_infer_slot_by_mcap(entry_mcap, series);
+        let entry_sec = chart_slot_to_sec(entry_slot, slot0);
+        return (entry_sec, entry_sec + held);
+    }
+
     let exit_slot = chart_infer_slot_by_mcap(exit_mcap, series);
     let exit_sec = chart_slot_to_sec(exit_slot, slot0);
 
-    let entry_sec = if entry_unix && close_unix && closed_at >= entry_at {
-        let held = closed_at - entry_at;
-        exit_sec.saturating_sub(held).max(0)
-    } else if entry_at > 0 && !entry_unix {
+    let entry_sec = if entry_at > 0 && !entry_unix {
         chart_slot_to_sec(entry_at, slot0)
     } else {
         let entry_slot = chart_infer_slot_by_mcap(entry_mcap, series);
         chart_slot_to_sec(entry_slot, slot0)
     };
 
-    let closed_sec = if close_unix && entry_unix && closed_at >= entry_at {
-        (entry_sec + (closed_at - entry_at)).max(entry_sec)
-    } else if closed_at > 0 && !close_unix {
+    let closed_sec = if closed_at > 0 && !close_unix {
         chart_slot_to_sec(closed_at, slot0)
     } else {
         exit_sec.max(entry_sec)
     };
 
     (entry_sec, closed_sec)
+}
+
+fn chart_trade_window_bounds(marker_times: &[(i64, i64)], points: &[(i64, f64)]) -> (i64, i64) {
+    if !marker_times.is_empty() {
+        let entry_min = marker_times.iter().map(|(e, _)| *e).min().unwrap_or(0);
+        let exit_max = marker_times.iter().map(|(_, c)| *c).max().unwrap_or(entry_min);
+        return (
+            entry_min.saturating_sub(CHART_PRE_SECS),
+            exit_max + CHART_POST_SECS,
+        );
+    }
+    if let (Some(lo), Some(hi)) = (points.first().map(|p| p.0), points.last().map(|p| p.0)) {
+        let span = hi.saturating_sub(lo);
+        if span > 180 {
+            return (lo.saturating_sub(CHART_PRE_SECS), lo + 180);
+        }
+        return (lo.saturating_sub(CHART_PRE_SECS), hi + 60);
+    }
+    (0, CHART_POST_SECS)
 }
 
 #[tokio::main]
@@ -608,7 +633,7 @@ async fn main() {
             }
             points = deduped;
 
-            let markers: Vec<ChartMarker> = marker_rows
+            let mut markers: Vec<ChartMarker> = marker_rows
                 .into_iter()
                 .filter_map(|m| {
                     if !chart_mcap_matches_tape(m.entry_mcap_sol, median)
@@ -637,6 +662,21 @@ async fn main() {
                     })
                 })
                 .collect();
+
+            let marker_times: Vec<(i64, i64)> = markers
+                .iter()
+                .map(|m| (m.entry_at, m.closed_at))
+                .collect();
+            let point_series: Vec<(i64, f64)> = points.iter().map(|p| (p.t, p.mcap)).collect();
+            let (win_lo, win_hi) = chart_trade_window_bounds(&marker_times, &point_series);
+            points.retain(|p| p.t >= win_lo && p.t <= win_hi);
+            for p in &mut points {
+                p.t = p.t.saturating_sub(win_lo);
+            }
+            for m in &mut markers {
+                m.entry_at = m.entry_at.clamp(win_lo, win_hi).saturating_sub(win_lo);
+                m.closed_at = m.closed_at.clamp(win_lo, win_hi).saturating_sub(win_lo);
+            }
 
             Json(ChartResponse {
                 t0: 0,

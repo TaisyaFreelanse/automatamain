@@ -217,6 +217,8 @@ struct ChartData {
 
 /// Pump.fun tape mcaps are SOL; reject slot-sized garbage and NaN/inf.
 const CHART_MCAP_ABS_MAX: f64 = 200_000.0;
+const CHART_PRE_SECS: i64 = 10;
+const CHART_POST_SECS: i64 = 120;
 
 fn chart_mcap_valid(mcap: f64) -> bool {
     mcap.is_finite() && mcap > 0.0 && mcap <= CHART_MCAP_ABS_MAX
@@ -288,8 +290,41 @@ fn sanitize_chart(mut chart: ChartData) -> ChartData {
             && chart_mcap_matches_tape(m.entry_mcap, median)
             && chart_mcap_matches_tape(m.exit_mcap, median)
     });
+    chart_focus_trade_window(&mut chart);
     chart.t0 = 0;
     chart
+}
+
+fn chart_trade_window_bounds(markers: &[ChartMarker], points: &[ChartPoint]) -> (i64, i64) {
+    if !markers.is_empty() {
+        let entry_min = markers.iter().map(|m| m.entry_at).min().unwrap_or(0);
+        let exit_max = markers.iter().map(|m| m.closed_at).max().unwrap_or(entry_min);
+        return (
+            entry_min.saturating_sub(CHART_PRE_SECS),
+            exit_max + CHART_POST_SECS,
+        );
+    }
+    if let (Some(lo), Some(hi)) = (points.first().map(|p| p.t), points.last().map(|p| p.t)) {
+        let span = hi.saturating_sub(lo);
+        if span > 180 {
+            return (lo.saturating_sub(CHART_PRE_SECS), lo + 180);
+        }
+        return (lo.saturating_sub(CHART_PRE_SECS), hi + 60);
+    }
+    (0, CHART_POST_SECS)
+}
+
+/// Clip tape to entry−10s … exit+120s and re-base time so entry ≈ +10s (no negatives).
+fn chart_focus_trade_window(chart: &mut ChartData) {
+    let (win_lo, win_hi) = chart_trade_window_bounds(&chart.markers, &chart.points);
+    chart.points.retain(|p| p.t >= win_lo && p.t <= win_hi);
+    for p in &mut chart.points {
+        p.t = p.t.saturating_sub(win_lo);
+    }
+    for m in &mut chart.markers {
+        m.entry_at = m.entry_at.clamp(win_lo, win_hi).saturating_sub(win_lo);
+        m.closed_at = m.closed_at.clamp(win_lo, win_hi).saturating_sub(win_lo);
+    }
 }
 
 /// Y extent for autoscale: tape points + marker mcaps in plot units (× price_mult).
@@ -1053,17 +1088,24 @@ impl eframe::App for Dashboard {
                         .unwrap_or(series.first().map(|(_, m)| *m).unwrap_or(1.0));
                     let mut hover_tip = String::new();
 
-                    let (x_lo, x_hi) = chart.markers.iter().fold(
-                        (
-                            chart.points.first().map(|p| p.t as f64).unwrap_or(0.0),
-                            chart.points.last().map(|p| p.t as f64).unwrap_or(0.0),
-                        ),
-                        |(lo, hi), m| {
-                            let xe = chart_x_sec(m.entry_at, t0);
-                            let xx = chart_x_sec(m.closed_at, t0);
-                            (lo.min(xe), hi.max(xx))
-                        },
-                    );
+                    let x_lo = 0.0;
+                    let x_hi = chart
+                        .points
+                        .iter()
+                        .map(|p| chart_x_sec(p.t, t0))
+                        .chain(
+                            chart
+                                .markers
+                                .iter()
+                                .flat_map(|m| {
+                                    [
+                                        chart_x_sec(m.entry_at, t0),
+                                        chart_x_sec(m.closed_at, t0),
+                                    ]
+                                }),
+                        )
+                        .fold(0.0_f64, f64::max)
+                        .max(1.0);
                     let y_bounds = chart_plot_y_bounds(
                         &chart.points,
                         &chart.markers,
@@ -1077,7 +1119,7 @@ impl eframe::App for Dashboard {
                         .allow_zoom(true)
                         .show_axes(true)
                         .show_grid(true)
-                        .x_axis_label("Time (s from tape start)")
+                        .x_axis_label("Time (s from entry −10s)")
                         .y_axis_label(y_name)
                         .x_axis_formatter(|mark, _| format!("{:.0}s", mark.value))
                         .label_formatter(|name, value| {
@@ -1087,6 +1129,8 @@ impl eframe::App for Dashboard {
                                 format!("{name}\n{:.0}s", value.x)
                             }
                         });
+                    let x_pad = (x_hi * 0.04).max(2.0);
+                    plot = plot.include_x(0.0).include_x(x_hi + x_pad);
                     if let Some((y_lo, y_hi)) = y_bounds {
                         let pad = ((y_hi - y_lo) * 0.12).max(y_hi * 0.05).max(1.0);
                         plot = plot.include_y(y_lo - pad).include_y(y_hi + pad);
