@@ -437,6 +437,12 @@ enum DashCmd {
     SetBuySize(f64),
     FetchMode,
     FetchTxLog,
+    /// Single GET /bot-trades (periodic poll).
+    FetchBotTrades,
+    /// GET /status — balance, paused, wallet (periodic poll + after trades).
+    FetchStatus,
+    /// Retried refresh after position close (DB write is async on the bot).
+    RefreshBotTradesAfterClose,
     FetchOpenPositions,
     /// Switch broker mode. `confirm_live` must be true to switch to live;
     /// the dashboard enforces this via a two-step typed confirmation.
@@ -756,6 +762,7 @@ impl Dashboard {
                     }
                     WsMsg::PositionClose { address, .. } => {
                         self.open.remove(&address);
+                        let _ = self.cmd_tx.try_send(DashCmd::RefreshBotTradesAfterClose);
                     }
                     WsMsg::BalanceUpdate { balance } => self.balance = Some(balance),
                     WsMsg::PausedState { paused } => self.paused = paused,
@@ -772,6 +779,8 @@ impl Dashboard {
                         v3_tape,
                         time_kill_detail,
                     } => {
+                        let refresh_history =
+                            kind == TxEventKind::Sell && status == "confirmed";
                         if self.tx_log.len() >= 256 {
                             self.tx_log.pop_front();
                         }
@@ -788,6 +797,9 @@ impl Dashboard {
                             v3_tape,
                             time_kill_detail,
                         });
+                        if refresh_history {
+                            let _ = self.cmd_tx.try_send(DashCmd::RefreshBotTradesAfterClose);
+                        }
                     }
                 },
             }
@@ -1228,8 +1240,8 @@ impl eframe::App for Dashboard {
                                         .radius(9.0)
                                         .shape(MarkerShape::Down)
                                         .name(format!(
-                                            "SELL +{:.0}s {prefix}{:.*} ({:+.0}%)",
-                                            x_exit, dec, exit_y, marker.pnl
+                                            "SELL +{:.0}s {prefix}{:.*} ({:+.0}%) — {}",
+                                            x_exit, dec, exit_y, marker.pnl, marker.reason
                                         )),
                                 );
                             }
@@ -1467,6 +1479,8 @@ impl eframe::App for Dashboard {
         if should_poll {
             let _ = self.cmd_tx.try_send(DashCmd::FetchMode);
             let _ = self.cmd_tx.try_send(DashCmd::FetchTxLog);
+            let _ = self.cmd_tx.try_send(DashCmd::FetchBotTrades);
+            let _ = self.cmd_tx.try_send(DashCmd::FetchStatus);
             let _ = self.cmd_tx.try_send(DashCmd::FetchOpenPositions);
             self.last_http_poll = Some(std::time::Instant::now());
         }
@@ -2047,51 +2061,21 @@ async fn ws_loop(
                 let _ = tx.send(AppEvent::Connected);
                 ctx.request_repaint();
 
-                // Fetch bot trades
                 {
-                    let url = format!("{}/bot-trades", http_url);
+                    let url = http_url.clone();
                     let tx2 = tx.clone();
                     let ctx2 = ctx.clone();
                     tokio::spawn(async move {
-                        if let Ok(resp) = reqwest::get(&url).await {
-                            if let Ok(rows) = resp.json::<Vec<BotTradeRow>>().await {
-                                let _ = tx2.send(AppEvent::BotTrades(rows));
-                                ctx2.request_repaint();
-                            }
-                        }
+                        fetch_bot_trades_http(&url, &tx2, &ctx2).await;
                     });
                 }
 
-                // Fetch status
                 {
-                    #[derive(serde::Deserialize)]
-                    struct StatusResp {
-                        paused: bool,
-                        balance_sol: f64,
-                        #[serde(default)]
-                        mode: Option<String>,
-                        #[serde(default)]
-                        wallet: Option<String>,
-                    }
-                    let url = format!("{}/status", http_url);
+                    let url = http_url.clone();
                     let tx2 = tx.clone();
                     let ctx2 = ctx.clone();
                     tokio::spawn(async move {
-                        if let Ok(resp) = reqwest::get(&url).await {
-                            if let Ok(s) = resp.json::<StatusResp>().await {
-                                let _ = tx2.send(AppEvent::Status {
-                                    paused: s.paused,
-                                    mode: s.mode,
-                                });
-                                if let Some(pk) = s.wallet {
-                                    let _ = tx2.send(AppEvent::Pubkey(pk));
-                                }
-                                let _ = tx2.send(AppEvent::Msg(WsMsg::BalanceUpdate {
-                                    balance: s.balance_sol,
-                                }));
-                                ctx2.request_repaint();
-                            }
-                        }
+                        fetch_status_http(&url, &tx2, &ctx2).await;
                     });
                 }
 
@@ -2137,18 +2121,27 @@ async fn ws_loop(
                                             // WS broadcast is lossy on reconnect; refresh OPEN from HTTP.
                                             fetch_open_positions_http(&http_url, &tx, &ctx);
                                         }
-                                        if let WsMsg::PositionClose { .. } = &parsed {
-                                            let url = format!("{}/bot-trades", http_url);
-                                            let tx2 = tx.clone(); let ctx2 = ctx.clone();
-                                            tokio::spawn(async move {
-                                                tokio::time::sleep(Duration::from_millis(1500)).await;
-                                                if let Ok(resp) = reqwest::get(&url).await {
-                                                    if let Ok(rows) = resp.json::<Vec<BotTradeRow>>().await {
-                                                        let _ = tx2.send(AppEvent::BotTrades(rows));
-                                                        ctx2.request_repaint();
-                                                    }
-                                                }
-                                            });
+                                        let refresh_history = match &parsed {
+                                            WsMsg::PositionClose { .. } => true,
+                                            WsMsg::TxEvent {
+                                                kind: TxEventKind::Sell,
+                                                status,
+                                                ..
+                                            } => status == "confirmed",
+                                            _ => false,
+                                        };
+                                        let refresh_status = match &parsed {
+                                            WsMsg::PositionClose { .. } => true,
+                                            WsMsg::TxEvent { kind, .. } => {
+                                                matches!(kind, TxEventKind::Buy | TxEventKind::Sell)
+                                            }
+                                            _ => false,
+                                        };
+                                        if refresh_history {
+                                            schedule_bot_trades_refresh(&http_url, &tx, &ctx);
+                                        }
+                                        if refresh_status {
+                                            schedule_status_refresh(&http_url, &tx, &ctx);
                                         }
                                         let _ = tx.send(AppEvent::Msg(parsed));
                                         ctx.request_repaint();
@@ -2261,6 +2254,28 @@ async fn ws_loop(
                                             }
                                     });
                                 }
+                                Some(DashCmd::FetchBotTrades) => {
+                                    let url = http_url.clone();
+                                    let tx2 = tx.clone();
+                                    let ctx2 = ctx.clone();
+                                    tokio::spawn(async move {
+                                        fetch_bot_trades_http(&url, &tx2, &ctx2).await;
+                                    });
+                                }
+                                Some(DashCmd::FetchStatus) => {
+                                    let url = http_url.clone();
+                                    let tx2 = tx.clone();
+                                    let ctx2 = ctx.clone();
+                                    tokio::spawn(async move {
+                                        fetch_status_http(&url, &tx2, &ctx2).await;
+                                    });
+                                }
+                                Some(DashCmd::RefreshBotTradesAfterClose) => {
+                                    let url = http_url.clone();
+                                    let tx2 = tx.clone();
+                                    let ctx2 = ctx.clone();
+                                    schedule_bot_trades_refresh(&url, &tx2, &ctx2);
+                                }
                                 Some(DashCmd::FetchOpenPositions) => {
                                     let url = http_url.clone();
                                     let tx2 = tx.clone();
@@ -2317,6 +2332,107 @@ async fn ws_loop(
 }
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct StatusResp {
+    paused: bool,
+    balance_sol: f64,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    wallet: Option<String>,
+}
+
+async fn fetch_status_http(
+    http_url: &str,
+    tx: &mpsc::SyncSender<AppEvent>,
+    ctx: &egui::Context,
+) {
+    let url = format!("{}/status", http_url);
+    match reqwest::get(&url).await {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(s) = resp.json::<StatusResp>().await {
+                let _ = tx.send(AppEvent::Status {
+                    paused: s.paused,
+                    mode: s.mode,
+                });
+                if let Some(pk) = s.wallet {
+                    let _ = tx.send(AppEvent::Pubkey(pk));
+                }
+                let _ = tx.send(AppEvent::Msg(WsMsg::BalanceUpdate {
+                    balance: s.balance_sol,
+                }));
+                ctx.request_repaint();
+            } else {
+                eprintln!("[dashboard] GET /status: JSON decode failed");
+            }
+        }
+        Ok(resp) => {
+            eprintln!("[dashboard] GET /status: HTTP {}", resp.status());
+        }
+        Err(e) => eprintln!("[dashboard] GET /status: {e}"),
+    }
+}
+
+/// Re-fetch balance after BUY/SELL/close; broker/RPC may update shortly after the WS event.
+fn schedule_status_refresh(
+    http_url: &str,
+    tx: &mpsc::SyncSender<AppEvent>,
+    ctx: &egui::Context,
+) {
+    let http_url = http_url.to_string();
+    let tx = tx.clone();
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        for delay_ms in [0_u64, 400, 1500] {
+            if delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            fetch_status_http(&http_url, &tx, &ctx).await;
+        }
+    });
+}
+
+async fn fetch_bot_trades_http(
+    http_url: &str,
+    tx: &mpsc::SyncSender<AppEvent>,
+    ctx: &egui::Context,
+) {
+    let url = format!("{}/bot-trades", http_url);
+    match reqwest::get(&url).await {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(rows) = resp.json::<Vec<BotTradeRow>>().await {
+                let _ = tx.send(AppEvent::BotTrades(rows));
+                ctx.request_repaint();
+            } else {
+                eprintln!("[dashboard] GET /bot-trades: JSON decode failed");
+            }
+        }
+        Ok(resp) => {
+            eprintln!("[dashboard] GET /bot-trades: HTTP {}", resp.status());
+        }
+        Err(e) => eprintln!("[dashboard] GET /bot-trades: {e}"),
+    }
+}
+
+/// Re-fetch HISTORY after close; bot writes `bot_trades` asynchronously after WS events.
+fn schedule_bot_trades_refresh(
+    http_url: &str,
+    tx: &mpsc::SyncSender<AppEvent>,
+    ctx: &egui::Context,
+) {
+    let http_url = http_url.to_string();
+    let tx = tx.clone();
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        for delay_ms in [0_u64, 800, 2000, 5000] {
+            if delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            fetch_bot_trades_http(&http_url, &tx, &ctx).await;
+        }
+    });
+}
 
 fn fetch_open_positions_http(
     http_url: &str,
