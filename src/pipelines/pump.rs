@@ -32,6 +32,7 @@ pub struct PumpPipeline {
     pumpswap_metrics: Arc<FeedMetrics>,
     dedup: SharedDedup,
     enable_pumpswap: bool,
+    launchpad_tx: Sender<PumpLaunchpadCommand>,
 }
 
 impl PumpPipeline {
@@ -47,6 +48,11 @@ impl PumpPipeline {
         dedup: SharedDedup,
         enable_pumpswap: bool,
     ) -> Self {
+        let (mut actor, launchpad_tx) = PumpLaunchpadStorageActor::new(sniper_threshold);
+        tokio::spawn(async move {
+            actor.listen().await;
+        });
+
         Self {
             ws_url,
             config,
@@ -57,19 +63,20 @@ impl PumpPipeline {
             pumpswap_metrics,
             dedup,
             enable_pumpswap,
+            launchpad_tx,
         }
     }
 
+    pub fn launchpad(&self) -> &Sender<PumpLaunchpadCommand> {
+        &self.launchpad_tx
+    }
+
     pub fn run(&mut self) {
-        let (mut actor, handler) = PumpLaunchpadStorageActor::new(self.sniper_threshold);
+        let handler = self.launchpad_tx.clone();
 
         let (pump_feed, mut pump_rx) = Feed::<PumpEvent>::with_metrics(self.pump_metrics.clone());
         let (pumpswap_feed, _pumpswap_rx) =
             Feed::<PumpAmmEvent>::with_metrics(self.pumpswap_metrics.clone());
-
-        tokio::spawn(async move {
-            actor.listen().await;
-        });
 
         tokio::spawn(pump_feed.subscribe(
             self.ws_url.clone(),

@@ -2,9 +2,13 @@
 //! no decisions, no I/O beyond the swarm/registry queries.
 
 use solana_address::Address;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::helper::Amount;
-use crate::launchpads::token_bucket::TokenBucket;
+use crate::launchpads::{
+    pump::launchpad::PumpLaunchpadCommand,
+    token_bucket::TokenBucket,
+};
 use crate::persistence::creators::CreatorStatistics;
 use crate::scoring::anti_bundle::{compute_bundle_stats, BundleStats};
 use crate::scoring::config::FeatureThresholds;
@@ -157,6 +161,64 @@ pub async fn snapshot_early_tape(bucket: &TokenBucket) -> EarlyTapePoint {
         cum_sell_events,
         mcap_sol,
     }
+}
+
+/// Live bucket from launchpad storage (pool state includes trades since create).
+pub async fn fetch_live_bucket(
+    launchpad: &mpsc::Sender<PumpLaunchpadCommand>,
+    mint: Address,
+) -> Option<TokenBucket> {
+    let (tx, rx) = oneshot::channel();
+    launchpad
+        .send(PumpLaunchpadCommand::GetBucket {
+            mint,
+            respond_to: tx,
+        })
+        .await
+        .ok()?;
+    rx.await.ok()
+}
+
+/// Like `observe_early_tape_points`, but each sample uses a fresh bucket from
+/// launchpad storage so `mcap_sol` tracks bonding-curve trades during the window.
+pub async fn observe_early_tape_points_live(
+    launchpad: &mpsc::Sender<PumpLaunchpadCommand>,
+    mint: Address,
+    window_ms: u64,
+    slices: usize,
+) -> Vec<EarlyTapePoint> {
+    let s = slices.max(1) as u64;
+    let window_ms = window_ms.max(1);
+    if s <= 1 {
+        tokio::time::sleep(std::time::Duration::from_millis(window_ms)).await;
+        if let Some(bucket) = fetch_live_bucket(launchpad, mint).await {
+            return vec![snapshot_early_tape(&bucket).await];
+        }
+        return Vec::new();
+    }
+
+    let slice_ms = (window_ms / s).max(1);
+    let mut out: Vec<EarlyTapePoint> = Vec::with_capacity(s as usize);
+    for i in 0..s {
+        if i > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(slice_ms)).await;
+        }
+        if let Some(bucket) = fetch_live_bucket(launchpad, mint).await {
+            out.push(snapshot_early_tape(&bucket).await);
+        }
+    }
+    let used = slice_ms.saturating_mul(s.saturating_sub(1));
+    if window_ms > used {
+        tokio::time::sleep(std::time::Duration::from_millis(window_ms - used)).await;
+        if let Some(bucket) = fetch_live_bucket(launchpad, mint).await {
+            if let Some(last) = out.last_mut() {
+                *last = snapshot_early_tape(&bucket).await;
+            } else {
+                out.push(snapshot_early_tape(&bucket).await);
+            }
+        }
+    }
+    out
 }
 
 /// `slices` evenly spaced samples across `window_ms` (last point refreshed at window end).

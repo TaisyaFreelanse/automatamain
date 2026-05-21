@@ -236,6 +236,7 @@ async fn main() {
         dedup.clone(),
         false,
     );
+    let launchpad_tx = pump.launchpad().clone();
     tokio::spawn(async move { pump.run() });
 
     // Periodic feed-metrics logger with simple anomaly alerting: EMA of
@@ -809,6 +810,7 @@ async fn main() {
                 let dev_ranker_for_create = dev_ranker_handle.clone();
                 let smart_money_for_create = smart_money_handle.clone();
                 let bucket_for_score = bucket.clone();
+                let launchpad_for_score = launchpad_tx.clone();
                 let buy_cap = buy_size_state.clone();
                 let learning_log_create = learning_log.clone();
                 let learning_overrides_spawn = learning_overrides.clone();
@@ -914,19 +916,37 @@ async fn main() {
                         bot_metrics_create.note_passed_filter();
 
                         // --- Stage 2: scoring window + early tape ---------
-                        let initial_mcap_sol =
-                            bucket_for_score.pool().market_cap().amount().to_float();
                         let window_ms = filter_config.scoring.scoring_window_ms;
                         let tape_slices = filter_config
                             .scoring
                             .buyer_velocity_slices
                             .max(1);
-                        let tape_points = features::observe_early_tape_points(
-                            &bucket_for_score,
+                        let tape_points = features::observe_early_tape_points_live(
+                            &launchpad_for_score,
+                            mint_address,
                             window_ms,
                             tape_slices,
                         )
                         .await;
+
+                        let scoring_bucket = features::fetch_live_bucket(
+                            &launchpad_for_score,
+                            mint_address,
+                        )
+                        .await
+                        .unwrap_or(bucket_for_score.clone());
+
+                        let pool_mcap = |b: &loggaper::launchpads::token_bucket::TokenBucket| {
+                            b.pool().market_cap().amount().to_float()
+                        };
+                        let initial_mcap_sol = tape_points
+                            .first()
+                            .map(|p| p.mcap_sol)
+                            .unwrap_or_else(|| pool_mcap(&scoring_bucket));
+                        let current_mcap_sol = tape_points
+                            .last()
+                            .map(|p| p.mcap_sol)
+                            .unwrap_or_else(|| pool_mcap(&scoring_bucket));
 
                         let merged_thr = merge_thresholds(
                             &filter_config.scoring.thresholds,
@@ -940,7 +960,7 @@ async fn main() {
 
                         // --- Stage 3: snapshot features ---------------------
                         let (early_buyers, _buy_sizes_sol, buy_volume_sol, still_long, sold, bundle) =
-                            features::snapshot_early_buyers(&bucket_for_score, thr_snapshot).await;
+                            features::snapshot_early_buyers(&scoring_bucket, thr_snapshot).await;
 
                         let (dev_category, dev_record) =
                             dev_ranker_for_create.category(general_create.user).await;
@@ -954,7 +974,7 @@ async fn main() {
                             .await;
                         let mut smart_wallet_early_exits: u32 = 0;
                         for a in smart_addrs {
-                            if let Some(t) = bucket_for_score.swarm().get_trader(a).await {
+                            if let Some(t) = scoring_bucket.swarm().get_trader(a).await {
                                 if t.holdings().raw() == 0 && t.total_spent().raw() > 0 {
                                     smart_wallet_early_exits += 1;
                                 }
@@ -965,9 +985,6 @@ async fn main() {
                             &tape_points,
                             smart_wallet_early_exits,
                         );
-
-                        let current_mcap_sol =
-                            bucket_for_score.pool().market_cap().amount().to_float();
 
                         let regular_buyer_count = early_buyers.regulars.len() as u64;
                         let sniper_count = early_buyers.snipers.len() as u64;
@@ -1178,7 +1195,7 @@ async fn main() {
 
                         if tx
                             .send(PositionMessage::InitiateBuy {
-                                pool: bucket_for_score.pool().clone_box(),
+                                pool: scoring_bucket.pool().clone_box(),
                                 amount_sol,
                                 open_reason,
                                 dev_address: Some(general_create.user),
