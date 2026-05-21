@@ -507,19 +507,31 @@ async fn main() {
         }
 
         async fn get_bot_trades(State(state): State<ApiState>) -> impl IntoResponse {
-            match sqlx::query_as::<_, BotTradeRow>(
-                "SELECT id, mint, entry_mcap_sol, invested_sol, realized_pnl_pct, close_reason, \
+            const Q: &str = "SELECT id, mint, entry_mcap_sol, invested_sol, realized_pnl_pct, close_reason, \
                  entry_at, closed_at, exit_mcap_sol, entry_meta \
-                 FROM bot_trades ORDER BY closed_at DESC"
-            )
-            .fetch_all(&state.pool)
-            .await {
-                Ok(rows) => Json(rows).into_response(),
-                Err(e) => {
-                    eprintln!("[HTTP] bot_trades error: {e}");
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                 FROM bot_trades ORDER BY closed_at DESC";
+            let mut last_err = None;
+            for attempt in 0..3u8 {
+                match sqlx::query_as::<_, BotTradeRow>(Q).fetch_all(&state.pool).await {
+                    Ok(rows) => return Json(rows).into_response(),
+                    Err(e) => {
+                        let retryable = e.to_string().contains("timed out");
+                        last_err = Some(e);
+                        if retryable && attempt < 2 {
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                40 * (attempt as u64 + 1),
+                            ))
+                            .await;
+                            continue;
+                        }
+                        break;
+                    }
                 }
             }
+            if let Some(e) = last_err {
+                eprintln!("[HTTP] bot_trades error: {e}");
+            }
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
 
         async fn get_chart(

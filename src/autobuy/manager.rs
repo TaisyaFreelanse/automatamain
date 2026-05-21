@@ -1053,11 +1053,6 @@ impl PositionManagerActor {
                                 });
                             }
 
-                            let _ = self.event_tx.try_send(WsFeedMessage::PositionClose {
-                                address: mint.to_string(),
-                                reason: reason.clone(),
-                            });
-
                             // Historical bug: the row used to report
                             // `invested_sol = initial_holdings.to_float()`,
                             // which is in TOKEN units, and `realized_pnl_pct`
@@ -1093,17 +1088,24 @@ impl PositionManagerActor {
                                 entry_mcap_sol,
                                 invested_sol: invested_sol_row,
                                 realized_pnl_pct: realized_pnl_pct_row,
-                                close_reason: reason,
+                                close_reason: reason.clone(),
                                 entry_at: close_entry_time as i64,
                                 closed_at: closed_at_ts,
                                 exit_mcap_sol,
                                 entry_meta: entry_meta_json(close_learning_snapshot.as_ref()),
                             };
                             let repo = self.bot_trades.clone();
+                            let event_tx = self.event_tx.clone();
+                            let address = mint.to_string();
+                            let reason_ws = reason;
                             tokio::spawn(async move {
                                 if let Err(e) = repo.save_bot_trade(entry).await {
                                     eprintln!("[BOT TRADE] save failed: {e:?}");
                                 }
+                                let _ = event_tx.try_send(WsFeedMessage::PositionClose {
+                                    address,
+                                    reason: reason_ws,
+                                });
                             });
                         }
                     }

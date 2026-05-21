@@ -46,6 +46,7 @@ pub async fn setup_postgres_pool(max_connections: u32) -> Pool<Postgres> {
 
     sqlx::postgres::PgPoolOptions::new()
         .max_connections(max_connections)
+        .acquire_timeout(std::time::Duration::from_secs(15))
         .connect(&std::env::var("DATABASE_URL").expect("DATABASE_URL must be set"))
         .await
         .unwrap()

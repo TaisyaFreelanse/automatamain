@@ -6,7 +6,11 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+        Arc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -189,6 +193,7 @@ pub struct BotTradeRow {
     pub invested_sol: f64,
     pub realized_pnl_pct: f64,
     pub close_reason: String,
+    pub entry_at: i64,
     pub closed_at: i64,
     pub exit_mcap_sol: f64,
     #[serde(default)]
@@ -768,7 +773,7 @@ impl Dashboard {
                     }
                     WsMsg::PositionClose { address, .. } => {
                         self.open.remove(&address);
-                        let _ = self.cmd_tx.try_send(DashCmd::RefreshBotTradesAfterClose);
+                        send_dash_cmd(&self.cmd_tx, DashCmd::RefreshBotTradesAfterClose);
                     }
                     WsMsg::BalanceUpdate { balance } => self.balance = Some(balance),
                     WsMsg::PausedState { paused } => self.paused = paused,
@@ -808,7 +813,7 @@ impl Dashboard {
                             pnl_sol_pct,
                         });
                         if refresh_history {
-                            let _ = self.cmd_tx.try_send(DashCmd::RefreshBotTradesAfterClose);
+                            send_dash_cmd(&self.cmd_tx, DashCmd::RefreshBotTradesAfterClose);
                         }
                     }
                 },
@@ -1487,11 +1492,11 @@ impl eframe::App for Dashboard {
             .map(|t| t.elapsed() >= Duration::from_secs(5))
             .unwrap_or(true);
         if should_poll {
-            let _ = self.cmd_tx.try_send(DashCmd::FetchMode);
-            let _ = self.cmd_tx.try_send(DashCmd::FetchTxLog);
-            let _ = self.cmd_tx.try_send(DashCmd::FetchBotTrades);
-            let _ = self.cmd_tx.try_send(DashCmd::FetchStatus);
-            let _ = self.cmd_tx.try_send(DashCmd::FetchOpenPositions);
+            send_dash_cmd(&self.cmd_tx, DashCmd::FetchMode);
+            send_dash_cmd(&self.cmd_tx, DashCmd::FetchTxLog);
+            send_dash_cmd(&self.cmd_tx, DashCmd::FetchBotTrades);
+            send_dash_cmd(&self.cmd_tx, DashCmd::FetchStatus);
+            send_dash_cmd(&self.cmd_tx, DashCmd::FetchOpenPositions);
             self.last_http_poll = Some(std::time::Instant::now());
         }
 
@@ -2065,6 +2070,12 @@ fn spawn_ws_thread(
     });
 }
 
+fn send_dash_cmd(cmd_tx: &tokio::sync::mpsc::Sender<DashCmd>, cmd: DashCmd) {
+    if let Err(e) = cmd_tx.try_send(cmd) {
+        eprintln!("[dashboard] cmd channel full, dropped: {e}");
+    }
+}
+
 async fn ws_loop(
     tx: mpsc::SyncSender<AppEvent>,
     ctx: egui::Context,
@@ -2075,6 +2086,19 @@ async fn ws_loop(
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message;
+
+    let bot_trades_gen = Arc::new(AtomicU64::new(0));
+
+    // HISTORY via HTTP — do not wait for WS (startup / reconnect gaps).
+    {
+        let url = http_url.clone();
+        let tx2 = tx.clone();
+        let ctx2 = ctx.clone();
+        let fetch_gen = bot_trades_gen.clone();
+        tokio::spawn(async move {
+            fetch_bot_trades_http(&url, &tx2, &ctx2, &fetch_gen).await;
+        });
+    }
 
     // SOL price fetcher
     let tx_price = tx.clone();
@@ -2110,8 +2134,9 @@ async fn ws_loop(
                     let url = http_url.clone();
                     let tx2 = tx.clone();
                     let ctx2 = ctx.clone();
+                    let fetch_gen = bot_trades_gen.clone();
                     tokio::spawn(async move {
-                        fetch_bot_trades_http(&url, &tx2, &ctx2).await;
+                        fetch_bot_trades_http(&url, &tx2, &ctx2, &fetch_gen).await;
                     });
                 }
 
@@ -2183,7 +2208,12 @@ async fn ws_loop(
                                             _ => false,
                                         };
                                         if refresh_history {
-                                            schedule_bot_trades_refresh(&http_url, &tx, &ctx);
+                                            schedule_bot_trades_refresh(
+                                                &http_url,
+                                                &tx,
+                                                &ctx,
+                                                &bot_trades_gen,
+                                            );
                                         }
                                         if refresh_status {
                                             schedule_status_refresh(&http_url, &tx, &ctx);
@@ -2307,8 +2337,9 @@ async fn ws_loop(
                                     let url = http_url.clone();
                                     let tx2 = tx.clone();
                                     let ctx2 = ctx.clone();
+                                    let fetch_gen = bot_trades_gen.clone();
                                     tokio::spawn(async move {
-                                        fetch_bot_trades_http(&url, &tx2, &ctx2).await;
+                                        fetch_bot_trades_http(&url, &tx2, &ctx2, &fetch_gen).await;
                                     });
                                 }
                                 Some(DashCmd::FetchStatus) => {
@@ -2323,7 +2354,8 @@ async fn ws_loop(
                                     let url = http_url.clone();
                                     let tx2 = tx.clone();
                                     let ctx2 = ctx.clone();
-                                    schedule_bot_trades_refresh(&url, &tx2, &ctx2);
+                                    let fetch_gen = bot_trades_gen.clone();
+                                    schedule_bot_trades_refresh(&url, &tx2, &ctx2, &fetch_gen);
                                 }
                                 Some(DashCmd::FetchOpenPositions) => {
                                     let url = http_url.clone();
@@ -2446,39 +2478,55 @@ async fn fetch_bot_trades_http(
     http_url: &str,
     tx: &mpsc::SyncSender<AppEvent>,
     ctx: &egui::Context,
+    fetch_gen: &AtomicU64,
 ) {
+    let my_gen = fetch_gen.fetch_add(1, Ordering::SeqCst) + 1;
     let url = format!("{}/bot-trades", http_url);
-    match reqwest::get(&url).await {
-        Ok(resp) if resp.status().is_success() => {
-            if let Ok(rows) = resp.json::<Vec<BotTradeRow>>().await {
-                let _ = tx.send(AppEvent::BotTrades(rows));
-                ctx.request_repaint();
-            } else {
-                eprintln!("[dashboard] GET /bot-trades: JSON decode failed");
+    let rows = match reqwest::get(&url).await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Vec<BotTradeRow>>().await {
+            Ok(rows) => Some(rows),
+            Err(e) => {
+                eprintln!("[dashboard] GET /bot-trades: JSON decode failed: {e}");
+                None
             }
-        }
+        },
         Ok(resp) => {
             eprintln!("[dashboard] GET /bot-trades: HTTP {}", resp.status());
+            None
         }
-        Err(e) => eprintln!("[dashboard] GET /bot-trades: {e}"),
+        Err(e) => {
+            eprintln!("[dashboard] GET /bot-trades: {e}");
+            None
+        }
+    };
+    if fetch_gen.load(Ordering::SeqCst) != my_gen {
+        return;
+    }
+    if let Some(rows) = rows {
+        match tx.send(AppEvent::BotTrades(rows)) {
+            Ok(()) => ctx.request_repaint(),
+            Err(e) => eprintln!("[dashboard] BotTrades event dropped (UI backlog): {e}"),
+        }
     }
 }
 
-/// Re-fetch HISTORY after close; bot writes `bot_trades` asynchronously after WS events.
+/// Re-fetch HISTORY after close (DB write may lag; pool timeouts can fail early GETs).
 fn schedule_bot_trades_refresh(
     http_url: &str,
     tx: &mpsc::SyncSender<AppEvent>,
     ctx: &egui::Context,
+    fetch_gen: &Arc<AtomicU64>,
 ) {
     let http_url = http_url.to_string();
     let tx = tx.clone();
     let ctx = ctx.clone();
+    let fetch_gen = fetch_gen.clone();
     tokio::spawn(async move {
-        for delay_ms in [0_u64, 800, 2000, 5000] {
+        for delay_ms in [0_u64, 800, 2000, 5000, 10_000, 15_000] {
             if delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             }
-            fetch_bot_trades_http(&http_url, &tx, &ctx).await;
+            fetch_bot_trades_http(&http_url, &tx, &ctx, &fetch_gen).await;
         }
     });
 }
@@ -2598,7 +2646,7 @@ fn main() -> eframe::Result<()> {
     let config = load_config();
 
     let (tx, rx) = mpsc::sync_channel::<AppEvent>(1024);
-    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<DashCmd>(32);
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<DashCmd>(128);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
