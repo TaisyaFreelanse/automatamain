@@ -6,6 +6,7 @@ pub struct BotTradeEntry {
     pub invested_sol: f64,
     pub realized_pnl_pct: f64,
     pub close_reason: String,
+    pub entry_at: i64,
     pub closed_at: i64,
     pub exit_mcap_sol: f64,
     /// JSON of `V3TapeWire` at entry (empty string if unknown).
@@ -20,6 +21,7 @@ pub struct BotTradeRow {
     pub invested_sol: f64,
     pub realized_pnl_pct: f64,
     pub close_reason: String,
+    pub entry_at: i64,
     pub closed_at: i64,
     pub exit_mcap_sol: f64,
     pub entry_meta: String,

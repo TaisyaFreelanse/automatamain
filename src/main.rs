@@ -390,7 +390,8 @@ async fn main() {
 
         async fn get_bot_trades(State(state): State<ApiState>) -> impl IntoResponse {
             match sqlx::query_as::<_, BotTradeRow>(
-                "SELECT id, mint, entry_mcap_sol, invested_sol, realized_pnl_pct, close_reason, closed_at, exit_mcap_sol, entry_meta \
+                "SELECT id, mint, entry_mcap_sol, invested_sol, realized_pnl_pct, close_reason, \
+                 entry_at, closed_at, exit_mcap_sol, entry_meta \
                  FROM bot_trades ORDER BY closed_at DESC"
             )
             .fetch_all(&state.pool)
@@ -408,18 +409,28 @@ async fn main() {
             Path(mint): Path<String>,
         ) -> impl IntoResponse {
             #[derive(sqlx::FromRow)]
-            struct PricePoint {
-                market_cap: f64,
+            struct ChartPointRow {
+                t: i64,
+                mcap: f64,
             }
             #[derive(sqlx::FromRow)]
             struct BotTradeMarkerRow {
+                entry_at: i64,
+                closed_at: i64,
                 entry_mcap_sol: f64,
                 exit_mcap_sol: f64,
                 realized_pnl_pct: f64,
                 close_reason: String,
             }
             #[derive(serde::Serialize)]
+            struct ChartPoint {
+                t: i64,
+                mcap: f64,
+            }
+            #[derive(serde::Serialize)]
             struct ChartMarker {
+                entry_at: i64,
+                closed_at: i64,
                 entry_mcap: f64,
                 exit_mcap: f64,
                 pnl: f64,
@@ -427,12 +438,27 @@ async fn main() {
             }
             #[derive(serde::Serialize)]
             struct ChartResponse {
-                prices: Vec<f64>,
+                t0: i64,
+                points: Vec<ChartPoint>,
                 markers: Vec<ChartMarker>,
             }
 
-            let price_rows = match sqlx::query_as::<_, PricePoint>(
-                "SELECT market_cap::float8 AS market_cap \
+            fn infer_entry_at(entry_mcap: f64, closed_at: i64, points: &[(i64, f64)]) -> i64 {
+                points
+                    .iter()
+                    .filter(|(t, _)| *t <= closed_at)
+                    .min_by(|a, b| {
+                        (a.1 - entry_mcap)
+                            .abs()
+                            .partial_cmp(&(b.1 - entry_mcap).abs())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(t, _)| *t)
+                    .unwrap_or_else(|| points.first().map(|p| p.0).unwrap_or(closed_at))
+            }
+
+            let point_rows = match sqlx::query_as::<_, ChartPointRow>(
+                "SELECT CAST(slot_time AS BIGINT) AS t, market_cap::float8 AS mcap \
                  FROM trades \
                  WHERE coin_address = $1 AND currency = 'sol' \
                  ORDER BY slot_time ASC \
@@ -450,7 +476,7 @@ async fn main() {
             };
 
             let marker_rows = match sqlx::query_as::<_, BotTradeMarkerRow>(
-                "SELECT entry_mcap_sol, exit_mcap_sol, realized_pnl_pct, close_reason \
+                "SELECT entry_at, closed_at, entry_mcap_sol, exit_mcap_sol, realized_pnl_pct, close_reason \
                  FROM bot_trades \
                  WHERE mint = $1 \
                  ORDER BY closed_at ASC",
@@ -466,18 +492,38 @@ async fn main() {
                 }
             };
 
-            let prices: Vec<f64> = price_rows.into_iter().map(|p| p.market_cap).collect();
+            let points: Vec<ChartPoint> = point_rows
+                .into_iter()
+                .map(|p| ChartPoint { t: p.t, mcap: p.mcap })
+                .collect();
+            let series: Vec<(i64, f64)> = points.iter().map(|p| (p.t, p.mcap)).collect();
+            let t0 = points.first().map(|p| p.t).unwrap_or(0);
+
             let markers: Vec<ChartMarker> = marker_rows
                 .into_iter()
-                .map(|m| ChartMarker {
-                    entry_mcap: m.entry_mcap_sol,
-                    exit_mcap: m.exit_mcap_sol,
-                    pnl: m.realized_pnl_pct,
-                    reason: m.close_reason,
+                .map(|m| {
+                    let entry_at = if m.entry_at > 0 {
+                        m.entry_at
+                    } else {
+                        infer_entry_at(m.entry_mcap_sol, m.closed_at, &series)
+                    };
+                    ChartMarker {
+                        entry_at,
+                        closed_at: m.closed_at,
+                        entry_mcap: m.entry_mcap_sol,
+                        exit_mcap: m.exit_mcap_sol,
+                        pnl: m.realized_pnl_pct,
+                        reason: m.close_reason,
+                    }
                 })
                 .collect();
 
-            Json(ChartResponse { prices, markers }).into_response()
+            Json(ChartResponse {
+                t0,
+                points,
+                markers,
+            })
+            .into_response()
         }
 
         async fn get_dev_stats(

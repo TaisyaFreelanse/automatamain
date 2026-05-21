@@ -1019,16 +1019,18 @@ impl PositionManagerActor {
                                 0.0
                             };
 
+                            let closed_at_ts = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs() as i64;
                             let entry = BotTradeEntry {
                                 mint: mint.to_string(),
                                 entry_mcap_sol,
                                 invested_sol: invested_sol_row,
                                 realized_pnl_pct: realized_pnl_pct_row,
                                 close_reason: reason,
-                                closed_at: SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_secs() as i64,
+                                entry_at: close_entry_time as i64,
+                                closed_at: closed_at_ts,
                                 exit_mcap_sol,
                                 entry_meta: entry_meta_json(close_learning_snapshot.as_ref()),
                             };
@@ -1219,6 +1221,7 @@ impl PositionManagerActor {
                     invested_sol: amount_sol,
                     realized_pnl_pct: pnl_pct,
                     close_reason: reason,
+                    entry_at: now as i64,
                     closed_at: now as i64,
                     exit_mcap_sol,
                     entry_meta: entry_meta_json(learning_snapshot),

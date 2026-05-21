@@ -190,17 +190,58 @@ pub struct BotTradeRow {
 }
 
 #[derive(Deserialize, Clone)]
+struct ChartPoint {
+    t: i64,
+    mcap: f64,
+}
+
+#[derive(Deserialize, Clone)]
 struct ChartMarker {
+    entry_at: i64,
+    closed_at: i64,
     entry_mcap: f64,
     exit_mcap: f64,
     pnl: f64,
     reason: String,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, Default)]
 struct ChartData {
-    prices: Vec<f64>,
+    #[serde(default)]
+    t0: i64,
+    #[serde(default)]
+    points: Vec<ChartPoint>,
+    #[serde(default)]
     markers: Vec<ChartMarker>,
+}
+
+/// Linear mcap at unix time `t` from trade tape points.
+fn mcap_at_time(points: &[(i64, f64)], t: i64) -> f64 {
+    if points.is_empty() {
+        return 0.0;
+    }
+    if t <= points[0].0 {
+        return points[0].1;
+    }
+    if t >= points.last().unwrap().0 {
+        return points.last().unwrap().1;
+    }
+    for w in points.windows(2) {
+        let (t0, m0) = w[0];
+        let (t1, m1) = w[1];
+        if t >= t0 && t <= t1 {
+            if t1 == t0 {
+                return m0;
+            }
+            let f = (t - t0) as f64 / (t1 - t0) as f64;
+            return m0 + (m1 - m0) * f;
+        }
+    }
+    points.last().unwrap().1
+}
+
+fn chart_x_sec(t: i64, t0: i64) -> f64 {
+    (t - t0) as f64
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
@@ -862,7 +903,7 @@ impl eframe::App for Dashboard {
             egui::Window::new(format!("Chart: {}", short_addr(&mint)))
                 .open(&mut open)
                 .resizable(true)
-                .default_size([700.0, 400.0])
+                .default_size([820.0, 460.0])
                 .show(ctx, |ui| {
                     if ui.button("Dev Stats").clicked() {
                         let _ = self.cmd_tx.try_send(DashCmd::FetchDevStats(mint.clone()));
@@ -870,96 +911,159 @@ impl eframe::App for Dashboard {
                     }
                     ui.separator();
 
-                    use egui_plot::{Line, MarkerShape, Plot, PlotPoints, Points};
+                    if chart.points.is_empty() {
+                        ui.label("No trade tape for this mint yet.");
+                        return;
+                    }
+
+                    use egui_plot::{HLine, Line, MarkerShape, Plot, PlotPoints, Points, Polygon, VLine};
+
+                    let price_mult = self.sol_price.unwrap_or(1.0);
+                    let y_name = if self.sol_price.is_some() {
+                        "Market Cap ($)"
+                    } else {
+                        "Market Cap (SOL)"
+                    };
+                    let prefix = if self.sol_price.is_some() { "$" } else { "" };
+                    let dec = if self.sol_price.is_some() { 0 } else { 1 };
+                    let t0 = chart.t0;
+                    let series: Vec<(i64, f64)> =
+                        chart.points.iter().map(|p| (p.t, p.mcap)).collect();
+                    let ref_entry_mcap = chart
+                        .markers
+                        .first()
+                        .map(|m| m.entry_mcap)
+                        .unwrap_or(series.first().map(|(_, m)| *m).unwrap_or(1.0));
+                    let mut hover_tip = String::new();
 
                     Plot::new("price_chart")
-                        .height(300.0)
+                        .height(340.0)
                         .allow_drag(true)
                         .allow_zoom(true)
-                        .show(ui, |plot_ui| {
-                            let price_mult = self.sol_price.unwrap_or(1.0);
-                            let y_name = if self.sol_price.is_some() {
-                                "Market Cap ($)"
+                        .show_axes(true)
+                        .show_grid(true)
+                        .x_axis_label("Time (s from tape start)")
+                        .y_axis_label(y_name)
+                        .x_axis_formatter(|mark, _| format!("{:.0}s", mark.value))
+                        .label_formatter(|name, value| {
+                            if name.is_empty() {
+                                format!("{:.0}s", value.x)
                             } else {
-                                "Market Cap (SOL)"
-                            };
+                                format!("{name}\n{:.0}s", value.x)
+                            }
+                        })
+                        .show(ui, |plot_ui| {
+                            let bounds = plot_ui.plot_bounds();
+                            let y_lo = bounds.min()[1];
+                            let y_hi = bounds.max()[1];
 
                             let line_pts: PlotPoints = chart
-                                .prices
+                                .points
                                 .iter()
-                                .enumerate()
-                                .map(|(i, &p)| [i as f64, p * price_mult])
+                                .map(|p| {
+                                    [
+                                        chart_x_sec(p.t, t0),
+                                        p.mcap * price_mult,
+                                    ]
+                                })
                                 .collect();
                             plot_ui.line(
                                 Line::new(line_pts)
-                                    .color(egui::Color32::from_rgb(150, 200, 255))
-                                    .name(y_name),
+                                    .color(egui::Color32::from_rgb(120, 175, 255))
+                                    .width(2.0)
+                                    .name("MCap"),
                             );
 
-                            for marker in &chart.markers {
-                                let entry_idx = chart
-                                    .prices
-                                    .iter()
-                                    .enumerate()
-                                    .min_by(|x, y| {
-                                        let a = *x.1;
-                                        let b = *y.1;
-                                        (a - marker.entry_mcap)
-                                            .abs()
-                                            .partial_cmp(&(b - marker.entry_mcap).abs())
-                                            .unwrap()
-                                    })
-                                    .map(|(i, _)| i)
-                                    .unwrap_or(0);
+                            for (i, marker) in chart.markers.iter().enumerate() {
+                                let x_entry = chart_x_sec(marker.entry_at, t0);
+                                let x_exit = chart_x_sec(marker.closed_at, t0);
+                                let entry_y = mcap_at_time(&series, marker.entry_at) * price_mult;
+                                let exit_y = mcap_at_time(&series, marker.closed_at) * price_mult;
 
-                                let exit_idx = chart.prices[entry_idx..]
-                                    .iter()
-                                    .enumerate()
-                                    .min_by(|x, y| {
-                                        let a = *x.1;
-                                        let b = *y.1;
-                                        (a - marker.exit_mcap)
-                                            .abs()
-                                            .partial_cmp(&(b - marker.exit_mcap).abs())
-                                            .unwrap()
-                                    })
-                                    .map(|(i, _)| entry_idx + i)
-                                    .unwrap_or(entry_idx);
+                                let hold_fill = egui::Color32::from_rgba_premultiplied(80, 160, 255, 28);
+                                plot_ui.polygon(
+                                    Polygon::new(PlotPoints::new(vec![
+                                        [x_entry, y_lo],
+                                        [x_exit, y_lo],
+                                        [x_exit, y_hi],
+                                        [x_entry, y_hi],
+                                    ]))
+                                    .fill_color(hold_fill)
+                                    .allow_hover(false),
+                                );
 
-                                let entry_color = egui::Color32::from_rgb(80, 220, 80);
-                                let exit_color = if marker.pnl >= 0.0 {
-                                    egui::Color32::from_rgb(80, 220, 80)
+                                let vline_entry = egui::Color32::from_rgb(70, 210, 90);
+                                let vline_exit = if marker.pnl >= 0.0 {
+                                    egui::Color32::from_rgb(70, 210, 90)
                                 } else {
-                                    egui::Color32::from_rgb(220, 80, 80)
+                                    egui::Color32::from_rgb(230, 85, 85)
                                 };
+                                plot_ui.vline(
+                                    VLine::new(x_entry)
+                                        .color(vline_entry)
+                                        .width(1.5)
+                                        .name(format!("Entry #{i}")),
+                                );
+                                plot_ui.vline(
+                                    VLine::new(x_exit)
+                                        .color(vline_exit)
+                                        .width(1.5)
+                                        .style(egui_plot::LineStyle::dashed_dense())
+                                        .name(format!("Exit #{i}")),
+                                );
 
-                                let entry_val = marker.entry_mcap * price_mult;
-                                let exit_val = marker.exit_mcap * price_mult;
-                                let prefix = if self.sol_price.is_some() { "$" } else { "" };
-                                let dec = if self.sol_price.is_some() { 0 } else { 1 };
+                                plot_ui.hline(
+                                    HLine::new(entry_y)
+                                        .color(vline_entry.gamma_multiply(0.55))
+                                        .width(1.0)
+                                        .style(egui_plot::LineStyle::dotted_dense())
+                                        .allow_hover(false),
+                                );
 
                                 plot_ui.points(
-                                    Points::new(PlotPoints::new(vec![[
-                                        entry_idx as f64,
-                                        entry_val,
-                                    ]]))
-                                    .color(entry_color)
-                                    .radius(8.0)
-                                    .shape(MarkerShape::Up)
-                                    .name(format!("Entry {}{:.*}", prefix, dec, entry_val)),
+                                    Points::new(PlotPoints::new(vec![[x_entry, entry_y]]))
+                                        .color(vline_entry)
+                                        .radius(9.0)
+                                        .shape(MarkerShape::Up)
+                                        .name(format!(
+                                            "BUY +{:.0}s {}{:.*}",
+                                            x_entry, prefix, dec, entry_y
+                                        )),
                                 );
                                 plot_ui.points(
-                                    Points::new(PlotPoints::new(vec![[exit_idx as f64, exit_val]]))
-                                        .color(exit_color)
-                                        .radius(8.0)
+                                    Points::new(PlotPoints::new(vec![[x_exit, exit_y]]))
+                                        .color(vline_exit)
+                                        .radius(9.0)
                                         .shape(MarkerShape::Down)
                                         .name(format!(
-                                            "Exit {}{:.*} ({:+.1}%) {}",
-                                            prefix, dec, exit_val, marker.pnl, marker.reason
+                                            "SELL +{:.0}s {}{:.*} ({:+.1}%) {}",
+                                            x_exit, prefix, dec, exit_y, marker.pnl, marker.reason
                                         )),
                                 );
                             }
+
+                            if let Some(hover) = plot_ui.pointer_coordinate() {
+                                let mcap_plot = hover.y / price_mult;
+                                let pct = if ref_entry_mcap > 0.0 {
+                                    (mcap_plot / ref_entry_mcap - 1.0) * 100.0
+                                } else {
+                                    0.0
+                                };
+                                hover_tip = format!(
+                                    "t = +{:.0}s | mcap = {}{:.*} | {:+.1}% vs entry",
+                                    hover.x, prefix, dec, mcap_plot * price_mult, pct
+                                );
+                            }
                         });
+
+                    if hover_tip.is_empty() {
+                        ui.label(
+                            egui::RichText::new("Hover chart for time / mcap / % from entry")
+                                .weak(),
+                        );
+                    } else {
+                        ui.label(egui::RichText::new(hover_tip).monospace());
+                    }
                 });
             if !open {
                 self.chart_window = None;
