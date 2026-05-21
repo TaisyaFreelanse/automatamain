@@ -670,12 +670,17 @@ async fn main() {
             let point_series: Vec<(i64, f64)> = points.iter().map(|p| (p.t, p.mcap)).collect();
             let (win_lo, win_hi) = chart_trade_window_bounds(&marker_times, &point_series);
             points.retain(|p| p.t >= win_lo && p.t <= win_hi);
+            let entry_base = markers
+                .iter()
+                .map(|m| m.entry_at)
+                .min()
+                .unwrap_or(win_lo);
             for p in &mut points {
-                p.t = p.t.saturating_sub(win_lo);
+                p.t = p.t.saturating_sub(entry_base);
             }
             for m in &mut markers {
-                m.entry_at = m.entry_at.clamp(win_lo, win_hi).saturating_sub(win_lo);
-                m.closed_at = m.closed_at.clamp(win_lo, win_hi).saturating_sub(win_lo);
+                m.entry_at = m.entry_at.clamp(win_lo, win_hi).saturating_sub(entry_base);
+                m.closed_at = m.closed_at.clamp(win_lo, win_hi).saturating_sub(entry_base);
             }
 
             Json(ChartResponse {

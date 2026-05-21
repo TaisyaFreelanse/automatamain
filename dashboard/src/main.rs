@@ -314,16 +314,22 @@ fn chart_trade_window_bounds(markers: &[ChartMarker], points: &[ChartPoint]) -> 
     (0, CHART_POST_SECS)
 }
 
-/// Clip tape to entry−10s … exit+120s and re-base time so entry ≈ +10s (no negatives).
+/// Clip tape to entry−10s … exit+120s; re-base so BUY = 0s (pre-entry ≈ −10…0).
 fn chart_focus_trade_window(chart: &mut ChartData) {
     let (win_lo, win_hi) = chart_trade_window_bounds(&chart.markers, &chart.points);
     chart.points.retain(|p| p.t >= win_lo && p.t <= win_hi);
+    let entry_base = chart
+        .markers
+        .iter()
+        .map(|m| m.entry_at)
+        .min()
+        .unwrap_or(win_lo);
     for p in &mut chart.points {
-        p.t = p.t.saturating_sub(win_lo);
+        p.t = p.t.saturating_sub(entry_base);
     }
     for m in &mut chart.markers {
-        m.entry_at = m.entry_at.clamp(win_lo, win_hi).saturating_sub(win_lo);
-        m.closed_at = m.closed_at.clamp(win_lo, win_hi).saturating_sub(win_lo);
+        m.entry_at = m.entry_at.clamp(win_lo, win_hi).saturating_sub(entry_base);
+        m.closed_at = m.closed_at.clamp(win_lo, win_hi).saturating_sub(entry_base);
     }
 }
 
@@ -1088,7 +1094,22 @@ impl eframe::App for Dashboard {
                         .unwrap_or(series.first().map(|(_, m)| *m).unwrap_or(1.0));
                     let mut hover_tip = String::new();
 
-                    let x_lo = 0.0;
+                    let x_min = chart
+                        .points
+                        .iter()
+                        .map(|p| chart_x_sec(p.t, t0))
+                        .chain(
+                            chart
+                                .markers
+                                .iter()
+                                .flat_map(|m| {
+                                    [
+                                        chart_x_sec(m.entry_at, t0),
+                                        chart_x_sec(m.closed_at, t0),
+                                    ]
+                                }),
+                        )
+                        .fold(f64::INFINITY, f64::min);
                     let x_hi = chart
                         .points
                         .iter()
@@ -1104,8 +1125,9 @@ impl eframe::App for Dashboard {
                                     ]
                                 }),
                         )
-                        .fold(0.0_f64, f64::max)
+                        .fold(f64::NEG_INFINITY, f64::max)
                         .max(1.0);
+                    let x_lo = if x_min.is_finite() { x_min } else { -10.0 };
                     let y_bounds = chart_plot_y_bounds(
                         &chart.points,
                         &chart.markers,
@@ -1119,24 +1141,66 @@ impl eframe::App for Dashboard {
                         .allow_zoom(true)
                         .show_axes(true)
                         .show_grid(true)
-                        .x_axis_label("Time (s from entry −10s)")
+                        .set_margin_fraction(egui::vec2(0.12, 0.08))
+                        .x_axis_label("Time (s, BUY = 0)")
                         .y_axis_label(y_name)
                         .x_axis_formatter(|mark, _| format!("{:.0}s", mark.value))
                         .label_formatter(|name, value| {
                             if name.is_empty() {
                                 format!("{:.0}s", value.x)
                             } else {
-                                format!("{name}\n{:.0}s", value.x)
+                                name.to_string()
                             }
                         });
-                    let x_pad = (x_hi * 0.04).max(2.0);
-                    plot = plot.include_x(0.0).include_x(x_hi + x_pad);
+                    let x_pad = 4.0;
+                    plot = plot
+                        .include_x(x_lo - x_pad)
+                        .include_x(x_hi + x_pad);
                     if let Some((y_lo, y_hi)) = y_bounds {
                         let pad = ((y_hi - y_lo) * 0.12).max(y_hi * 0.05).max(1.0);
                         plot = plot.include_y(y_lo - pad).include_y(y_hi + pad);
                     }
 
                     plot.show(ui, |plot_ui| {
+                            // Hold zones under the price line.
+                            for marker in &chart.markers {
+                                let x_entry = chart_x_sec(marker.entry_at, t0);
+                                let x_exit = chart_x_sec(marker.closed_at, t0);
+                                if x_exit < x_entry {
+                                    continue;
+                                }
+                                let entry_y = marker.entry_mcap * price_mult;
+                                let exit_y = marker.exit_mcap * price_mult;
+                                if !entry_y.is_finite()
+                                    || !exit_y.is_finite()
+                                    || entry_y <= 0.0
+                                    || exit_y <= 0.0
+                                {
+                                    continue;
+                                }
+                                let (zone_y_lo, zone_y_hi) = chart_plot_y_bounds(
+                                    &chart.points,
+                                    &[],
+                                    price_mult,
+                                    x_entry,
+                                    x_exit,
+                                )
+                                .unwrap_or((entry_y.min(exit_y), entry_y.max(exit_y)));
+                                let zone_pad = ((zone_y_hi - zone_y_lo) * 0.06).max(1.0);
+                                let hold_fill =
+                                    egui::Color32::from_rgba_premultiplied(80, 160, 255, 14);
+                                plot_ui.polygon(
+                                    Polygon::new(PlotPoints::new(vec![
+                                        [x_entry, zone_y_lo - zone_pad],
+                                        [x_exit, zone_y_lo - zone_pad],
+                                        [x_exit, zone_y_hi + zone_pad],
+                                        [x_entry, zone_y_hi + zone_pad],
+                                    ]))
+                                    .fill_color(hold_fill)
+                                    .allow_hover(false),
+                                );
+                            }
+
                             let line_pts: PlotPoints = chart
                                 .points
                                 .iter()
@@ -1151,10 +1215,10 @@ impl eframe::App for Dashboard {
                                 Line::new(line_pts)
                                     .color(egui::Color32::from_rgb(120, 175, 255))
                                     .width(2.0)
-                                    .name("MCap"),
+                                    .name(""),
                             );
 
-                            for (i, marker) in chart.markers.iter().enumerate() {
+                            for marker in &chart.markers {
                                 let x_entry = chart_x_sec(marker.entry_at, t0);
                                 let x_exit = chart_x_sec(marker.closed_at, t0);
                                 if x_exit < x_entry {
@@ -1170,28 +1234,6 @@ impl eframe::App for Dashboard {
                                     continue;
                                 }
 
-                                let (zone_y_lo, zone_y_hi) = chart_plot_y_bounds(
-                                    &chart.points,
-                                    &[],
-                                    price_mult,
-                                    x_entry,
-                                    x_exit,
-                                )
-                                .unwrap_or((entry_y.min(exit_y), entry_y.max(exit_y)));
-                                let zone_pad = ((zone_y_hi - zone_y_lo) * 0.06).max(1.0);
-
-                                let hold_fill = egui::Color32::from_rgba_premultiplied(80, 160, 255, 28);
-                                plot_ui.polygon(
-                                    Polygon::new(PlotPoints::new(vec![
-                                        [x_entry, zone_y_lo - zone_pad],
-                                        [x_exit, zone_y_lo - zone_pad],
-                                        [x_exit, zone_y_hi + zone_pad],
-                                        [x_entry, zone_y_hi + zone_pad],
-                                    ]))
-                                    .fill_color(hold_fill)
-                                    .allow_hover(false),
-                                );
-
                                 let vline_entry = egui::Color32::from_rgb(70, 210, 90);
                                 let vline_exit = if marker.pnl >= 0.0 {
                                     egui::Color32::from_rgb(70, 210, 90)
@@ -1202,14 +1244,14 @@ impl eframe::App for Dashboard {
                                     VLine::new(x_entry)
                                         .color(vline_entry)
                                         .width(1.5)
-                                        .name(format!("Entry #{i}")),
+                                        .allow_hover(false),
                                 );
                                 plot_ui.vline(
                                     VLine::new(x_exit)
                                         .color(vline_exit)
                                         .width(1.5)
                                         .style(egui_plot::LineStyle::dashed_dense())
-                                        .name(format!("Exit #{i}")),
+                                        .allow_hover(false),
                                 );
 
                                 plot_ui.hline(
@@ -1223,37 +1265,47 @@ impl eframe::App for Dashboard {
                                 plot_ui.points(
                                     Points::new(PlotPoints::new(vec![[x_entry, entry_y]]))
                                         .color(vline_entry)
-                                        .radius(9.0)
+                                        .radius(8.0)
                                         .shape(MarkerShape::Up)
-                                        .name(format!(
-                                            "BUY +{:.0}s {}{:.*}",
-                                            x_entry, prefix, dec, entry_y
-                                        )),
+                                        .name(format!("BUY {prefix}{:.*}", dec, entry_y)),
                                 );
                                 plot_ui.points(
                                     Points::new(PlotPoints::new(vec![[x_exit, exit_y]]))
                                         .color(vline_exit)
-                                        .radius(9.0)
+                                        .radius(8.0)
                                         .shape(MarkerShape::Down)
                                         .name(format!(
-                                            "SELL +{:.0}s {}{:.*} ({:+.1}%) {}",
-                                            x_exit, prefix, dec, exit_y, marker.pnl, marker.reason
+                                            "SELL +{:.0}s {prefix}{:.*} ({:+.0}%)",
+                                            x_exit, dec, exit_y, marker.pnl
                                         )),
                                 );
                             }
 
                             if let Some(hover) = plot_ui.pointer_coordinate() {
-                                let t_sec = hover.x.round().max(0.0) as i64;
+                                let t_sec = hover.x.round() as i64;
                                 let mcap_plot = mcap_at_time(&series, t_sec);
                                 let pct = if ref_entry_mcap > 0.0 && chart_mcap_valid(mcap_plot) {
                                     (mcap_plot / ref_entry_mcap - 1.0) * 100.0
                                 } else {
                                     0.0
                                 };
-                                hover_tip = format!(
-                                    "t = +{:.0}s | mcap = {}{:.*} | {:+.1}% vs entry",
-                                    hover.x, prefix, dec, mcap_plot * price_mult, pct
-                                );
+                                let t_label = if hover.x >= 0.0 {
+                                    format!("+{:.0}s", hover.x)
+                                } else {
+                                    format!("{:.0}s", hover.x)
+                                };
+                                let mcap_disp = mcap_plot * price_mult;
+                                hover_tip = if dec == 0 {
+                                    format!(
+                                        "t = {t_label} | mcap = {prefix}{mcap_disp:.0} | {pct:+.1}% vs entry",
+                                        pct = pct,
+                                    )
+                                } else {
+                                    format!(
+                                        "t = {t_label} | mcap = {prefix}{mcap_disp:.1} | {pct:+.1}% vs entry",
+                                        pct = pct,
+                                    )
+                                };
                             }
                         });
 
