@@ -819,7 +819,7 @@ impl PositionManagerActor {
                     reason,
                 } => {
                     if let Some(mut pos) = self.positions.remove(&mint) {
-                        let actual_pnl = pos.pnl();
+                        let mcap_pnl_pct = pos.pnl();
                         let entry_mcap_sol = pos.enter_mcap.to_float();
                         let invested_sol = pos.initial_holdings.to_float();
                         let exit_mcap_sol = pos.pool.market_cap().amount().to_float();
@@ -888,14 +888,24 @@ impl PositionManagerActor {
                             }
                         };
 
-                        println!(
-                            "[SELL] {mint} | reason={reason} | pnl={actual_pnl:+.2}% \
-                             | sold={percent:.0}% of holdings | returned={return_value:.4} SOL \
-                             (est {sell_estimated_for_log:.4} SOL)"
-                        );
-
                         pos.total_returned += return_value;
                         let total_returned = pos.total_returned;
+                        let spent_sol = pos.spent_sol;
+                        if percent >= 100.0 && spent_sol > 0.0 {
+                            let sol_pnl_pct = (total_returned / spent_sol - 1.0) * 100.0;
+                            println!(
+                                "[SELL] {mint} | reason={reason} | pnl_sol={sol_pnl_pct:+.2}% \
+                                 pnl_mcap={mcap_pnl_pct:+.2}% | spent={spent_sol:.4} SOL \
+                                 | returned={total_returned:.4} SOL (est {sell_estimated_for_log:.4}) \
+                                 | sold={percent:.0}%"
+                            );
+                        } else {
+                            println!(
+                                "[SELL] {mint} | reason={reason} | pnl_mcap={mcap_pnl_pct:+.2}% \
+                                 | sold={percent:.0}% of holdings | leg_returned={return_value:.4} SOL \
+                                 (est {sell_estimated_for_log:.4} SOL)"
+                            );
+                        }
 
                         // Snapshot fields needed in the close branch BEFORE
                         // potentially moving `pos` back into the map for

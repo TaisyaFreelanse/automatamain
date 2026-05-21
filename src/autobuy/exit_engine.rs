@@ -209,7 +209,7 @@ fn default_live_score_refresh_secs() -> u64 {
 }
 
 fn default_exit_grace_secs() -> u64 {
-    12
+    3
 }
 
 /// Floor for in-position `live_score` (matches entry profile resolution).

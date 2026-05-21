@@ -1074,7 +1074,7 @@ impl eframe::App for Dashboard {
                         return;
                     }
 
-                    use egui_plot::{HLine, Line, MarkerShape, Plot, PlotPoints, Points, Polygon, VLine};
+                    use egui_plot::{HLine, Line, MarkerShape, Plot, PlotPoints, Points};
 
                     let price_mult = self.sol_price.unwrap_or(1.0);
                     let y_name = if self.sol_price.is_some() {
@@ -1142,7 +1142,7 @@ impl eframe::App for Dashboard {
                         .show_axes(true)
                         .show_grid(true)
                         .set_margin_fraction(egui::vec2(0.12, 0.08))
-                        .x_axis_label("Time (s, BUY = 0)")
+                        .x_axis_label("Time from entry (seconds)")
                         .y_axis_label(y_name)
                         .x_axis_formatter(|mark, _| format!("{:.0}s", mark.value))
                         .label_formatter(|name, value| {
@@ -1162,45 +1162,6 @@ impl eframe::App for Dashboard {
                     }
 
                     plot.show(ui, |plot_ui| {
-                            // Hold zones under the price line.
-                            for marker in &chart.markers {
-                                let x_entry = chart_x_sec(marker.entry_at, t0);
-                                let x_exit = chart_x_sec(marker.closed_at, t0);
-                                if x_exit < x_entry {
-                                    continue;
-                                }
-                                let entry_y = marker.entry_mcap * price_mult;
-                                let exit_y = marker.exit_mcap * price_mult;
-                                if !entry_y.is_finite()
-                                    || !exit_y.is_finite()
-                                    || entry_y <= 0.0
-                                    || exit_y <= 0.0
-                                {
-                                    continue;
-                                }
-                                let (zone_y_lo, zone_y_hi) = chart_plot_y_bounds(
-                                    &chart.points,
-                                    &[],
-                                    price_mult,
-                                    x_entry,
-                                    x_exit,
-                                )
-                                .unwrap_or((entry_y.min(exit_y), entry_y.max(exit_y)));
-                                let zone_pad = ((zone_y_hi - zone_y_lo) * 0.06).max(1.0);
-                                let hold_fill =
-                                    egui::Color32::from_rgba_premultiplied(80, 160, 255, 14);
-                                plot_ui.polygon(
-                                    Polygon::new(PlotPoints::new(vec![
-                                        [x_entry, zone_y_lo - zone_pad],
-                                        [x_exit, zone_y_lo - zone_pad],
-                                        [x_exit, zone_y_hi + zone_pad],
-                                        [x_entry, zone_y_hi + zone_pad],
-                                    ]))
-                                    .fill_color(hold_fill)
-                                    .allow_hover(false),
-                                );
-                            }
-
                             let line_pts: PlotPoints = chart
                                 .points
                                 .iter()
@@ -1234,45 +1195,37 @@ impl eframe::App for Dashboard {
                                     continue;
                                 }
 
-                                let vline_entry = egui::Color32::from_rgb(70, 210, 90);
-                                let vline_exit = if marker.pnl >= 0.0 {
-                                    egui::Color32::from_rgb(70, 210, 90)
-                                } else {
-                                    egui::Color32::from_rgb(230, 85, 85)
-                                };
-                                plot_ui.vline(
-                                    VLine::new(x_entry)
-                                        .color(vline_entry)
-                                        .width(1.5)
-                                        .allow_hover(false),
-                                );
-                                plot_ui.vline(
-                                    VLine::new(x_exit)
-                                        .color(vline_exit)
-                                        .width(1.5)
-                                        .style(egui_plot::LineStyle::dashed_dense())
-                                        .allow_hover(false),
-                                );
+                                let color_buy = egui::Color32::from_rgb(70, 210, 90);
+                                let color_sell = egui::Color32::from_rgb(230, 85, 85);
 
                                 plot_ui.hline(
                                     HLine::new(entry_y)
-                                        .color(vline_entry.gamma_multiply(0.55))
-                                        .width(1.0)
+                                        .color(color_buy)
+                                        .width(0.8)
                                         .style(egui_plot::LineStyle::dotted_dense())
-                                        .allow_hover(false),
+                                        .allow_hover(false)
+                                        .name("Entry mcap"),
+                                );
+                                plot_ui.hline(
+                                    HLine::new(exit_y)
+                                        .color(color_sell)
+                                        .width(0.8)
+                                        .style(egui_plot::LineStyle::dotted_dense())
+                                        .allow_hover(false)
+                                        .name("Exit mcap"),
                                 );
 
                                 plot_ui.points(
                                     Points::new(PlotPoints::new(vec![[x_entry, entry_y]]))
-                                        .color(vline_entry)
-                                        .radius(8.0)
+                                        .color(color_buy)
+                                        .radius(9.0)
                                         .shape(MarkerShape::Up)
                                         .name(format!("BUY {prefix}{:.*}", dec, entry_y)),
                                 );
                                 plot_ui.points(
                                     Points::new(PlotPoints::new(vec![[x_exit, exit_y]]))
-                                        .color(vline_exit)
-                                        .radius(8.0)
+                                        .color(color_sell)
+                                        .radius(9.0)
                                         .shape(MarkerShape::Down)
                                         .name(format!(
                                             "SELL +{:.0}s {prefix}{:.*} ({:+.0}%)",
@@ -1708,7 +1661,7 @@ impl eframe::App for Dashboard {
                         .min_col_width(72.0)
                         .show(ui, |ui| {
                             ui.label(egui::RichText::new("Address").strong());
-                            ui.label(egui::RichText::new("PnL %").strong());
+                            ui.label(egui::RichText::new("PnL % (mcap)").strong());
                             ui.label(egui::RichText::new("Holdings").strong());
                             ui.label(egui::RichText::new("Entry MCAP ($)").strong());
                             ui.label(egui::RichText::new("Curr MCAP ($)").strong());
@@ -1971,7 +1924,7 @@ impl eframe::App for Dashboard {
                         .show(ui, |ui| {
                             ui.label(egui::RichText::new("Time").strong());
                             ui.label(egui::RichText::new("Mint").strong());
-                            ui.label(egui::RichText::new("PnL %").strong());
+                            ui.label(egui::RichText::new("PnL % (SOL)").strong());
                             ui.label(egui::RichText::new("Invested ($)").strong());
                             ui.label(egui::RichText::new("Entry MCAP ($)").strong());
                             ui.label(egui::RichText::new("V3 @ close").strong());

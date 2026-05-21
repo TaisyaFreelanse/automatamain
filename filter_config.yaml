@@ -56,8 +56,9 @@ buy_config:
   exit_v4:
     enabled: true
     live_score_refresh_secs: 3
-    # No decay exit / lite Distribution downgrade until live tape + this many seconds.
-    exit_grace_secs: 12
+    # No decay exit / Distribution phase until held this long (SL floor still active).
+    # 12s was too slow on fast dumps (e.g. BrS69Z); 3s allows decay after entry settles.
+    exit_grace_secs: 3
     hold_min_live_score: 13
     hold_min_b2s: 2.2
     hold_min_smart: 5
