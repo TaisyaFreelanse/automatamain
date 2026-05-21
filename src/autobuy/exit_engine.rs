@@ -222,6 +222,65 @@ pub fn in_exit_grace_period(held_secs: u64, cfg: &ExitEngineV4Config) -> bool {
     held_secs < cfg.exit_grace_secs
 }
 
+/// Stop-loss grace: no SL (even confirmed ticks) until held this long after entry.
+pub fn in_sl_grace_period(held_secs: u64, sl_grace_secs: u64) -> bool {
+    held_secs < sl_grace_secs
+}
+
+const EXIT_MCAP_ABS_MAX: f64 = 200_000.0;
+
+pub fn exit_mcap_valid(mcap: f64) -> bool {
+    mcap.is_finite() && mcap > 0.0 && mcap <= EXIT_MCAP_ABS_MAX
+}
+
+pub fn exit_mcap_median(mcaps: &[f64]) -> Option<f64> {
+    let mut v: Vec<f64> = mcaps.iter().copied().filter(|m| exit_mcap_valid(*m)).collect();
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(v[v.len() / 2])
+}
+
+/// Reject bonding-curve outliers vs tape median (same idea as dashboard chart filter).
+pub fn exit_mcap_matches_band(mcap: f64, median: Option<f64>, band_low: f64, band_high: f64) -> bool {
+    if !exit_mcap_valid(mcap) {
+        return false;
+    }
+    let Some(med) = median else {
+        return true;
+    };
+    if med <= 0.0 {
+        return true;
+    }
+    mcap >= med * band_low && mcap <= med * band_high
+}
+
+/// Median of recent in-band ticks; falls back to median / last raw / `enter_mcap`.
+pub fn filtered_exit_mcap(
+    samples: &[f64],
+    enter_mcap: f64,
+    band_low: f64,
+    band_high: f64,
+) -> f64 {
+    let median = exit_mcap_median(samples);
+    let in_band: Vec<f64> = samples
+        .iter()
+        .copied()
+        .filter(|m| exit_mcap_matches_band(*m, median, band_low, band_high))
+        .collect();
+    if let Some(m) = exit_mcap_median(&in_band) {
+        return m;
+    }
+    if let Some(m) = median {
+        return m;
+    }
+    if let Some(&last) = samples.iter().rev().find(|m| exit_mcap_valid(**m)) {
+        return last;
+    }
+    enter_mcap.max(0.0)
+}
+
 fn default_hold_min_b2s() -> f64 {
     2.2
 }
@@ -798,5 +857,13 @@ mod tests {
     fn profit_staircase() {
         assert_eq!(profit_lock_staircase_floor(55.0), Some(15.0));
         assert_eq!(profit_lock_staircase_floor(120.0), Some(40.0));
+    }
+
+    #[test]
+    fn filtered_exit_mcap_rejects_stale_low_tick() {
+        // Entry ~74; one stale ~59 tick must not dominate median.
+        let samples = [73.5, 74.0, 59.0, 73.8, 74.2];
+        let filtered = filtered_exit_mcap(&samples, 73.67, 0.02, 50.0);
+        assert!(filtered > 65.0, "filtered was {filtered}");
     }
 }

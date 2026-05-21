@@ -69,6 +69,10 @@ pub struct Position {
     pub peak_profit_pct: f64,
     pub live_tape_prev: Option<EarlyTapePoint>,
     pub live_tape_curr: Option<EarlyTapePoint>,
+    /// Recent raw bonding-curve mcaps (100ms ticks) for median / outlier filter on exit.
+    pub exit_mcap_ticks: Vec<f64>,
+    /// Consecutive ticks with filtered PnL at or below `exit_profit_floor` (SL confirm).
+    pub sl_below_floor_streak: u8,
 }
 
 impl Position {
@@ -129,15 +133,52 @@ impl Position {
             peak_profit_pct: 0.0,
             live_tape_prev: None,
             live_tape_curr: None,
+            exit_mcap_ticks: Vec::new(),
+            sl_below_floor_streak: 0,
+        }
+    }
+
+    pub fn push_exit_mcap_tick(&mut self, raw_mcap: f64, max_ticks: usize) {
+        if crate::autobuy::exit_engine::exit_mcap_valid(raw_mcap) {
+            self.exit_mcap_ticks.push(raw_mcap);
+            if self.exit_mcap_ticks.len() > max_ticks {
+                let drop = self.exit_mcap_ticks.len() - max_ticks;
+                self.exit_mcap_ticks.drain(0..drop);
+            }
         }
     }
 
     pub fn pnl(&self) -> f64 {
+        self.pnl_at_mcap(self.pool.market_cap().amount().to_float())
+    }
+
+    pub fn pnl_at_mcap(&self, mcap: f64) -> f64 {
         let enter_mcap = self.enter_mcap.to_float();
         if enter_mcap == 0.0 {
             return 0.0;
         }
-        (self.pool.market_cap().amount().to_float() / enter_mcap - 1.0) * 100.0
+        (mcap / enter_mcap - 1.0) * 100.0
+    }
+
+    /// PnL from median-filtered mcap tape (guards SL / trailing against single bad ticks).
+    pub fn pnl_filtered(&self, band_low: f64, band_high: f64) -> f64 {
+        let enter = self.enter_mcap.to_float();
+        let mcap = crate::autobuy::exit_engine::filtered_exit_mcap(
+            &self.exit_mcap_ticks,
+            enter,
+            band_low,
+            band_high,
+        );
+        self.pnl_at_mcap(mcap)
+    }
+
+    pub fn filtered_market_cap(&self, band_low: f64, band_high: f64) -> f64 {
+        crate::autobuy::exit_engine::filtered_exit_mcap(
+            &self.exit_mcap_ticks,
+            self.enter_mcap.to_float(),
+            band_low,
+            band_high,
+        )
     }
 
     /// Advance second-resolution mcap samples for adaptive time-kill velocity.

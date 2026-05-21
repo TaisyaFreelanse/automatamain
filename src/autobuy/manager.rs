@@ -3,7 +3,7 @@ use crate::{
         broker::{Broker, BuyReceipt},
         exit_engine::{
             adaptive_moonbag_sell_pct, adaptive_trailing, apply_phase_to_tp,
-            calculate_live_score, entry_live_score_floor, in_exit_grace_period,
+            calculate_live_score, entry_live_score_floor, in_exit_grace_period, in_sl_grace_period,
             live_metrics_from_snapshot, live_metrics_lite, maybe_upgrade_runner,
             momentum_decay_detected, profit_lock_staircase_floor,
             resolve_entry_profile, transition_position_phase, ExitEngineV4Config, ExitProfile,
@@ -220,9 +220,43 @@ pub struct SmartBuyConfig {
     /// Max allowed `fill_mcap / score_mcap` (e.g. 1.5 = abort if fill is 50%+ above score).
     #[serde(default = "default_fill_mcap_abort_max_ratio")]
     pub fill_mcap_abort_max_ratio: f64,
+    /// SL: consecutive ticks (100ms) with filtered PnL <= floor before full exit.
+    #[serde(default = "default_sl_confirm_ticks")]
+    pub sl_confirm_ticks: u32,
+    /// SL: no stop-loss until held this many seconds after entry (decay grace is separate).
+    #[serde(default = "default_sl_grace_secs")]
+    pub sl_grace_secs: u64,
+    /// Ring buffer length for exit mcap median filter (~500ms at 100ms ticks when 5).
+    #[serde(default = "default_exit_mcap_median_ticks")]
+    pub exit_mcap_median_ticks: usize,
+    /// Outlier band vs tape median (low/high multipliers, chart-style).
+    #[serde(default = "default_exit_mcap_band_low_ratio")]
+    pub exit_mcap_band_low_ratio: f64,
+    #[serde(default = "default_exit_mcap_band_high_ratio")]
+    pub exit_mcap_band_high_ratio: f64,
     /// Adaptive Exit Engine V4 (profiles, live score, hold/runner, adaptive trailing).
     #[serde(default)]
     pub exit_v4: ExitEngineV4Config,
+}
+
+fn default_sl_confirm_ticks() -> u32 {
+    3
+}
+
+fn default_sl_grace_secs() -> u64 {
+    5
+}
+
+fn default_exit_mcap_median_ticks() -> usize {
+    5
+}
+
+fn default_exit_mcap_band_low_ratio() -> f64 {
+    0.02
+}
+
+fn default_exit_mcap_band_high_ratio() -> f64 {
+    50.0
 }
 
 fn default_fill_mcap_abort_enabled() -> bool {
@@ -273,6 +307,11 @@ impl Default for SmartBuyConfig {
             trailing_stop_drawdown_pct: 26.0, // exit if mcap drops 26% from peak
             fill_mcap_abort_enabled: default_fill_mcap_abort_enabled(),
             fill_mcap_abort_max_ratio: default_fill_mcap_abort_max_ratio(),
+            sl_confirm_ticks: default_sl_confirm_ticks(),
+            sl_grace_secs: default_sl_grace_secs(),
+            exit_mcap_median_ticks: default_exit_mcap_median_ticks(),
+            exit_mcap_band_low_ratio: default_exit_mcap_band_low_ratio(),
+            exit_mcap_band_high_ratio: default_exit_mcap_band_high_ratio(),
             exit_v4: ExitEngineV4Config::default(),
         }
     }
@@ -681,6 +720,8 @@ impl PositionManagerActor {
                                 ts: now_secs(),
                                 v3_tape: v3_wire.clone(),
                                 time_kill_detail: None,
+                                pnl_mcap_pct: None,
+                                pnl_sol_pct: None,
                             });
                             r
                         }
@@ -698,6 +739,8 @@ impl PositionManagerActor {
                                 ts: now_secs(),
                                 v3_tape: v3_wire.clone(),
                                 time_kill_detail: None,
+                                pnl_mcap_pct: None,
+                                pnl_sol_pct: None,
                             });
                             continue;
                         }
@@ -789,6 +832,7 @@ impl PositionManagerActor {
                     position.learning_snapshot = learning_snapshot;
                     position.open_reason = Some(open_reason.clone());
                     let enter_mcap = position.enter_mcap.to_float();
+                    position.push_exit_mcap_tick(enter_mcap, self.config.exit_mcap_median_ticks);
                     let mcap_src = if receipt.entry_mcap_fill_sol.is_some() {
                         "on-chain fill"
                     } else {
@@ -847,27 +891,16 @@ impl PositionManagerActor {
                             None
                         };
 
-                        let (return_value, sell_estimated_for_log) = match self
+                        let (return_value, sell_estimated_for_log, sell_signature) = match self
                             .broker
                             .sell(mint, sell_qty, pos.pool.as_ref(), close_ata)
                             .await
                         {
-                            Ok(r) => {
-                                let _ = self.event_tx.try_send(WsFeedMessage::TxEvent {
-                                    kind: TxEventKind::Sell,
-                                    mint: mint.to_string(),
-                                    signature: r.signature.clone(),
-                                    amount_sol: r.sol_received_actual,
-                                    amount_sol_estimated: Some(r.sol_received_estimated),
-                                    status: "confirmed".into(),
-                                    reason: Some(reason.clone()),
-                                    mode: self.broker.mode_label().to_string(),
-                                    ts: now_secs(),
-                                    v3_tape: None,
-                                    time_kill_detail: time_kill_detail.clone(),
-                                });
-                                (r.sol_received_actual, r.sol_received_estimated)
-                            }
+                            Ok(r) => (
+                                r.sol_received_actual,
+                                r.sol_received_estimated,
+                                r.signature.clone(),
+                            ),
                             Err(e) => {
                                 eprintln!("[SELL] Broker error for {mint}: {e}");
                                 let _ = self.event_tx.try_send(WsFeedMessage::TxEvent {
@@ -882,6 +915,8 @@ impl PositionManagerActor {
                                     ts: now_secs(),
                                     v3_tape: None,
                                     time_kill_detail,
+                                    pnl_mcap_pct: Some(mcap_pnl_pct),
+                                    pnl_sol_pct: None,
                                 });
                                 self.positions.insert(mint, pos);
                                 continue;
@@ -889,6 +924,26 @@ impl PositionManagerActor {
                         };
 
                         pos.total_returned += return_value;
+                        let pnl_sol_pct_tx = if pos.spent_sol > 0.0 && percent >= 100.0 {
+                            Some((pos.total_returned / pos.spent_sol - 1.0) * 100.0)
+                        } else {
+                            None
+                        };
+                        let _ = self.event_tx.try_send(WsFeedMessage::TxEvent {
+                            kind: TxEventKind::Sell,
+                            mint: mint.to_string(),
+                            signature: sell_signature,
+                            amount_sol: return_value,
+                            amount_sol_estimated: Some(sell_estimated_for_log),
+                            status: "confirmed".into(),
+                            reason: Some(reason.clone()),
+                            mode: self.broker.mode_label().to_string(),
+                            ts: now_secs(),
+                            v3_tape: None,
+                            time_kill_detail: time_kill_detail.clone(),
+                            pnl_mcap_pct: Some(mcap_pnl_pct),
+                            pnl_sol_pct: pnl_sol_pct_tx,
+                        });
                         let total_returned = pos.total_returned;
                         let spent_sol = pos.spent_sol;
                         if percent >= 100.0 && spent_sol > 0.0 {
@@ -1196,6 +1251,18 @@ impl PositionManagerActor {
             .await
         {
             Ok(r) => {
+                let pnl_pct = if amount_sol > 0.0 {
+                    (r.sol_received_actual / amount_sol - 1.0) * 100.0
+                } else {
+                    0.0
+                };
+                let fill_mcap = spike.fill_mcap_sol;
+                let score_mcap = spike.score_mcap_sol;
+                let pnl_mcap_abort = if score_mcap > 0.0 {
+                    (fill_mcap / score_mcap - 1.0) * 100.0
+                } else {
+                    0.0
+                };
                 let _ = self.event_tx.try_send(WsFeedMessage::TxEvent {
                     kind: TxEventKind::Sell,
                     mint: mint.to_string(),
@@ -1208,14 +1275,11 @@ impl PositionManagerActor {
                     ts: now_secs(),
                     v3_tape: None,
                     time_kill_detail: None,
+                    pnl_mcap_pct: Some(pnl_mcap_abort),
+                    pnl_sol_pct: Some(pnl_pct),
                 });
 
                 let pnl_sol = r.sol_received_actual - amount_sol;
-                let pnl_pct = if amount_sol > 0.0 {
-                    (r.sol_received_actual / amount_sol - 1.0) * 100.0
-                } else {
-                    0.0
-                };
                 self.strategy.note_position_opened();
                 self.strategy.note_position_closed(pnl_sol);
 
@@ -1372,14 +1436,18 @@ impl PositionManagerActor {
                 continue;
             }
 
-            let current_mcap = pos.pool.market_cap().amount().to_float();
+            let raw_mcap = pos.pool.market_cap().amount().to_float();
+            pos.push_exit_mcap_tick(raw_mcap, global_cfg.exit_mcap_median_ticks);
+            let band_lo = global_cfg.exit_mcap_band_low_ratio;
+            let band_hi = global_cfg.exit_mcap_band_high_ratio;
+            let current_mcap = pos.filtered_market_cap(band_lo, band_hi);
             if current_mcap > pos.highest_mcap {
                 pos.highest_mcap = current_mcap;
             }
 
             pos.time_kill_note_mcap_sample(current_time, current_mcap);
 
-            let profit = pos.pnl();
+            let profit = pos.pnl_filtered(band_lo, band_hi);
             if profit > pos.peak_profit_pct {
                 pos.peak_profit_pct = profit;
             }
@@ -1516,15 +1584,30 @@ impl PositionManagerActor {
             }
 
             // --- 2. Stop Loss / Smart Stop ---
-            // FIX Bug 4: unified sign convention — floor can be negative (initial SL)
-            // or positive (raised after smart-stop). The check is always the same:
-            // "exit if current profit is below the floor".
-            if profit <= pos.exit_profit_floor {
+            // Filtered mcap + N-tick confirm + post-entry grace (avoids one stale WS tick).
+            let in_sl_grace = in_sl_grace_period(held_secs, global_cfg.sl_grace_secs);
+            if in_sl_grace {
+                pos.sl_below_floor_streak = 0;
+            } else if profit <= pos.exit_profit_floor {
+                pos.sl_below_floor_streak = pos
+                    .sl_below_floor_streak
+                    .saturating_add(1)
+                    .min(255);
+            } else {
+                pos.sl_below_floor_streak = 0;
+            }
+            let sl_confirm = global_cfg.sl_confirm_ticks.max(1);
+            if !in_sl_grace && pos.sl_below_floor_streak >= sl_confirm as u8 {
                 pos.is_closing = true;
                 actions.push((
                     *mint,
                     100.0,
-                    format!("SL (floor {:.1}%)", pos.exit_profit_floor),
+                    format!(
+                        "SL (floor {:.1}%, {} ticks, filt mcap {:.1})",
+                        pos.exit_profit_floor,
+                        sl_confirm,
+                        current_mcap
+                    ),
                 ));
                 continue;
             }
@@ -1887,6 +1970,12 @@ pub enum WsFeedMessage {
         v3_tape: Option<V3TapeWire>,
         #[serde(skip_serializing_if = "Option::is_none")]
         time_kill_detail: Option<String>,
+        /// Sell: mcap PnL % at decision time (`None` for buys).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pnl_mcap_pct: Option<f64>,
+        /// Sell: position SOL PnL % after this leg (`None` for buys / partial without spent).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pnl_sol_pct: Option<f64>,
     },
 }
 

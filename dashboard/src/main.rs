@@ -150,6 +150,10 @@ pub enum WsMsg {
         v3_tape: Option<V3TapeWire>,
         #[serde(default)]
         time_kill_detail: Option<String>,
+        #[serde(default)]
+        pnl_mcap_pct: Option<f64>,
+        #[serde(default)]
+        pnl_sol_pct: Option<f64>,
     },
 }
 
@@ -173,6 +177,8 @@ pub struct TxLogRow {
     pub ts: i64,
     pub v3_tape: Option<V3TapeWire>,
     pub time_kill_detail: Option<String>,
+    pub pnl_mcap_pct: Option<f64>,
+    pub pnl_sol_pct: Option<f64>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -778,6 +784,8 @@ impl Dashboard {
                         ts,
                         v3_tape,
                         time_kill_detail,
+                        pnl_mcap_pct,
+                        pnl_sol_pct,
                     } => {
                         let refresh_history =
                             kind == TxEventKind::Sell && status == "confirmed";
@@ -796,6 +804,8 @@ impl Dashboard {
                             ts,
                             v3_tape,
                             time_kill_detail,
+                            pnl_mcap_pct,
+                            pnl_sol_pct,
                         });
                         if refresh_history {
                             let _ = self.cmd_tx.try_send(DashCmd::RefreshBotTradesAfterClose);
@@ -1766,7 +1776,7 @@ impl eframe::App for Dashboard {
                 .max_height(third.min(180.0))
                 .show(ui, |ui| {
                     egui::Grid::new("tx_log_grid")
-                        .num_columns(8)
+                        .num_columns(9)
                         .striped(true)
                         .min_col_width(52.0)
                         .show(ui, |ui| {
@@ -1776,6 +1786,7 @@ impl eframe::App for Dashboard {
                             ui.label(egui::RichText::new("Mint").strong());
                             ui.label(egui::RichText::new("SOL act.").strong());
                             ui.label(egui::RichText::new("SOL est.").strong());
+                            ui.label(egui::RichText::new("PnL").strong());
                             ui.label(egui::RichText::new("V3 / time kill").strong());
                             ui.label(egui::RichText::new("Status").strong());
                             ui.end_row();
@@ -1815,6 +1826,40 @@ impl eframe::App for Dashboard {
                                         ui.label(format!("{:.4}", est)).on_hover_text(
                                             "Estimated from bonding curve / Jupiter quote × slippage; \
                                              act. = wallet lamport delta from tx meta.",
+                                        );
+                                    }
+                                    _ => {
+                                        ui.label(
+                                            egui::RichText::new("—")
+                                                .small()
+                                                .color(egui::Color32::GRAY),
+                                        );
+                                    }
+                                }
+
+                                match (row.kind, row.pnl_mcap_pct, row.pnl_sol_pct) {
+                                    (TxEventKind::Sell, mcap, sol) => {
+                                        let mcap_s = mcap
+                                            .map(|p| format!("mcap {:+.1}%", p))
+                                            .unwrap_or_else(|| "mcap —".into());
+                                        let sol_s = sol
+                                            .map(|p| format!("SOL {:+.1}%", p))
+                                            .unwrap_or_else(|| "SOL —".into());
+                                        let pnl_resp = ui.vertical(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(mcap_s)
+                                                    .small()
+                                                    .monospace(),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(sol_s)
+                                                    .small()
+                                                    .monospace()
+                                                    .color(egui::Color32::from_rgb(200, 220, 255)),
+                                            );
+                                        });
+                                        pnl_resp.response.on_hover_text(
+                                            "mcap = bonding curve at sell; SOL = wallet PnL on position.",
                                         );
                                     }
                                     _ => {
@@ -2233,6 +2278,8 @@ async fn ws_loop(
                                                             ts,
                                                             v3_tape,
                                                             time_kill_detail,
+                                                            pnl_mcap_pct,
+                                                            pnl_sol_pct,
                                                         } => Some(TxLogRow {
                                                             kind,
                                                             mint,
@@ -2245,6 +2292,8 @@ async fn ws_loop(
                                                             ts,
                                                             v3_tape,
                                                             time_kill_detail,
+                                                            pnl_mcap_pct,
+                                                            pnl_sol_pct,
                                                         }),
                                                         _ => None,
                                                     })

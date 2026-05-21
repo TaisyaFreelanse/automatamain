@@ -29,6 +29,14 @@ buy_config:
   tp5_pct: 200.0
   tp5_sell_pct: 10.0
   exit_profit_floor: -16.0
+  # SL: require N consecutive ticks (100ms) with filtered mcap PnL <= floor.
+  sl_confirm_ticks: 3
+  # SL: no stop-loss for this many seconds after entry (V4 decay grace is separate).
+  sl_grace_secs: 5
+  # Median filter on bonding-curve mcap for exit decisions (ring length in ticks).
+  exit_mcap_median_ticks: 5
+  exit_mcap_band_low_ratio: 0.02
+  exit_mcap_band_high_ratio: 50.0
   # Fixed window when time_kill_adaptive: false. When adaptive (V3), weak/neutral/strong
   # seconds below are used instead (this value is ignored for the timer).
   time_kill_secs: 25
