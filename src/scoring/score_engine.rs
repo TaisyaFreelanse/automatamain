@@ -4,7 +4,13 @@ use serde::Serialize;
 
 use crate::scoring::config::{FeatureThresholds, ScoringConfig, ScoringWeights};
 use crate::scoring::dev_ranker::DevCategory;
-use crate::scoring::features::TokenFeatures;
+use crate::scoring::features::{momentum_peak_pct, TokenFeatures};
+
+/// Momentum for scoring: peak mcap in the window vs first sample (not end-only).
+fn scoring_momentum_pct(f: &TokenFeatures) -> f64 {
+    let peak = f.peak_mcap_sol.max(f.current_mcap_sol);
+    momentum_peak_pct(f.initial_mcap_sol, peak)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum Tier {
@@ -123,11 +129,7 @@ impl<'a> ScoreEngine<'a> {
             );
         }
 
-        let momentum_pct = if f.initial_mcap_sol > 0.0 {
-            (f.current_mcap_sol / f.initial_mcap_sol - 1.0) * 100.0
-        } else {
-            0.0
-        };
+        let momentum_pct = scoring_momentum_pct(f);
         if momentum_pct >= t.momentum_overheated_pct {
             add(
                 "momentum_overheated",
@@ -249,12 +251,8 @@ impl<'a> ScoreEngine<'a> {
             );
         }
 
-        // --- Momentum (mcap delta during scoring window) -------------------
-        let momentum_pct = if f.initial_mcap_sol > 0.0 {
-            (f.current_mcap_sol / f.initial_mcap_sol - 1.0) * 100.0
-        } else {
-            0.0
-        };
+        // --- Momentum (peak mcap vs window start) --------------------------
+        let momentum_pct = scoring_momentum_pct(f);
         // V2: reward only launches inside [low, high]; penalize anything above
         // the good window, and still allow a separate "blow-off" floor via
         // `momentum_overheated_pct` when it sits above `good_high` (legacy YAML).

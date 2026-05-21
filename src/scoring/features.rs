@@ -54,6 +54,8 @@ pub struct TokenFeatures {
     // Pool / market state
     pub current_mcap_sol: f64,
     pub initial_mcap_sol: f64,
+    /// Max mcap seen across scoring-window tape samples (for peak momentum).
+    pub peak_mcap_sol: f64,
 
     // Early buyers (the snapshot itself)
     pub buyers: EarlyBuyersSnapshot,
@@ -163,6 +165,25 @@ pub async fn snapshot_early_tape(bucket: &TokenBucket) -> EarlyTapePoint {
     }
 }
 
+/// Peak mcap % vs window start (used for `momentum_good` / early exit).
+pub fn momentum_peak_pct(initial_mcap_sol: f64, peak_mcap_sol: f64) -> f64 {
+    if initial_mcap_sol > 0.0 {
+        (peak_mcap_sol / initial_mcap_sol - 1.0) * 100.0
+    } else {
+        0.0
+    }
+}
+
+/// Result of the live early-tape observer (may end before full `window_ms`).
+#[derive(Clone, Debug)]
+pub struct EarlyTapeObserveResult {
+    pub points: Vec<EarlyTapePoint>,
+    pub initial_mcap_sol: f64,
+    pub peak_mcap_sol: f64,
+    pub current_mcap_sol: f64,
+    pub exited_early: bool,
+}
+
 /// Live bucket from launchpad storage (pool state includes trades since create).
 pub async fn fetch_live_bucket(
     launchpad: &mpsc::Sender<PumpLaunchpadCommand>,
@@ -179,46 +200,102 @@ pub async fn fetch_live_bucket(
     rx.await.ok()
 }
 
+fn finalize_tape_observe(
+    points: Vec<EarlyTapePoint>,
+    exited_early: bool,
+) -> EarlyTapeObserveResult {
+    let initial_mcap_sol = points.first().map(|p| p.mcap_sol).unwrap_or(0.0);
+    let peak_mcap_sol = points
+        .iter()
+        .map(|p| p.mcap_sol)
+        .fold(initial_mcap_sol, f64::max);
+    let current_mcap_sol = points.last().map(|p| p.mcap_sol).unwrap_or(peak_mcap_sol);
+    EarlyTapeObserveResult {
+        points,
+        initial_mcap_sol,
+        peak_mcap_sol,
+        current_mcap_sol,
+        exited_early,
+    }
+}
+
+fn tape_hit_momentum_low(initial: f64, peak: f64, low_pct: f64) -> bool {
+    initial > 0.0 && momentum_peak_pct(initial, peak) >= low_pct
+}
+
 /// Like `observe_early_tape_points`, but each sample uses a fresh bucket from
 /// launchpad storage so `mcap_sol` tracks bonding-curve trades during the window.
+///
+/// When `early_exit_momentum_low_pct` is set, stops sleeping as soon as peak mcap
+/// vs the first sample reaches that % (fast pump path).
 pub async fn observe_early_tape_points_live(
     launchpad: &mpsc::Sender<PumpLaunchpadCommand>,
     mint: Address,
     window_ms: u64,
     slices: usize,
-) -> Vec<EarlyTapePoint> {
+    early_exit_momentum_low_pct: Option<f64>,
+) -> EarlyTapeObserveResult {
     let s = slices.max(1) as u64;
     let window_ms = window_ms.max(1);
     if s <= 1 {
         tokio::time::sleep(std::time::Duration::from_millis(window_ms)).await;
-        if let Some(bucket) = fetch_live_bucket(launchpad, mint).await {
-            return vec![snapshot_early_tape(&bucket).await];
-        }
-        return Vec::new();
+        let points = if let Some(bucket) = fetch_live_bucket(launchpad, mint).await {
+            vec![snapshot_early_tape(&bucket).await]
+        } else {
+            Vec::new()
+        };
+        return finalize_tape_observe(points, false);
     }
 
     let slice_ms = (window_ms / s).max(1);
     let mut out: Vec<EarlyTapePoint> = Vec::with_capacity(s as usize);
+    let mut initial_mcap_sol = 0.0_f64;
+    let mut peak_mcap_sol = 0.0_f64;
+
     for i in 0..s {
         if i > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(slice_ms)).await;
         }
-        if let Some(bucket) = fetch_live_bucket(launchpad, mint).await {
-            out.push(snapshot_early_tape(&bucket).await);
+        let Some(bucket) = fetch_live_bucket(launchpad, mint).await else {
+            continue;
+        };
+        let point = snapshot_early_tape(&bucket).await;
+        if out.is_empty() {
+            initial_mcap_sol = point.mcap_sol;
+            peak_mcap_sol = point.mcap_sol;
+        } else {
+            peak_mcap_sol = peak_mcap_sol.max(point.mcap_sol);
+        }
+        out.push(point);
+
+        if let Some(low) = early_exit_momentum_low_pct {
+            if tape_hit_momentum_low(initial_mcap_sol, peak_mcap_sol, low) {
+                return finalize_tape_observe(out, true);
+            }
         }
     }
+
     let used = slice_ms.saturating_mul(s.saturating_sub(1));
     if window_ms > used {
         tokio::time::sleep(std::time::Duration::from_millis(window_ms - used)).await;
         if let Some(bucket) = fetch_live_bucket(launchpad, mint).await {
+            let point = snapshot_early_tape(&bucket).await;
+            if out.is_empty() {
+                return finalize_tape_observe(vec![point], false);
+            }
             if let Some(last) = out.last_mut() {
-                *last = snapshot_early_tape(&bucket).await;
-            } else {
-                out.push(snapshot_early_tape(&bucket).await);
+                *last = point;
             }
         }
     }
-    out
+
+    let mut result = finalize_tape_observe(out, false);
+    if let Some(low) = early_exit_momentum_low_pct {
+        if tape_hit_momentum_low(result.initial_mcap_sol, result.peak_mcap_sol, low) {
+            result.exited_early = true;
+        }
+    }
+    result
 }
 
 /// `slices` evenly spaced samples across `window_ms` (last point refreshed at window end).
@@ -426,6 +503,7 @@ pub fn assemble(
     dev_rank_record: DevRecord,
     initial_mcap_sol: f64,
     current_mcap_sol: f64,
+    peak_mcap_sol: f64,
     buyers: EarlyBuyersSnapshot,
     regular_buyer_count: u64,
     sniper_count: u64,
@@ -471,6 +549,7 @@ pub fn assemble(
         dev_rank_record,
         current_mcap_sol,
         initial_mcap_sol,
+        peak_mcap_sol,
         buyers,
         regular_buyer_count,
         sniper_count,

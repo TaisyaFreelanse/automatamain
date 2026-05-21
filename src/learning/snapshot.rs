@@ -39,8 +39,9 @@ pub struct LearningTradeSnapshot {
 
 impl LearningTradeSnapshot {
     pub fn from_scoring(f: &TokenFeatures, breakdown: &ScoreBreakdown) -> Self {
+        let peak = f.peak_mcap_sol.max(f.current_mcap_sol);
         let velocity_pct = if f.initial_mcap_sol > 0.0 {
-            (f.current_mcap_sol / f.initial_mcap_sol - 1.0) * 100.0
+            (peak / f.initial_mcap_sol - 1.0) * 100.0
         } else {
             0.0
         };

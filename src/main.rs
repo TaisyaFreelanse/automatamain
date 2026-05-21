@@ -921,13 +921,19 @@ async fn main() {
                             .scoring
                             .buyer_velocity_slices
                             .max(1);
-                        let tape_points = features::observe_early_tape_points_live(
+                        let momentum_low_pct = filter_config
+                            .scoring
+                            .thresholds
+                            .momentum_good_low_pct;
+                        let tape_observe = features::observe_early_tape_points_live(
                             &launchpad_for_score,
                             mint_address,
                             window_ms,
                             tape_slices,
+                            Some(momentum_low_pct),
                         )
                         .await;
+                        let tape_points = tape_observe.points;
 
                         let scoring_bucket = features::fetch_live_bucket(
                             &launchpad_for_score,
@@ -939,14 +945,13 @@ async fn main() {
                         let pool_mcap = |b: &loggaper::launchpads::token_bucket::TokenBucket| {
                             b.pool().market_cap().amount().to_float()
                         };
-                        let initial_mcap_sol = tape_points
-                            .first()
-                            .map(|p| p.mcap_sol)
-                            .unwrap_or_else(|| pool_mcap(&scoring_bucket));
-                        let current_mcap_sol = tape_points
-                            .last()
-                            .map(|p| p.mcap_sol)
-                            .unwrap_or_else(|| pool_mcap(&scoring_bucket));
+                        let initial_mcap_sol = if tape_observe.initial_mcap_sol > 0.0 {
+                            tape_observe.initial_mcap_sol
+                        } else {
+                            pool_mcap(&scoring_bucket)
+                        };
+                        let current_mcap_sol = tape_observe.current_mcap_sol;
+                        let peak_mcap_sol = tape_observe.peak_mcap_sol.max(current_mcap_sol);
 
                         let merged_thr = merge_thresholds(
                             &filter_config.scoring.thresholds,
@@ -997,6 +1002,7 @@ async fn main() {
                             dev_record,
                             initial_mcap_sol,
                             current_mcap_sol,
+                            peak_mcap_sol,
                             early_buyers,
                             regular_buyer_count,
                             sniper_count,
@@ -1018,7 +1024,8 @@ async fn main() {
 
                         eprintln!(
                             "[SCORE] {} tier={:?} score={} buyers={}+{} vol={:.2} \
-                             mcap_init={:.1} mcap_now={:.1} bundle_sim={:.2} \
+                             mcap_init={:.1} mcap_peak={:.1} mcap_now={:.1} early_exit={} \
+                             bundle_sim={:.2} \
                              bundle_id={:.2} dev_cat={:?} smart={} bv_persist={:.2} \
                              sell_press={:.2} absorb={:.2} dumps={} sm_exits={} items={:?}",
                             general_create.mint,
@@ -1028,7 +1035,9 @@ async fn main() {
                             sniper_count,
                             buy_volume_sol,
                             initial_mcap_sol,
+                            peak_mcap_sol,
                             current_mcap_sol,
+                            tape_observe.exited_early,
                             token_features.bundle.similar_size_ratio,
                             token_features.bundle.identical_size_ratio,
                             dev_category,
