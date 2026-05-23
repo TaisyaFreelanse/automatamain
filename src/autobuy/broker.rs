@@ -55,8 +55,19 @@ pub enum BrokerError {
     PositionNotFound(Address),
     #[error("Transaction failed: {0}")]
     TransactionFailed(String),
+    /// Jupiter could not quote/swap (even after chunked attempts). Position must be
+    /// closed manually; manager clears `is_closing` and surfaces a dashboard alert.
+    #[error("Jupiter sell exhausted (manual exit required): {0}")]
+    JupiterSellExhausted(String),
     #[error("Custom : {0}")]
     Custom(String),
+}
+
+impl BrokerError {
+    /// Full exit failed on Jupiter routing; operator should sell the ATA manually.
+    pub fn requires_manual_sell(&self) -> bool {
+        matches!(self, BrokerError::JupiterSellExhausted(_))
+    }
 }
 
 // ── Trait ─────────────────────────────────────────────────────────────────────

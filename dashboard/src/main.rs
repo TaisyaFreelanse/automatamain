@@ -159,6 +159,13 @@ pub enum WsMsg {
         #[serde(default)]
         pnl_sol_pct: Option<f64>,
     },
+    ManualSellRequired {
+        mint: String,
+        exit_reason: String,
+        detail: String,
+        holdings: f64,
+        ts: i64,
+    },
 }
 
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -596,6 +603,17 @@ struct Dashboard {
     config_panel: ConfigPanel,
     /// Brief "Copied" banner after copying a mint to the clipboard.
     mint_copy_flash_until: Option<Instant>,
+    /// Sticky alert when live bot cannot Jupiter-sell; operator must sell manually.
+    manual_sell_alert: Option<ManualSellAlert>,
+}
+
+#[derive(Clone, Debug)]
+struct ManualSellAlert {
+    mint: String,
+    exit_reason: String,
+    detail: String,
+    holdings: f64,
+    ts: i64,
 }
 
 impl Dashboard {
@@ -630,6 +648,7 @@ impl Dashboard {
             last_http_poll: None,
             config_panel: ConfigPanel::new(),
             mint_copy_flash_until: None,
+            manual_sell_alert: None,
         }
     }
 
@@ -777,6 +796,21 @@ impl Dashboard {
                     }
                     WsMsg::BalanceUpdate { balance } => self.balance = Some(balance),
                     WsMsg::PausedState { paused } => self.paused = paused,
+                    WsMsg::ManualSellRequired {
+                        mint,
+                        exit_reason,
+                        detail,
+                        holdings,
+                        ts,
+                    } => {
+                        self.manual_sell_alert = Some(ManualSellAlert {
+                            mint,
+                            exit_reason,
+                            detail,
+                            holdings,
+                            ts,
+                        });
+                    }
                     WsMsg::TxEvent {
                         kind,
                         mint,
@@ -1512,6 +1546,37 @@ impl eframe::App for Dashboard {
                     ui.colored_label(egui::Color32::from_rgb(220, 90, 90), "● DISCONNECTED");
                 }
                 ui.separator();
+
+                if let Some(alert) = &self.manual_sell_alert {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 90, 90),
+                            egui::RichText::new("⚠ MANUAL SELL REQUIRED")
+                                .strong()
+                                .size(16.0),
+                        );
+                        render_mint_with_copy(
+                            ui,
+                            ctx,
+                            alert.mint.as_str(),
+                            &mut self.mint_copy_flash_until,
+                        );
+                        ui.label(format!(
+                            "holdings {:.4} · trigger: {}",
+                            alert.holdings, alert.exit_reason
+                        ));
+                        if ui.button("Dismiss").clicked() {
+                            self.manual_sell_alert = None;
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new(&alert.detail)
+                            .small()
+                            .color(egui::Color32::from_rgb(255, 180, 120)),
+                    )
+                    .on_hover_text("Sell this mint manually in your wallet (Jupiter/Phantom). Position was returned to OPEN in the bot.");
+                    ui.separator();
+                }
 
                 // ── Mode badge (DEMO=green, LIVE=red, unknown=gray) ──────────
                 match self.mode.as_deref() {

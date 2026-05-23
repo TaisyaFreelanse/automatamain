@@ -1,0 +1,22 @@
+-- Granular post-exit mcap (meme pumps: peak often 30–90s after exit) + time of extrema.
+ALTER TABLE bot_trades
+    ADD COLUMN IF NOT EXISTS post_exit_mcap_10s float8,
+    ADD COLUMN IF NOT EXISTS post_exit_mcap_30s float8,
+    ADD COLUMN IF NOT EXISTS post_exit_mcap_50s float8,
+    ADD COLUMN IF NOT EXISTS post_exit_mcap_70s float8,
+    ADD COLUMN IF NOT EXISTS post_exit_mcap_100s float8,
+    ADD COLUMN IF NOT EXISTS post_exit_mcap_180s float8,
+    ADD COLUMN IF NOT EXISTS post_exit_mcap_240s float8,
+    ADD COLUMN IF NOT EXISTS post_exit_mcap_300s float8,
+    ADD COLUMN IF NOT EXISTS post_exit_mcap_10m float8,
+    ADD COLUMN IF NOT EXISTS post_exit_pct_10s float8,
+    ADD COLUMN IF NOT EXISTS post_exit_pct_30s float8,
+    ADD COLUMN IF NOT EXISTS post_exit_pct_50s float8,
+    ADD COLUMN IF NOT EXISTS post_exit_pct_70s float8,
+    ADD COLUMN IF NOT EXISTS post_exit_pct_100s float8,
+    ADD COLUMN IF NOT EXISTS post_exit_pct_180s float8,
+    ADD COLUMN IF NOT EXISTS post_exit_pct_240s float8,
+    ADD COLUMN IF NOT EXISTS post_exit_pct_300s float8,
+    ADD COLUMN IF NOT EXISTS post_exit_pct_10m float8,
+    ADD COLUMN IF NOT EXISTS post_exit_time_to_max_secs bigint,
+    ADD COLUMN IF NOT EXISTS post_exit_time_to_min_secs bigint;

@@ -7,6 +7,7 @@ pub mod jupiter_sell;
 pub mod manager;
 pub mod open_reason;
 pub mod performance_tracker;
+pub mod post_exit_tracker;
 pub mod positions;
 pub mod pump_brocker;
 pub mod wallet_tx_sol;

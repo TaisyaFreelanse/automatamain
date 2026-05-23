@@ -4,8 +4,8 @@ use crate::{
         exit_engine::{
             adaptive_moonbag_sell_pct, adaptive_trailing, apply_phase_to_tp,
             calculate_live_score, entry_live_score_floor, in_exit_grace_period, in_sl_grace_period,
-            live_metrics_from_snapshot, live_metrics_lite, momentum_decay_detected,
-            log_v4_live_snapshot, maybe_upgrade_runner, profit_lock_staircase_floor,
+            live_metrics_from_snapshot, live_metrics_lite, maybe_upgrade_runner,
+            momentum_decay_detected, profit_lock_staircase_floor,
             resolve_entry_profile, transition_position_phase, ExitEngineV4Config, ExitProfile,
             PositionPhase, TkEntryThresholds,
         },
@@ -16,6 +16,7 @@ use crate::{
     launchpads::token_bucket::TokenBucket,
     learning::{LearningLogPg, LearningTradeSnapshot},
     persistence::{
+        bot_trade_post_exit::BotTradePostExitRepository,
         bot_trades::{BotTradeEntry, BotTradeRepository},
     },
     scoring::{
@@ -436,6 +437,8 @@ pub struct PositionManagerActor {
     last_print_time: u64,
     event_tx: mpsc::Sender<WsFeedMessage>,
     bot_trades: Arc<dyn BotTradeRepository + Send + Sync>,
+    post_exit_repo: Arc<dyn BotTradePostExitRepository + Send + Sync>,
+    post_exit_rpc: Option<Arc<solana_client::nonblocking::rpc_client::RpcClient>>,
     /// When true, InitiateBuy signals are dropped; open positions still managed.
     paused: bool,
     paused_state: StdArc<AtomicBool>,
@@ -452,6 +455,8 @@ impl PositionManagerActor {
         initial_balance_sol: f64,
         config: SmartBuyConfig,
         bot_trades: Arc<dyn BotTradeRepository + Send + Sync>,
+        post_exit_repo: Arc<dyn BotTradePostExitRepository + Send + Sync>,
+        post_exit_rpc: Option<Arc<solana_client::nonblocking::rpc_client::RpcClient>>,
         strategy_cfg: StrategyConfig,
         dev_ranker: Option<DevRankerHandle>,
         smart_money: Option<SmartMoneyHandle>,
@@ -480,6 +485,8 @@ impl PositionManagerActor {
             last_print_time: 0,
             event_tx,
             bot_trades,
+            post_exit_repo,
+            post_exit_rpc,
             paused: false,
             paused_state: paused_state.clone(),
             balance_state: balance_state.clone(),
@@ -548,9 +555,6 @@ impl PositionManagerActor {
                         pos.live_prev_buyers_per_sec = pos.live_buyers_per_sec;
                         pos.live_buyers_per_sec = live.buyers_per_sec;
                         pos.live_prev_velocity = vel;
-                        pos.live_sell_pressure = live.sell_pressure_score;
-                        pos.live_volume_delta = live.volume_delta;
-                        pos.live_momentum_decay = metrics.momentum_decay;
                         pos.live_score = calculate_live_score(&metrics)
                             .max(pos.live_score_entry_floor);
                         pos.last_live_score_at = SystemTime::now()
@@ -575,24 +579,7 @@ impl PositionManagerActor {
                         );
                         pos.exit_profile = profile;
                         pos.hold_mode = hold;
-                        log_v4_live_snapshot(
-                            &mint.to_string(),
-                            held,
-                            pos.live_score,
-                            pos.live_score_entry_floor,
-                            pos.exit_phase,
-                            pos.exit_profile,
-                            pos.hold_mode,
-                            pos.live_buyers_per_sec,
-                            pos.live_prev_buyers_per_sec,
-                            pos.live_sell_pressure,
-                            pos.live_volume_delta,
-                            vel,
-                            profit,
-                            &metrics,
-                            pos.decay_exit_streak,
-                            v4.momentum_decay_confirm_ticks,
-                        );
+                        let _ = held;
                     }
                 }
 
@@ -923,6 +910,29 @@ impl PositionManagerActor {
                             ),
                             Err(e) => {
                                 eprintln!("[SELL] Broker error for {mint}: {e}");
+                                if e.requires_manual_sell() {
+                                    eprintln!(
+                                        "[SELL] {mint}: Jupiter routing exhausted — \
+                                         clearing is_closing; MANUAL SELL required (holdings {:.4})",
+                                        pos.holdings.to_float()
+                                    );
+                                    pos.is_closing = false;
+                                    pos.pending_partial_sell = false;
+                                    let _ = self.event_tx.try_send(
+                                        WsFeedMessage::ManualSellRequired {
+                                            mint: mint.to_string(),
+                                            exit_reason: reason.clone(),
+                                            detail: e.to_string(),
+                                            holdings: pos.holdings.to_float(),
+                                            ts: now_secs(),
+                                        },
+                                    );
+                                } else if percent >= 100.0 {
+                                    pos.is_closing = false;
+                                    pos.pending_partial_sell = false;
+                                } else {
+                                    pos.pending_partial_sell = false;
+                                }
                                 let _ = self.event_tx.try_send(WsFeedMessage::TxEvent {
                                     kind: TxEventKind::Sell,
                                     mint: mint.to_string(),
@@ -1073,6 +1083,11 @@ impl PositionManagerActor {
                                 });
                             }
 
+                            let _ = self.event_tx.try_send(WsFeedMessage::PositionClose {
+                                address: mint.to_string(),
+                                reason: reason.clone(),
+                            });
+
                             // Historical bug: the row used to report
                             // `invested_sol = initial_holdings.to_float()`,
                             // which is in TOKEN units, and `realized_pnl_pct`
@@ -1108,24 +1123,31 @@ impl PositionManagerActor {
                                 entry_mcap_sol,
                                 invested_sol: invested_sol_row,
                                 realized_pnl_pct: realized_pnl_pct_row,
-                                close_reason: reason.clone(),
+                                close_reason: reason,
                                 entry_at: close_entry_time as i64,
                                 closed_at: closed_at_ts,
                                 exit_mcap_sol,
                                 entry_meta: entry_meta_json(close_learning_snapshot.as_ref()),
                             };
                             let repo = self.bot_trades.clone();
-                            let event_tx = self.event_tx.clone();
-                            let address = mint.to_string();
-                            let reason_ws = reason;
+                            let post_exit_repo = self.post_exit_repo.clone();
+                            let post_exit_rpc = self.post_exit_rpc.clone();
+                            let mint_str = mint.to_string();
                             tokio::spawn(async move {
-                                if let Err(e) = repo.save_bot_trade(entry).await {
-                                    eprintln!("[BOT TRADE] save failed: {e:?}");
+                                match repo.save_bot_trade(entry).await {
+                                    Ok(trade_id) => {
+                                        if let Some(rpc) = post_exit_rpc {
+                                            crate::autobuy::post_exit_tracker::spawn_post_exit_tracking(
+                                                rpc,
+                                                post_exit_repo,
+                                                trade_id,
+                                                mint_str,
+                                                exit_mcap_sol,
+                                            );
+                                        }
+                                    }
+                                    Err(e) => eprintln!("[BOT TRADE] save failed: {e:?}"),
                                 }
-                                let _ = event_tx.try_send(WsFeedMessage::PositionClose {
-                                    address,
-                                    reason: reason_ws,
-                                });
                             });
                         }
                     }
@@ -1487,11 +1509,6 @@ impl PositionManagerActor {
             {
                 let snap = pos.learning_snapshot.as_ref();
                 let metrics = live_metrics_lite(pos, vel, profit, snap, &v4_cfg);
-                pos.live_sell_pressure = snap
-                    .map(|s| s.sell_pressure_score)
-                    .unwrap_or(pos.live_sell_pressure);
-                pos.live_volume_delta = vel;
-                pos.live_momentum_decay = metrics.momentum_decay;
                 pos.live_score =
                     calculate_live_score(&metrics).max(pos.live_score_entry_floor);
                 pos.live_prev_velocity = vel;
@@ -1507,24 +1524,6 @@ impl PositionManagerActor {
                     maybe_upgrade_runner(&v4_cfg, pos.exit_profile, &metrics, pos.live_score, pos.hold_mode);
                 pos.exit_profile = profile;
                 pos.hold_mode = hold;
-                log_v4_live_snapshot(
-                    &mint.to_string(),
-                    held_secs,
-                    pos.live_score,
-                    pos.live_score_entry_floor,
-                    pos.exit_phase,
-                    pos.exit_profile,
-                    pos.hold_mode,
-                    pos.live_buyers_per_sec,
-                    pos.live_prev_buyers_per_sec,
-                    pos.live_sell_pressure,
-                    pos.live_volume_delta,
-                    vel,
-                    profit,
-                    &metrics,
-                    pos.decay_exit_streak,
-                    v4_cfg.momentum_decay_confirm_ticks,
-                );
             }
 
             if v4_enabled && v4_cfg.profit_staircase_enabled {
@@ -1578,31 +1577,26 @@ impl PositionManagerActor {
                 time_kill_after_secs: Some(pos.last_time_kill_after_secs),
             });
 
-            // --- 0. Phase 2: momentum decay full exit (confirmed decay signal only) ---
-            if v4_enabled && v4_cfg.momentum_decay_exit_enabled && !in_grace {
-                let volume_decay =
-                    pos.live_volume_delta < 0.0 && vel < pos.live_prev_velocity * 0.85;
-                let decay_signal = pos.live_tape_curr.is_some()
-                    && (pos.live_momentum_decay
-                        || volume_decay
-                        || momentum_decay_detected(
-                            pos.live_buyers_per_sec,
-                            pos.live_prev_buyers_per_sec,
-                            pos.live_sell_pressure,
-                            pos.live_volume_delta,
-                        ));
-
-                if decay_signal {
-                    pos.decay_exit_streak = pos
-                        .decay_exit_streak
-                        .saturating_add(1)
-                        .min(255);
-                } else {
-                    pos.decay_exit_streak = 0;
-                }
-
-                let confirm = v4_cfg.momentum_decay_confirm_ticks.max(1);
-                if pos.live_tape_curr.is_some() && pos.decay_exit_streak >= confirm {
+            // --- 0. Phase 2: momentum decay full exit ---
+            if v4_enabled
+                && v4_cfg.momentum_decay_exit_enabled
+                && !in_grace
+                && pos.live_tape_curr.is_some()
+            {
+                let sell_p = pos
+                    .learning_snapshot
+                    .as_ref()
+                    .map(|s| s.sell_pressure_score)
+                    .unwrap_or(0.0);
+                if momentum_decay_detected(
+                    pos.live_buyers_per_sec,
+                    pos.live_prev_buyers_per_sec,
+                    sell_p,
+                    vel,
+                )
+                    || pos.exit_phase == PositionPhase::Distribution
+                        && pos.live_score <= v4_cfg.phase_distribution_max_score
+                {
                     pos.is_closing = true;
                     let reason = if pos.exit_phase == PositionPhase::Distribution {
                         format!("MOMENTUM DECAY [{}]", pos.exit_phase.as_str())
@@ -1612,8 +1606,6 @@ impl PositionManagerActor {
                     actions.push((*mint, 100.0, reason));
                     continue;
                 }
-            } else if v4_enabled {
-                pos.decay_exit_streak = 0;
             }
 
             // --- 1. Time Kill (adaptive window: weak 20–25s, strong 45–70s) ---
@@ -2028,6 +2020,14 @@ pub enum WsFeedMessage {
         /// Sell: position SOL PnL % after this leg (`None` for buys / partial without spent).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pnl_sol_pct: Option<f64>,
+    },
+    /// Bot could not auto-sell (Jupiter quote/route exhausted). Position stays OPEN.
+    ManualSellRequired {
+        mint: String,
+        exit_reason: String,
+        detail: String,
+        holdings: f64,
+        ts: i64,
     },
 }
 

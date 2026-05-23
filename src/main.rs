@@ -173,13 +173,19 @@ async fn main() {
     setup_logging();
     let config = Arc::new(load_config().unwrap());
     let pool = setup_postgres_pool(30).await;
-    let (creators, tokens, trades, bot_trades) = setup_repositories(pool.clone()).await;
-    let (creators, tokens, trades, bot_trades) = (
+    let (creators, tokens, trades, bot_trades_pg) = setup_repositories(pool.clone()).await;
+    let bot_trades_pg = Arc::new(bot_trades_pg);
+    let (creators, tokens, trades) = (
         Arc::new(creators),
         Arc::new(tokens),
         Arc::new(trades),
-        Arc::new(bot_trades),
     );
+    let bot_trades: Arc<dyn loggaper::persistence::bot_trades::BotTradeRepository + Send + Sync> =
+        bot_trades_pg.clone();
+    let post_exit_repo: Arc<
+        dyn loggaper::persistence::bot_trade_post_exit::BotTradePostExitRepository + Send + Sync,
+    > = bot_trades_pg.clone();
+    let post_exit_rpc = loggaper::autobuy::execution::build_post_exit_rpc();
 
     let learn_path = config.persistence.learning_overrides_path.clone();
     let learning_overrides = Arc::new(RwLock::new(
@@ -258,6 +264,8 @@ async fn main() {
             config.start_balance_sol,
             config.buy_config.clone(),
             bot_trades,
+            post_exit_repo,
+            post_exit_rpc,
             config.strategy.clone(),
             Some(dev_ranker_handle.clone()),
             Some(smart_money_handle.clone()),
@@ -508,7 +516,16 @@ async fn main() {
 
         async fn get_bot_trades(State(state): State<ApiState>) -> impl IntoResponse {
             const Q: &str = "SELECT id, mint, entry_mcap_sol, invested_sol, realized_pnl_pct, close_reason, \
-                 entry_at, closed_at, exit_mcap_sol, entry_meta \
+                 entry_at, closed_at, exit_mcap_sol, entry_meta, \
+                 post_exit_mcap_10s, post_exit_mcap_30s, post_exit_mcap_50s, post_exit_mcap_70s, \
+                 post_exit_mcap_100s, post_exit_mcap_180s, post_exit_mcap_240s, post_exit_mcap_300s, \
+                 post_exit_mcap_5m, post_exit_mcap_10m, post_exit_mcap_15m, post_exit_mcap_30m, \
+                 post_exit_max_mcap, post_exit_min_mcap, \
+                 post_exit_time_to_max_secs, post_exit_time_to_min_secs, \
+                 post_exit_pct_10s, post_exit_pct_30s, post_exit_pct_50s, post_exit_pct_70s, \
+                 post_exit_pct_100s, post_exit_pct_180s, post_exit_pct_240s, post_exit_pct_300s, \
+                 post_exit_pct_5m, post_exit_pct_10m, post_exit_pct_15m, post_exit_pct_30m, \
+                 post_exit_max_pct, post_exit_min_pct, post_exit_tracking_done \
                  FROM bot_trades ORDER BY closed_at DESC";
             let mut last_err = None;
             for attempt in 0..3u8 {

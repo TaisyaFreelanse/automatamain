@@ -74,9 +74,7 @@ buy_config:
     hold_momentum_overheated_pct: 55.0
     phase_momentum_min_score: 5
     phase_expansion_min_score: 10
-    phase_distribution_max_score: 2
-    # Full exit on decay only after N consecutive ticks with real decay signal.
-    momentum_decay_confirm_ticks: 2
+    phase_distribution_max_score: 3
     strong_time_kill_min_profit_after_tp: 8.0
     momentum_decay_exit_enabled: true
     profit_staircase_enabled: true

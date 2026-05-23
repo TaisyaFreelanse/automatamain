@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_keypair::{Keypair, Signer};
 
 use crate::autobuy::{
@@ -164,4 +165,12 @@ pub async fn build_broker(
             Ok(Arc::new(broker))
         }
     }
+}
+
+/// Shared RPC client for post-exit mcap polling (live mode only).
+pub fn build_post_exit_rpc() -> Option<Arc<RpcClient>> {
+    let rpc_url = std::env::var("SOLANA_RPC_URL")
+        .or_else(|_| std::env::var("SOLANA_HTTP"))
+        .ok()?;
+    Some(Arc::new(RpcClient::new(rpc_url)))
 }

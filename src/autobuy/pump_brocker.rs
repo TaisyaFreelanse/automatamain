@@ -35,8 +35,10 @@ use crate::{
 use super::{
     broker::{Broker, BrokerError, BuyReceipt, SellReceipt},
     jupiter_sell::{
-        decode_jupiter_swap_transaction, jupiter_build_swap_exact_in,
-        jupiter_build_swap_wsol_to_mint_exact_in,
+        decode_jupiter_swap_transaction, is_jupiter_no_routes_found, jupiter_build_swap_exact_in,
+        jupiter_build_swap_v2_order_exact_in, jupiter_build_swap_wsol_to_mint_exact_in,
+        jupiter_execute_v2_order, JupiterQuoteOpts, JupiterSwapBuild,
+        JUPITER_EXCLUDE_PUMP_DEXES,
     },
     wallet_tx_sol,
 };
@@ -327,6 +329,7 @@ impl SolanaBroker {
             sol_lamports,
             slippage_bps_u16,
             &self.wallet_address.to_string(),
+            JupiterQuoteOpts::POST_GRADUATION,
         )
         .await?;
 
@@ -388,8 +391,262 @@ impl SolanaBroker {
         })
     }
 
-    /// Full or partial exit after the bonding curve has migrated (pump `Sell`
-    /// returns 6005). Uses Jupiter Swap API v6 (`quote` + `swap`).
+    async fn jupiter_quote_swap_build(
+        &self,
+        mint: SolAddress,
+        mint_s: &str,
+        chunk_raw: u64,
+        slippage_bps_u16: u16,
+        opts: JupiterQuoteOpts,
+        label: &str,
+    ) -> Result<JupiterSwapBuild, BrokerError> {
+        jupiter_build_swap_exact_in(
+            mint_s,
+            chunk_raw,
+            slippage_bps_u16,
+            &self.wallet_address.to_string(),
+            opts,
+        )
+        .await
+        .map_err(|e| {
+            eprintln!(
+                "[BROKER SELL] {mint}: Jupiter quote failed ({label}, raw={chunk_raw}): {e}"
+            );
+            e
+        })
+    }
+
+    async fn jupiter_send_swap_build(
+        &self,
+        build: &JupiterSwapBuild,
+    ) -> Result<Signature, BrokerError> {
+        if build.v2_request_id.is_some() {
+            return jupiter_execute_v2_order(build, self.keypair.as_ref()).await;
+        }
+        let tx_bytes = STANDARD
+            .decode(build.swap_transaction_b64.trim())
+            .map_err(|e| BrokerError::Custom(format!("Jupiter swapTransaction base64: {e}")))?;
+        let template = decode_jupiter_swap_transaction(&tx_bytes)?;
+        self.send_versioned_jupiter_with_retries(&template, "SELL-JUPITER")
+            .await
+    }
+
+    /// Post-graduation quote: exclude Pump → v2/order → v1 without exclude on `NO_ROUTES_FOUND`.
+    async fn jupiter_quote_swap_build_post_graduation(
+        &self,
+        mint: SolAddress,
+        mint_s: &str,
+        chunk_raw: u64,
+        slippage_bps_u16: u16,
+    ) -> Result<JupiterSwapBuild, BrokerError> {
+        let wallet = self.wallet_address.to_string();
+        match self
+            .jupiter_quote_swap_build(
+                mint,
+                mint_s,
+                chunk_raw,
+                slippage_bps_u16,
+                JupiterQuoteOpts::POST_GRADUATION,
+                "exclude Pump DEXes, multi-hop",
+            )
+            .await
+        {
+            Ok(build) => return Ok(build),
+            Err(e) if !is_jupiter_no_routes_found(&e) => return Err(e),
+            Err(e) => {
+                eprintln!(
+                    "[JUPITER] NO_ROUTES_FOUND with excludeDexes={JUPITER_EXCLUDE_PUMP_DEXES} \
+                     mint={mint} raw={chunk_raw}: {e}"
+                );
+            }
+        }
+
+        eprintln!(
+            "[JUPITER] {mint}: fallback GET /swap/v2/order (excludeDexes={JUPITER_EXCLUDE_PUMP_DEXES}, raw={chunk_raw})"
+        );
+        match jupiter_build_swap_v2_order_exact_in(
+            mint_s,
+            chunk_raw,
+            slippage_bps_u16,
+            &wallet,
+            Some(JUPITER_EXCLUDE_PUMP_DEXES),
+        )
+        .await
+        {
+            Ok(build) => return Ok(build),
+            Err(e) if !is_jupiter_no_routes_found(&e) => return Err(e),
+            Err(e) => {
+                eprintln!(
+                    "[JUPITER] v2/order NO_ROUTES with excludeDexes mint={mint} raw={chunk_raw}: {e}"
+                );
+            }
+        }
+
+        eprintln!(
+            "[JUPITER] {mint}: fallback v1 quote without excludeDexes (raw={chunk_raw}; 6005 guarded on send)"
+        );
+        self.jupiter_quote_swap_build(
+            mint,
+            mint_s,
+            chunk_raw,
+            slippage_bps_u16,
+            JupiterQuoteOpts::POST_GRADUATION_ALLOW_PUMP,
+            "no excludeDexes, multi-hop",
+        )
+        .await
+    }
+
+    async fn jupiter_retry_build_after_pump_6005(
+        &self,
+        mint: SolAddress,
+        mint_s: &str,
+        chunk_raw: u64,
+        slippage_bps_u16: u16,
+        had_exclude_on_first_quote: bool,
+    ) -> Result<JupiterSwapBuild, BrokerError> {
+        if had_exclude_on_first_quote {
+            if let Ok(build) = self
+                .jupiter_quote_swap_build(
+                    mint,
+                    mint_s,
+                    chunk_raw,
+                    slippage_bps_u16,
+                    JupiterQuoteOpts::POST_GRADUATION_DIRECT_ONLY,
+                    "exclude Pump DEXes, onlyDirectRoutes (6005 fallback)",
+                )
+                .await
+            {
+                return Ok(build);
+            }
+        }
+        self.jupiter_quote_swap_build(
+            mint,
+            mint_s,
+            chunk_raw,
+            slippage_bps_u16,
+            JupiterQuoteOpts::POST_GRADUATION_ALLOW_PUMP_DIRECT,
+            "no exclude, onlyDirectRoutes (6005 fallback)",
+        )
+        .await
+    }
+
+    /// Quote + send one Jupiter sell chunk (exclude Pump; `onlyDirectRoutes` only after on-chain 6005).
+    async fn jupiter_sell_chunk(
+        &self,
+        mint: SolAddress,
+        mint_s: &str,
+        ata_str: &str,
+        pre_sell_raw: u64,
+        chunk_raw: u64,
+        close_ata_after: bool,
+        ata_sol: SolAddress,
+        slip: f64,
+        mint_token: MintTokenKind,
+        slippage_bps_u16: u16,
+    ) -> Result<SellReceipt, BrokerError> {
+        if chunk_raw == 0 {
+            return Err(BrokerError::Custom(format!(
+                "{mint}: Jupiter chunk amount is zero"
+            )));
+        }
+
+        let mut build = self
+            .jupiter_quote_swap_build_post_graduation(mint, mint_s, chunk_raw, slippage_bps_u16)
+            .await?;
+
+        let sig = match self.jupiter_send_swap_build(&build).await {
+            Ok(sig) => sig,
+            Err(BrokerError::TransactionFailed(ref msg))
+                if is_bonding_curve_complete_pump_error(msg) =>
+            {
+                eprintln!(
+                    "[BROKER SELL] {mint}: SELL-JUPITER 6005 (multi-hop, raw={chunk_raw}) — onlyDirectRoutes"
+                );
+                build = self
+                    .jupiter_retry_build_after_pump_6005(
+                        mint,
+                        mint_s,
+                        chunk_raw,
+                        slippage_bps_u16,
+                        build.used_exclude_pump_dexes,
+                    )
+                    .await?;
+                self.jupiter_send_swap_build(&build).await?
+            }
+            Err(e) => return Err(e),
+        };
+
+        poll_ata_confirms_sell(
+            &self.rpc_client,
+            ata_str,
+            pre_sell_raw,
+            chunk_raw,
+            false,
+            mint,
+            Duration::from_secs(90),
+        )
+        .await?;
+
+        let sol_gross = build.out_lamports as f64 / 1e9;
+        let sol_estimated = (sol_gross * (1.0 - slip)).max(0.0);
+        let sig_jup_str = sig.to_string();
+        let mut sol_actual = self
+            .wallet_net_sol_or_fallback(&sig_jup_str, sol_estimated, "SELL-JUPITER-META")
+            .await;
+        let mut last_sig = sig_jup_str;
+
+        if close_ata_after {
+            match fetch_token_account_raw(&self.rpc_client, ata_str).await {
+                Ok(0) => {
+                    let mut ixs = self.compute_budget_prelude();
+                    let close_ix = mint_token.close_account_ix(
+                        ata_sol.into(),
+                        self.wallet_address.into(),
+                        self.wallet_address.into(),
+                    );
+                    ixs.push(close_ix);
+                    if let Ok(cs) = self.send_with_retries(ixs, "CLOSE-ATA").await {
+                        let close_delta = self
+                            .wallet_net_sol_or_fallback(&cs, 0.0, "CLOSE-ATA-META")
+                            .await;
+                        sol_actual += close_delta;
+                        last_sig = cs;
+                    }
+                }
+                Ok(left) => eprintln!(
+                    "[BROKER SELL] {mint}: post-Jupiter ATA still has raw {left}; skip close"
+                ),
+                Err(e) => eprintln!(
+                    "[BROKER SELL] {mint}: post-Jupiter ATA read failed ({e}); skip close"
+                ),
+            }
+        }
+
+        {
+            let mut bal = self.balance.lock().unwrap();
+            *bal += sol_actual;
+        }
+        Ok(SellReceipt {
+            sol_received_actual: sol_actual,
+            sol_received_estimated: sol_estimated,
+            signature: Some(last_sig),
+        })
+    }
+
+    fn jupiter_chunk_amounts(total_raw: u64, parts: u32) -> Vec<u64> {
+        if total_raw == 0 {
+            return Vec::new();
+        }
+        if parts <= 1 || total_raw < parts as u64 * 50_000 {
+            return vec![total_raw];
+        }
+        let base = total_raw / parts as u64;
+        let mut chunks: Vec<u64> = (0..parts - 1).map(|_| base).collect();
+        chunks.push(total_raw - base * (parts as u64 - 1));
+        chunks
+    }
+
+    /// Full or partial exit after bonding-curve graduation (Jupiter Swap API v1).
     async fn sell_tokens_post_graduation(
         &self,
         mint: SolAddress,
@@ -409,102 +666,77 @@ impl SolanaBroker {
             .unwrap_or(500);
 
         let mint_s = mint.to_string();
-        let build = jupiter_build_swap_exact_in(
-            &mint_s,
-            sold_raw,
-            slippage_bps_u16,
-            &self.wallet_address.to_string(),
-        )
-        .await?;
 
-        let tx_bytes = STANDARD
-            .decode(build.swap_transaction_b64.trim())
-            .map_err(|e| BrokerError::Custom(format!("Jupiter swapTransaction base64: {e}")))?;
-        let template = decode_jupiter_swap_transaction(&tx_bytes)?;
+        for parts in [1u32, 4] {
+            let chunks = Self::jupiter_chunk_amounts(sold_raw, parts);
+            if parts > 1 {
+                eprintln!(
+                    "[BROKER SELL] {mint}: Jupiter retry with {} chunks (total_raw={sold_raw})",
+                    chunks.len()
+                );
+            }
 
-        let sig = self
-            .send_versioned_jupiter_with_retries(&template, "SELL-JUPITER")
-            .await?;
+            let mut total_actual = 0.0_f64;
+            let mut total_est = 0.0_f64;
+            let mut last_sig: Option<String> = None;
+            let mut pre_raw = pre_sell_raw;
+            let mut all_ok = true;
+            let mut last_err: Option<BrokerError> = None;
 
-        poll_ata_confirms_sell(
-            &self.rpc_client,
-            ata_str,
-            pre_sell_raw,
-            sold_raw,
-            false,
-            mint,
-            Duration::from_secs(90),
-        )
-        .await?;
-
-        if do_close_ata {
-            let mut close_sig_opt: Option<String> = None;
-            match fetch_token_account_raw(&self.rpc_client, ata_str).await {
-                Ok(0) => {
-                    let mut ixs = self.compute_budget_prelude();
-                    let close_ix = mint_token.close_account_ix(
-                        ata_sol.into(),
-                        self.wallet_address.into(),
-                        self.wallet_address.into(),
-                    );
-                    ixs.push(close_ix);
-                    close_sig_opt = Some(self.send_with_retries(ixs, "CLOSE-ATA").await?);
-                }
-                Ok(left) => {
-                    eprintln!(
-                        "[BROKER SELL] {mint}: post-Jupiter ATA still has raw balance {left}; \
-                         skip CloseAccount"
-                    );
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[BROKER SELL] {mint}: post-Jupiter ATA balance read failed ({e}); \
-                         skip CloseAccount"
-                    );
+            for (i, chunk_raw) in chunks.iter().enumerate() {
+                let close_ata = do_close_ata && i + 1 == chunks.len();
+                match self
+                    .jupiter_sell_chunk(
+                        mint,
+                        &mint_s,
+                        ata_str,
+                        pre_raw,
+                        *chunk_raw,
+                        close_ata,
+                        ata_sol,
+                        slip,
+                        mint_token,
+                        slippage_bps_u16,
+                    )
+                    .await
+                {
+                    Ok(r) => {
+                        total_actual += r.sol_received_actual;
+                        total_est += r.sol_received_estimated;
+                        if let Some(s) = r.signature {
+                            last_sig = Some(s);
+                        }
+                        pre_raw = pre_raw.saturating_sub(*chunk_raw);
+                    }
+                    Err(e) => {
+                        all_ok = false;
+                        last_err = Some(e);
+                        break;
+                    }
                 }
             }
 
-            let sol_gross = build.out_lamports as f64 / 1e9;
-            let sol_estimated = (sol_gross * (1.0 - slip)).max(0.0);
-            let sig_jup_str = sig.to_string();
-            let mut sol_actual = self
-                .wallet_net_sol_or_fallback(&sig_jup_str, sol_estimated, "SELL-JUPITER-META")
-                .await;
-            let mut last_sig = sig_jup_str.clone();
-            if let Some(cs) = close_sig_opt {
-                let close_delta = self
-                    .wallet_net_sol_or_fallback(&cs, 0.0, "CLOSE-ATA-META")
-                    .await;
-                sol_actual += close_delta;
-                last_sig = cs;
+            if all_ok {
+                return Ok(SellReceipt {
+                    sol_received_actual: total_actual,
+                    sol_received_estimated: total_est,
+                    signature: last_sig,
+                });
             }
 
-            {
-                let mut bal = self.balance.lock().unwrap();
-                *bal += sol_actual;
+            if parts == 1 {
+                continue;
             }
-            return Ok(SellReceipt {
-                sol_received_actual: sol_actual,
-                sol_received_estimated: sol_estimated,
-                signature: Some(last_sig),
-            });
+            eprintln!(
+                "[BROKER SELL] {mint}: Jupiter chunked sell failed: {:?}",
+                last_err
+            );
         }
 
-        let sol_gross = build.out_lamports as f64 / 1e9;
-        let sol_estimated = (sol_gross * (1.0 - slip)).max(0.0);
-        let sig_jup_str = sig.to_string();
-        let sol_actual = self
-            .wallet_net_sol_or_fallback(&sig_jup_str, sol_estimated, "SELL-JUPITER-META")
-            .await;
-        {
-            let mut bal = self.balance.lock().unwrap();
-            *bal += sol_actual;
-        }
-        Ok(SellReceipt {
-            sol_received_actual: sol_actual,
-            sol_received_estimated: sol_estimated,
-            signature: Some(sig_jup_str),
-        })
+        Err(BrokerError::JupiterSellExhausted(format!(
+            "{mint}: no Jupiter route after excludeDexes, v2/order, unrestricted v1, direct-only, \
+             and 4-way split (raw={sold_raw})"
+        )))
     }
 
     async fn send_versioned_jupiter_with_retries(
@@ -1175,11 +1407,20 @@ impl Broker for SolanaBroker {
             .as_ref()
             .map(|c| c.curve_complete)
             .unwrap_or(false);
+        let curve_mcap_sol = curve_state_opt
+            .as_ref()
+            .map(bonding_curve_mcap_sol)
+            .unwrap_or(0.0);
+        // Near MCAP CEILING (~350 SOL) pump on-curve sell often returns 6005; use Jupiter instead.
+        const JUPITER_SELL_MCAP_SOL: f64 = 250.0;
+        let route_jupiter_not_pump = bonding_curve_complete
+            || (curve_mcap_sol >= JUPITER_SELL_MCAP_SOL && curve_mcap_sol.is_finite());
 
-        if bonding_curve_complete && token_amount_raw > 0 {
+        if route_jupiter_not_pump && token_amount_raw > 0 {
             eprintln!(
-                "[BROKER SELL] mint={mint} bonding curve COMPLETE (graduated) — \
-                 routing via Jupiter (raw_tokens={token_amount_raw}, close_ata={do_close_ata})"
+                "[BROKER SELL] mint={mint} graduated/high-mcap (complete={bonding_curve_complete} \
+                 curve_mcap={curve_mcap_sol:.1} SOL) — routing via Jupiter \
+                 (raw_tokens={token_amount_raw}, close_ata={do_close_ata})"
             );
             let pre_raw = fetch_token_account_raw(&self.rpc_client, &ata_str)
                 .await
@@ -1681,6 +1922,20 @@ async fn fetch_bonding_curve_state(
         is_cashback_coin,
         curve_complete,
     })
+}
+
+/// Read bonding-curve mcap (SOL) for post-exit tracking. `None` if account missing or migrated.
+pub async fn probe_bonding_mcap_sol(rpc: &RpcClient, mint: &SolAddress) -> Option<f64> {
+    let curve = fetch_bonding_curve_state(rpc, mint).await.ok()?;
+    if curve.curve_complete {
+        return None;
+    }
+    let mcap = bonding_curve_mcap_sol(&curve);
+    if mcap.is_finite() && mcap > 0.0 {
+        Some(mcap)
+    } else {
+        None
+    }
 }
 
 /// Pump's constant-product sell formula:
