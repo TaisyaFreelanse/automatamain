@@ -220,7 +220,7 @@ final_amount_sol = min(tier_sol, operator_cap)
 
 ### 8.6 Потолок mcap
 
-Если mcap ≥ ~350 SOL — принудительное закрытие (`MCAP CEILING`) — защита от страничных зон кривой.
+Если mcap ≥ `mcap_ceiling_sol` (по умолчанию ~350 SOL) — частичная фиксация (`MCAP CEILING`, ~65% sell), остаток moonbag под trailing/Jupiter.
 
 ---
 
@@ -402,7 +402,7 @@ Dashboard **HISTORY** и график тянутся из `bot_trades` + `trades
 | `MOMENTUM DECAY`                | Лента умерла (скорость/продажи)                 |
 | `MOMENTUM DECAY [distribution]` | Фаза «распределение», score на дне              |
 | `TRAILING EXIT (38% trail)`     | Откат от пика на 38%                            |
-| `MCAP CEILING`                  | Слишком высокий mcap                            |
+| `MCAP CEILING`                  | Высокий mcap: partial lock + moonbag (trailing) |
 | fill spike abort                | Вход слишком поздний vs score                   |
 
 

@@ -235,6 +235,12 @@ pub struct SmartBuyConfig {
     pub exit_mcap_band_low_ratio: f64,
     #[serde(default = "default_exit_mcap_band_high_ratio")]
     pub exit_mcap_band_high_ratio: f64,
+    /// Bonding-curve mcap (SOL) at which we lock most of the position (partial sell + moonbag).
+    #[serde(default = "default_mcap_ceiling_sol")]
+    pub mcap_ceiling_sol: f64,
+    /// % of current holdings to sell on first mcap ceiling hit (remainder = moonbag).
+    #[serde(default = "default_mcap_ceiling_partial_sell_pct")]
+    pub mcap_ceiling_partial_sell_pct: f64,
     /// Adaptive Exit Engine V4 (profiles, live score, hold/runner, adaptive trailing).
     #[serde(default)]
     pub exit_v4: ExitEngineV4Config,
@@ -258,6 +264,14 @@ fn default_exit_mcap_band_low_ratio() -> f64 {
 
 fn default_exit_mcap_band_high_ratio() -> f64 {
     50.0
+}
+
+fn default_mcap_ceiling_sol() -> f64 {
+    350.0
+}
+
+fn default_mcap_ceiling_partial_sell_pct() -> f64 {
+    65.0
 }
 
 fn default_fill_mcap_abort_enabled() -> bool {
@@ -313,6 +327,8 @@ impl Default for SmartBuyConfig {
             exit_mcap_median_ticks: default_exit_mcap_median_ticks(),
             exit_mcap_band_low_ratio: default_exit_mcap_band_low_ratio(),
             exit_mcap_band_high_ratio: default_exit_mcap_band_high_ratio(),
+            mcap_ceiling_sol: default_mcap_ceiling_sol(),
+            mcap_ceiling_partial_sell_pct: default_mcap_ceiling_partial_sell_pct(),
             exit_v4: ExitEngineV4Config::default(),
         }
     }
@@ -1656,10 +1672,33 @@ impl PositionManagerActor {
                 continue;
             }
 
-            // --- 3. Hard market-cap ceiling ---
-            if current_mcap >= 350.0 {
-                pos.is_closing = true;
-                actions.push((*mint, 100.0, "MCAP CEILING".to_string()));
+            // --- 3. MCAP ceiling: partial lock + moonbag (not full exit) ---
+            let ceiling_sol = global_cfg.mcap_ceiling_sol;
+            if ceiling_sol > 0.0
+                && current_mcap >= ceiling_sol
+                && !pos.mcap_ceiling_triggered
+                && !pos.pending_partial_sell
+            {
+                pos.mcap_ceiling_triggered = true;
+                let sell_pct = global_cfg
+                    .mcap_ceiling_partial_sell_pct
+                    .clamp(1.0, 99.0);
+                if !pos.trailing_active {
+                    pos.trailing_active = true;
+                    pos.exit_profit_floor = pos
+                        .exit_profit_floor
+                        .max(tp_cfg.trailing_floor_profit_pct);
+                }
+                pos.pending_partial_sell = true;
+                actions.push((
+                    *mint,
+                    sell_pct,
+                    format!("MCAP CEILING ({sell_pct:.0}% lock, moonbag)"),
+                ));
+                eprintln!(
+                    "[EXIT] {mint}: MCAP CEILING partial sell {sell_pct:.0}% at filt mcap \
+                     {current_mcap:.1} SOL (>= {ceiling_sol:.0}); moonbag + trailing"
+                );
                 continue;
             }
 

@@ -37,6 +37,9 @@ buy_config:
   exit_mcap_median_ticks: 5
   exit_mcap_band_low_ratio: 0.02
   exit_mcap_band_high_ratio: 50.0
+  # At this bonding-curve mcap (SOL): partial sell + moonbag (trailing/Jupiter on remainder).
+  mcap_ceiling_sol: 350.0
+  mcap_ceiling_partial_sell_pct: 65.0
   # Fixed window when time_kill_adaptive: false. When adaptive (V3), weak/neutral/strong
   # seconds below are used instead (this value is ignored for the timer).
   time_kill_secs: 25

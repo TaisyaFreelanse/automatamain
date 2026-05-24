@@ -25,6 +25,8 @@ pub struct Position {
     pub tp3_triggered: bool,
     pub tp4_triggered: bool,
     pub tp5_triggered: bool,
+    /// Partial profit-lock at bonding-curve mcap ceiling (moonbag + trailing on remainder).
+    pub mcap_ceiling_triggered: bool,
     pub trailing_active: bool,
     /// Blocks duplicate full-close signals while the sell tx is in-flight.
     pub is_closing: bool,
@@ -102,6 +104,7 @@ impl Position {
             tp3_triggered: false,
             tp4_triggered: false,
             tp5_triggered: false,
+            mcap_ceiling_triggered: false,
             trailing_active: false,
             is_closing: false,
             pending_partial_sell: false,
