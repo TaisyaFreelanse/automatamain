@@ -59,6 +59,10 @@ pub struct ScoringConfig {
 
     #[serde(default)]
     pub size: TierSize,
+
+    /// Pre-buy anti-rug: low sell-side / fake pump gates and scoring tightenings.
+    #[serde(default)]
+    pub anti_rug: AntiRugConfig,
 }
 
 impl Default for ScoringConfig {
@@ -74,8 +78,96 @@ impl Default for ScoringConfig {
             weights: ScoringWeights::default(),
             thresholds: FeatureThresholds::default(),
             size: TierSize::default(),
+            anti_rug: AntiRugConfig::default(),
         }
     }
+}
+
+/// Anti-rug entry filters (low fee flow / one-sided pump detection).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AntiRugConfig {
+    #[serde(default = "default_anti_rug_enabled")]
+    pub enabled: bool,
+    /// Skip buy when `sell_volume_window_sol` is below this (and buy volume is meaningful).
+    #[serde(default = "default_min_sell_volume_window_sol")]
+    pub min_sell_volume_window_sol: f64,
+    /// `sell_volume / buy_volume` must be at least this (fee-flow proxy).
+    #[serde(default = "default_min_fee_flow_ratio")]
+    pub min_fee_flow_ratio: f64,
+    /// Minimum normalized sell pressure score at entry.
+    #[serde(default = "default_min_sell_pressure_score")]
+    pub min_sell_pressure_score: f64,
+    /// Gates apply only when `buy_volume_sol` is at least this.
+    #[serde(default = "default_min_buy_volume_for_gates_sol")]
+    pub min_buy_volume_for_gates_sol: f64,
+    /// `absorb_strong` requires at least this much sell volume in the window.
+    #[serde(default = "default_absorb_strong_min_sell_vol_sol")]
+    pub absorb_strong_min_sell_vol_sol: f64,
+    /// No `buy_to_sell_ratio_high` points when ratio >= this and sell vol is tiny.
+    #[serde(default = "default_buy_to_sell_max_without_min_sell_vol")]
+    pub buy_to_sell_max_without_min_sell_vol: f64,
+    #[serde(default = "default_buy_to_sell_min_sell_vol_sol")]
+    pub buy_to_sell_min_sell_vol_sol: f64,
+    /// `buyer_velocity_persistent` needs at least this many velocity slices.
+    #[serde(default = "default_buyer_velocity_min_slices")]
+    pub buyer_velocity_min_slices: usize,
+    /// A+ capped to A when peak mcap below this unless buy volume is high enough.
+    #[serde(default = "default_low_mcap_peak_sol")]
+    pub low_mcap_peak_sol: f64,
+    #[serde(default = "default_low_mcap_min_buy_volume_sol")]
+    pub low_mcap_min_buy_volume_sol: f64,
+}
+
+impl Default for AntiRugConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_anti_rug_enabled(),
+            min_sell_volume_window_sol: default_min_sell_volume_window_sol(),
+            min_fee_flow_ratio: default_min_fee_flow_ratio(),
+            min_sell_pressure_score: default_min_sell_pressure_score(),
+            min_buy_volume_for_gates_sol: default_min_buy_volume_for_gates_sol(),
+            absorb_strong_min_sell_vol_sol: default_absorb_strong_min_sell_vol_sol(),
+            buy_to_sell_max_without_min_sell_vol: default_buy_to_sell_max_without_min_sell_vol(),
+            buy_to_sell_min_sell_vol_sol: default_buy_to_sell_min_sell_vol_sol(),
+            buyer_velocity_min_slices: default_buyer_velocity_min_slices(),
+            low_mcap_peak_sol: default_low_mcap_peak_sol(),
+            low_mcap_min_buy_volume_sol: default_low_mcap_min_buy_volume_sol(),
+        }
+    }
+}
+
+fn default_anti_rug_enabled() -> bool {
+    true
+}
+fn default_min_sell_volume_window_sol() -> f64 {
+    2.0
+}
+fn default_min_fee_flow_ratio() -> f64 {
+    0.08
+}
+fn default_min_sell_pressure_score() -> f64 {
+    0.08
+}
+fn default_min_buy_volume_for_gates_sol() -> f64 {
+    8.0
+}
+fn default_absorb_strong_min_sell_vol_sol() -> f64 {
+    1.5
+}
+fn default_buy_to_sell_max_without_min_sell_vol() -> f64 {
+    12.0
+}
+fn default_buy_to_sell_min_sell_vol_sol() -> f64 {
+    3.0
+}
+fn default_buyer_velocity_min_slices() -> usize {
+    2
+}
+fn default_low_mcap_peak_sol() -> f64 {
+    90.0
+}
+fn default_low_mcap_min_buy_volume_sol() -> f64 {
+    25.0
 }
 
 fn default_window_ms() -> u64 {

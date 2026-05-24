@@ -157,6 +157,19 @@ scoring:
   # Live: tier must be at least this. Use `A` so both A and A+ can buy when
   # `require_momentum_good` passes; set `APlus` only if you want top-tier-only.
   minimum_tier_for_buy: A
+  # Anti-rug: block one-sided low-fee pumps before buy; tighten tape score items.
+  anti_rug:
+    enabled: true
+    min_sell_volume_window_sol: 2.0
+    min_fee_flow_ratio: 0.08
+    min_sell_pressure_score: 0.08
+    min_buy_volume_for_gates_sol: 8.0
+    absorb_strong_min_sell_vol_sol: 1.5
+    buy_to_sell_max_without_min_sell_vol: 12.0
+    buy_to_sell_min_sell_vol_sol: 3.0
+    buyer_velocity_min_slices: 2
+    low_mcap_peak_sol: 90.0
+    low_mcap_min_buy_volume_sol: 25.0
   weights:
     dev_history_strong: 4
     dev_history_weak: 2

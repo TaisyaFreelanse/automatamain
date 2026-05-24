@@ -2,6 +2,7 @@
 
 use serde::Serialize;
 
+use crate::scoring::anti_rug::{cap_tier_for_low_mcap, rewards_buy_to_sell_ratio};
 use crate::scoring::config::{FeatureThresholds, ScoringConfig, ScoringWeights};
 use crate::scoring::dev_ranker::DevCategory;
 use crate::scoring::features::{momentum_peak_pct, TokenFeatures};
@@ -120,7 +121,7 @@ impl<'a> ScoreEngine<'a> {
             add("buyers_below_3", w.buyers_below_3, &mut total, &mut items);
         }
 
-        if f.buy_to_sell_ratio >= t.buy_to_sell_high {
+        if rewards_buy_to_sell_ratio(f, &self.cfg.anti_rug, t.buy_to_sell_high) {
             add(
                 "buy_to_sell_ratio_high",
                 w.buy_to_sell_ratio_high,
@@ -156,9 +157,9 @@ impl<'a> ScoreEngine<'a> {
             add("bundle_similar", w.bundle_similar, &mut total, &mut items);
         }
 
-        Self::apply_early_tape_scores(f, w, &mut total, &mut items);
+        self.apply_early_tape_scores(f, w, &mut total, &mut items);
 
-        self.finish_breakdown(total, items)
+        self.finish_breakdown(f, total, items)
     }
 
     /// Entry filter V2: merged thresholds, band-first momentum, similar-cluster bundle only.
@@ -242,7 +243,7 @@ impl<'a> ScoreEngine<'a> {
         }
 
         // --- Buy/sell pressure --------------------------------------------
-        if f.buy_to_sell_ratio >= t.buy_to_sell_high {
+        if rewards_buy_to_sell_ratio(f, &self.cfg.anti_rug, t.buy_to_sell_high) {
             add(
                 "buy_to_sell_ratio_high",
                 w.buy_to_sell_ratio_high,
@@ -284,19 +285,28 @@ impl<'a> ScoreEngine<'a> {
             add("bundle_similar", w.bundle_similar, &mut total, &mut items);
         }
 
-        Self::apply_early_tape_scores(f, w, &mut total, &mut items);
+        self.apply_early_tape_scores(f, w, &mut total, &mut items);
 
-        self.finish_breakdown(total, items)
+        self.finish_breakdown(f, total, items)
     }
 
-    fn finish_breakdown(&self, total: i32, items: Vec<(&'static str, i32)>) -> ScoreBreakdown {
-        let tier = if total >= self.cfg.a_plus_threshold {
-            Tier::APlus
-        } else if total >= self.cfg.a_threshold {
-            Tier::A
-        } else {
-            Tier::Skip
-        };
+    fn finish_breakdown(
+        &self,
+        f: &TokenFeatures,
+        total: i32,
+        items: Vec<(&'static str, i32)>,
+    ) -> ScoreBreakdown {
+        let tier = cap_tier_for_low_mcap(
+            f,
+            &self.cfg.anti_rug,
+            if total >= self.cfg.a_plus_threshold {
+                Tier::APlus
+            } else if total >= self.cfg.a_threshold {
+                Tier::A
+            } else {
+                Tier::Skip
+            },
+        );
 
         let recommended_size_sol = match tier {
             Tier::APlus => self.cfg.size.a_plus_sol,
@@ -314,11 +324,13 @@ impl<'a> ScoreEngine<'a> {
 
     /// Buyer cadence + sell-tape signals (shared by legacy and V2 paths).
     fn apply_early_tape_scores(
+        &self,
         f: &TokenFeatures,
         w: &ScoringWeights,
         total: &mut i32,
         items: &mut Vec<(&'static str, i32)>,
     ) {
+        let ar = &self.cfg.anti_rug;
         let add = |name: &'static str, points: i32, total: &mut i32, items: &mut Vec<_>| {
             if points != 0 {
                 *total += points;
@@ -326,7 +338,14 @@ impl<'a> ScoreEngine<'a> {
             }
         };
 
-        if f.buyer_velocity_persistence >= 0.62 {
+        let min_slices = if ar.enabled {
+            ar.buyer_velocity_min_slices.max(2)
+        } else {
+            1
+        };
+        if f.buyer_velocity_persistence >= 0.62
+            && f.buyer_velocity_new_per_slice.len() >= min_slices
+        {
             add(
                 "buyer_velocity_persistent",
                 w.buyer_velocity_persistent,
@@ -347,7 +366,12 @@ impl<'a> ScoreEngine<'a> {
             add("sell_pressure_high", w.sell_pressure_high, total, items);
         }
 
-        if f.absorb_quality_score >= 0.58 && f.sell_volume_window_sol >= 0.05 {
+        let absorb_min_sell = if ar.enabled {
+            ar.absorb_strong_min_sell_vol_sol
+        } else {
+            0.05
+        };
+        if f.absorb_quality_score >= 0.58 && f.sell_volume_window_sol >= absorb_min_sell {
             add("absorb_strong", w.absorb_strong, total, items);
         }
 

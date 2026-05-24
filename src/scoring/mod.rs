@@ -9,6 +9,7 @@
 //! Nothing in this module touches the broker / execution / UI layer.
 
 pub mod anti_bundle;
+pub mod anti_rug;
 pub mod config;
 pub mod dev_ranker;
 pub mod features;

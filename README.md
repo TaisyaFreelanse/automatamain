@@ -196,6 +196,10 @@ final_amount_sol = min(tier_sol, operator_cap)
 - После сильного профита включается **profit lock (лестница)** — пол поднимается (например после +50% пика → пол +15%): выход `SL trigger_pnl=… floor=15.0% …`.
 - **SL CRASH** — мгновенный выход при `trigger_pnl ≤ sl_crash_pnl_pct` (−28%) или падении raw mcap ≥ `sl_crash_tick_drop_pct` (18%) за тик; без grace/confirm/800ms delay.
 
+### 8.3.1 Anti-rug (до покупки)
+
+`scoring.anti_rug`: SKIP при низком sell-side / fee-flow (`low_sell_side_volume`, `low_fee_flow_ratio`, `fake_buy_to_sell_ratio`…). Ужесточены `absorb_strong` (sell vol ≥ 1.5 SOL), `buyer_velocity` (≥ 2 slice), A+ cap на low mcap без объёма.
+
 ### 8.4 Take profit (TP) — частичные продажи
 
 Не «всё сразу», а **лестница**:

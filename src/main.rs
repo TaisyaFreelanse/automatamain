@@ -24,6 +24,7 @@ use loggaper::{
     },
     pipelines::pump::PumpPipeline,
     scoring::{
+        anti_rug::entry_skip_reason,
         config::MinBuyTier,
         dev_ranker::{self, DevRankerHandle, DevRankerSnapshot},
         features,
@@ -1346,6 +1347,45 @@ async fn main() {
                                                 Some(dev_s.as_str()),
                                                 "live_gate_momentum",
                                                 "require_momentum_good",
+                                                payload,
+                                                ts,
+                                            )
+                                            .await;
+                                    });
+                                }
+                                return;
+                            }
+
+                            if let Some(reason) = entry_skip_reason(
+                                &token_features,
+                                &filter_config.scoring.anti_rug,
+                            ) {
+                                eprintln!(
+                                    "[BUY] {} skipped (anti_rug): {} | sell_vol={:.2} buy_vol={:.2} \
+                                     sp={:.3} b2s={:.1}",
+                                    general_create.mint,
+                                    reason,
+                                    token_features.sell_volume_window_sol,
+                                    token_features.buy_volume_sol,
+                                    token_features.sell_pressure_score,
+                                    token_features.buy_to_sell_ratio,
+                                );
+                                if let Some(ref log) = learning_log_create {
+                                    let log = log.clone();
+                                    let mint_s = general_create.mint.to_string();
+                                    let dev_s = general_create.user.to_string();
+                                    let snap =
+                                        LearningTradeSnapshot::from_scoring(&token_features, &breakdown);
+                                    let payload =
+                                        serde_json::to_value(&snap).unwrap_or_else(|_| serde_json::json!({}));
+                                    let ts = unix_now();
+                                    tokio::spawn(async move {
+                                        let _ = log
+                                            .log_skipped(
+                                                &mint_s,
+                                                Some(dev_s.as_str()),
+                                                "anti_rug",
+                                                reason,
                                                 payload,
                                                 ts,
                                             )
