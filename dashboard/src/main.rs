@@ -617,6 +617,17 @@ struct ManualSellAlert {
 }
 
 impl Dashboard {
+    /// Drop stale manual-sell banner when the bot closed the position or confirmed a sell.
+    fn clear_manual_sell_for_mint(&mut self, mint: &str) {
+        if self
+            .manual_sell_alert
+            .as_ref()
+            .is_some_and(|a| a.mint == mint)
+        {
+            self.manual_sell_alert = None;
+        }
+    }
+
     fn new(
         cc: &eframe::CreationContext<'_>,
         rx: mpsc::Receiver<AppEvent>,
@@ -670,6 +681,11 @@ impl Dashboard {
     fn apply_open_positions(&mut self, rows: Vec<OpenPositionWire>) {
         let live: std::collections::HashSet<String> =
             rows.iter().map(|w| w.address.clone()).collect();
+        if let Some(alert) = &self.manual_sell_alert {
+            if !live.contains(&alert.mint) {
+                self.manual_sell_alert = None;
+            }
+        }
         self.open.retain(|k, _| live.contains(k));
         for w in rows {
             self.open
@@ -791,6 +807,7 @@ impl Dashboard {
                         }
                     }
                     WsMsg::PositionClose { address, .. } => {
+                        self.clear_manual_sell_for_mint(&address);
                         self.open.remove(&address);
                         send_dash_cmd(&self.cmd_tx, DashCmd::RefreshBotTradesAfterClose);
                     }
@@ -826,6 +843,11 @@ impl Dashboard {
                         pnl_mcap_pct,
                         pnl_sol_pct,
                     } => {
+                        if matches!(kind, TxEventKind::Sell)
+                            && (status == "confirmed" || status == "sent")
+                        {
+                            self.clear_manual_sell_for_mint(&mint);
+                        }
                         let refresh_history =
                             kind == TxEventKind::Sell && status == "confirmed";
                         if self.tx_log.len() >= 256 {
@@ -1547,7 +1569,8 @@ impl eframe::App for Dashboard {
                 }
                 ui.separator();
 
-                if let Some(alert) = &self.manual_sell_alert {
+                let mut dismiss_manual_sell = false;
+                if let Some(alert) = self.manual_sell_alert.clone() {
                     ui.horizontal_wrapped(|ui| {
                         ui.colored_label(
                             egui::Color32::from_rgb(255, 90, 90),
@@ -1562,11 +1585,11 @@ impl eframe::App for Dashboard {
                             &mut self.mint_copy_flash_until,
                         );
                         ui.label(format!(
-                            "holdings {:.4} · trigger: {}",
-                            alert.holdings, alert.exit_reason
+                            "holdings {:.4} · trigger: {} · {}",
+                            alert.holdings, alert.exit_reason, format_age(alert.ts)
                         ));
                         if ui.button("Dismiss").clicked() {
-                            self.manual_sell_alert = None;
+                            dismiss_manual_sell = true;
                         }
                     });
                     ui.label(
@@ -1576,6 +1599,9 @@ impl eframe::App for Dashboard {
                     )
                     .on_hover_text("Sell this mint manually in your wallet (Jupiter/Phantom). Position was returned to OPEN in the bot.");
                     ui.separator();
+                }
+                if dismiss_manual_sell {
+                    self.manual_sell_alert = None;
                 }
 
                 // ── Mode badge (DEMO=green, LIVE=red, unknown=gray) ──────────

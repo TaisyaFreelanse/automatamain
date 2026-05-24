@@ -35,10 +35,10 @@ use crate::{
 use super::{
     broker::{Broker, BrokerError, BuyReceipt, SellReceipt},
     jupiter_sell::{
-        decode_jupiter_swap_transaction, is_jupiter_no_routes_found, jupiter_build_swap_exact_in,
-        jupiter_build_swap_v2_order_exact_in, jupiter_build_swap_wsol_to_mint_exact_in,
-        jupiter_execute_v2_order, JupiterQuoteOpts, JupiterSwapBuild,
-        JUPITER_EXCLUDE_PUMP_DEXES,
+        decode_jupiter_swap_transaction,         is_jupiter_empty_order, is_jupiter_execute_failed, is_jupiter_no_routes_found,
+        is_jupiter_slippage, jupiter_build_swap_exact_in, jupiter_build_swap_v2_order_exact_in,
+        jupiter_build_swap_wsol_to_mint_exact_in, jupiter_execute_v2_order, log_jupiter_fail,
+        JupiterQuoteOpts, JupiterSwapBuild, JUPITER_EXCLUDE_PUMP_DEXES,
     },
     wallet_tx_sol,
 };
@@ -419,9 +419,11 @@ impl SolanaBroker {
     async fn jupiter_send_swap_build(
         &self,
         build: &JupiterSwapBuild,
+        mint_log: &str,
+        raw_log: u64,
     ) -> Result<Signature, BrokerError> {
         if build.v2_request_id.is_some() {
-            return jupiter_execute_v2_order(build, self.keypair.as_ref()).await;
+            return jupiter_execute_v2_order(build, self.keypair.as_ref(), mint_log, raw_log).await;
         }
         let tx_bytes = STANDARD
             .decode(build.swap_transaction_b64.trim())
@@ -431,7 +433,7 @@ impl SolanaBroker {
             .await
     }
 
-    /// Post-graduation quote: exclude Pump → v2/order → v1 without exclude on `NO_ROUTES_FOUND`.
+    /// Post-graduation quote: exclude Pump → v2/order → v1 without exclude (always after v2 miss).
     async fn jupiter_quote_swap_build_post_graduation(
         &self,
         mint: SolAddress,
@@ -452,13 +454,10 @@ impl SolanaBroker {
             .await
         {
             Ok(build) => return Ok(build),
-            Err(e) if !is_jupiter_no_routes_found(&e) => return Err(e),
-            Err(e) => {
-                eprintln!(
-                    "[JUPITER] NO_ROUTES_FOUND with excludeDexes={JUPITER_EXCLUDE_PUMP_DEXES} \
-                     mint={mint} raw={chunk_raw}: {e}"
-                );
+            Err(e) if is_jupiter_no_routes_found(&e) => {
+                log_jupiter_fail("NO_ROUTES", mint_s, chunk_raw, &e.to_string());
             }
+            Err(e) => return Err(e),
         }
 
         eprintln!(
@@ -474,11 +473,12 @@ impl SolanaBroker {
         .await
         {
             Ok(build) => return Ok(build),
-            Err(e) if !is_jupiter_no_routes_found(&e) => return Err(e),
             Err(e) => {
-                eprintln!(
-                    "[JUPITER] v2/order NO_ROUTES with excludeDexes mint={mint} raw={chunk_raw}: {e}"
-                );
+                if is_jupiter_no_routes_found(&e) {
+                    log_jupiter_fail("NO_ROUTES", mint_s, chunk_raw, &format!("v2/order: {e}"));
+                } else if !is_jupiter_empty_order(&e) {
+                    log_jupiter_fail("EXECUTE_FAILED", mint_s, chunk_raw, &format!("v2/order: {e}"));
+                }
             }
         }
 
@@ -494,6 +494,39 @@ impl SolanaBroker {
             "no excludeDexes, multi-hop",
         )
         .await
+    }
+
+    /// v1 allow-Pump only (skip exclude + v2) — last resort after slippage retries.
+    async fn jupiter_quote_swap_build_allow_pump_v1(
+        &self,
+        mint: SolAddress,
+        mint_s: &str,
+        chunk_raw: u64,
+        slippage_bps_u16: u16,
+    ) -> Result<JupiterSwapBuild, BrokerError> {
+        eprintln!(
+            "[JUPITER] {mint}: v1 allow-pump only (raw={chunk_raw}, slippage_bps={slippage_bps_u16})"
+        );
+        self.jupiter_quote_swap_build(
+            mint,
+            mint_s,
+            chunk_raw,
+            slippage_bps_u16,
+            JupiterQuoteOpts::POST_GRADUATION_ALLOW_PUMP,
+            "no excludeDexes, multi-hop (slippage fallback)",
+        )
+        .await
+    }
+
+    fn jupiter_slippage_steps(base_bps: u16) -> Vec<u16> {
+        let mut steps = Vec::new();
+        for mul in [1u32, 2, 3] {
+            let b = ((base_bps as u32).saturating_mul(mul)).min(3500) as u16;
+            if !steps.contains(&b) {
+                steps.push(b);
+            }
+        }
+        steps
     }
 
     async fn jupiter_retry_build_after_pump_6005(
@@ -550,11 +583,94 @@ impl SolanaBroker {
             )));
         }
 
-        let mut build = self
-            .jupiter_quote_swap_build_post_graduation(mint, mint_s, chunk_raw, slippage_bps_u16)
-            .await?;
+        let slip_steps = Self::jupiter_slippage_steps(slippage_bps_u16);
+        let mut last_slip_err: Option<BrokerError> = None;
 
-        let sig = match self.jupiter_send_swap_build(&build).await {
+        for slip_bps in &slip_steps {
+            match self
+                .jupiter_sell_chunk_once(
+                    mint,
+                    mint_s,
+                    ata_str,
+                    pre_sell_raw,
+                    chunk_raw,
+                    close_ata_after,
+                    ata_sol,
+                    slip,
+                    mint_token,
+                    *slip_bps,
+                    false,
+                )
+                .await
+            {
+                Ok(r) => return Ok(r),
+                Err(e) if is_jupiter_slippage(&e) => {
+                    log_jupiter_fail("SLIPPAGE", mint_s, chunk_raw, &e.to_string());
+                    last_slip_err = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        if let Some(e) = &last_slip_err {
+            eprintln!(
+                "[JUPITER] {mint}: SLIPPAGE retries exhausted ({e}) — v1 allow-pump only (raw={chunk_raw})"
+            );
+        }
+
+        let max_slip = *slip_steps.last().unwrap_or(&slippage_bps_u16);
+        self.jupiter_sell_chunk_once(
+            mint,
+            mint_s,
+            ata_str,
+            pre_sell_raw,
+            chunk_raw,
+            close_ata_after,
+            ata_sol,
+            slip,
+            mint_token,
+            max_slip,
+            true,
+        )
+        .await
+    }
+
+    async fn jupiter_sell_chunk_once(
+        &self,
+        mint: SolAddress,
+        mint_s: &str,
+        ata_str: &str,
+        pre_sell_raw: u64,
+        chunk_raw: u64,
+        close_ata_after: bool,
+        ata_sol: SolAddress,
+        slip: f64,
+        mint_token: MintTokenKind,
+        slippage_bps_u16: u16,
+        allow_pump_v1_only: bool,
+    ) -> Result<SellReceipt, BrokerError> {
+        let mut build = if allow_pump_v1_only {
+            self.jupiter_quote_swap_build_allow_pump_v1(
+                mint,
+                mint_s,
+                chunk_raw,
+                slippage_bps_u16,
+            )
+            .await?
+        } else {
+            self.jupiter_quote_swap_build_post_graduation(
+                mint,
+                mint_s,
+                chunk_raw,
+                slippage_bps_u16,
+            )
+            .await?
+        };
+
+        let sig = match self
+            .jupiter_send_swap_build(&build, mint_s, chunk_raw)
+            .await
+        {
             Ok(sig) => sig,
             Err(BrokerError::TransactionFailed(ref msg))
                 if is_bonding_curve_complete_pump_error(msg) =>
@@ -571,7 +687,13 @@ impl SolanaBroker {
                         build.used_exclude_pump_dexes,
                     )
                     .await?;
-                self.jupiter_send_swap_build(&build).await?
+                self.jupiter_send_swap_build(&build, mint_s, chunk_raw)
+                    .await?
+            }
+            Err(e) if is_jupiter_slippage(&e) => return Err(e),
+            Err(e) if is_jupiter_execute_failed(&e) => {
+                log_jupiter_fail("EXECUTE_FAILED", mint_s, chunk_raw, &e.to_string());
+                return Err(e);
             }
             Err(e) => return Err(e),
         };
@@ -666,6 +788,7 @@ impl SolanaBroker {
             .unwrap_or(500);
 
         let mint_s = mint.to_string();
+        let mut last_err: Option<BrokerError> = None;
 
         for parts in [1u32, 4] {
             let chunks = Self::jupiter_chunk_amounts(sold_raw, parts);
@@ -681,7 +804,6 @@ impl SolanaBroker {
             let mut last_sig: Option<String> = None;
             let mut pre_raw = pre_sell_raw;
             let mut all_ok = true;
-            let mut last_err: Option<BrokerError> = None;
 
             for (i, chunk_raw) in chunks.iter().enumerate() {
                 let close_ata = do_close_ata && i + 1 == chunks.len();
@@ -733,9 +855,12 @@ impl SolanaBroker {
             );
         }
 
+        let detail = last_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown".into());
         Err(BrokerError::JupiterSellExhausted(format!(
-            "{mint}: no Jupiter route after excludeDexes, v2/order, unrestricted v1, direct-only, \
-             and 4-way split (raw={sold_raw})"
+            "{mint}: Jupiter sell exhausted after exclude→v2→v1-allow-pump, slippage retries, \
+             and 4-way split (raw={sold_raw}): {detail}"
         )))
     }
 

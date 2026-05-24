@@ -75,6 +75,36 @@ pub(crate) fn is_jupiter_no_routes_found(err: &BrokerError) -> bool {
     }
 }
 
+/// v2 `/order` returned HTTP 200 but no signable `transaction`.
+pub(crate) fn is_jupiter_empty_order(err: &BrokerError) -> bool {
+    match err {
+        BrokerError::Custom(msg) => {
+            msg.contains("EMPTY_ORDER") || msg.contains("empty transaction")
+        }
+        _ => false,
+    }
+}
+
+/// On-chain or `/execute` slippage (Pump/Jupiter custom 15001, etc.).
+pub(crate) fn is_jupiter_slippage(err: &BrokerError) -> bool {
+    match err {
+        BrokerError::TransactionFailed(msg) => {
+            msg.contains("15001")
+                || msg.to_ascii_lowercase().contains("slippage tolerance exceeded")
+                || msg.to_ascii_lowercase().contains("slippage")
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn is_jupiter_execute_failed(err: &BrokerError) -> bool {
+    matches!(err, BrokerError::TransactionFailed(_)) && !is_jupiter_slippage(err)
+}
+
+pub(crate) fn log_jupiter_fail(tag: &'static str, mint: &str, raw: u64, detail: &str) {
+    eprintln!("[JUPITER] {tag} mint={mint} raw={raw}: {detail}");
+}
+
 fn http() -> &'static Client {
     static HTTP: OnceLock<Client> = OnceLock::new();
     HTTP.get_or_init(|| {
@@ -213,10 +243,19 @@ pub(crate) async fn jupiter_fetch_quote_exact_in(
     let quote = jupiter_http_json(reqwest::Method::GET, &quote_url, None, "quote").await?;
 
     if let Some(err) = quote.get("error") {
-        eprintln!(
-            "[JUPITER] quote logical error url={} body={err}",
-            jupiter_quote_url_for_log(&quote_url)
-        );
+        if err.as_str() == Some("No routes found")
+            || quote
+                .get("errorCode")
+                .and_then(|v| v.as_str())
+                == Some("NO_ROUTES_FOUND")
+        {
+            log_jupiter_fail(
+                "NO_ROUTES",
+                input_mint,
+                amount_raw,
+                &format!("{err}"),
+            );
+        }
         return Err(BrokerError::Custom(format!("Jupiter quote error: {err}")));
     }
     Ok(quote)
@@ -251,7 +290,13 @@ pub(crate) async fn jupiter_build_swap_v2_order_exact_in(
 
     if let Some(err) = order.get("error").and_then(|v| v.as_str()) {
         if !err.is_empty() {
-            return Err(BrokerError::Custom(format!("Jupiter order error: {err}")));
+            log_jupiter_fail(
+                "EMPTY_ORDER",
+                input_mint,
+                amount_raw,
+                &format!("order logical error: {err}"),
+            );
+            return Err(BrokerError::Custom(format!("Jupiter EMPTY_ORDER: {err}")));
         }
     }
 
@@ -260,9 +305,20 @@ pub(crate) async fn jupiter_build_swap_v2_order_exact_in(
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
+            let code = order.get("errorCode").map(|v| v.to_string()).unwrap_or_default();
+            let msg = order
+                .get("errorMessage")
+                .or_else(|| order.get("error"))
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            log_jupiter_fail(
+                "EMPTY_ORDER",
+                input_mint,
+                amount_raw,
+                &format!("errorCode={code} message={msg}"),
+            );
             BrokerError::Custom(format!(
-                "Jupiter order: empty transaction (errorCode={:?})",
-                order.get("errorCode")
+                "Jupiter EMPTY_ORDER: empty transaction (errorCode={code}, message={msg})"
             ))
         })?
         .to_string();
@@ -288,6 +344,8 @@ pub(crate) async fn jupiter_build_swap_v2_order_exact_in(
 pub(crate) async fn jupiter_execute_v2_order(
     build: &JupiterSwapBuild,
     signer: &Keypair,
+    mint_log: &str,
+    raw_log: u64,
 ) -> Result<Signature, BrokerError> {
     let request_id = build.v2_request_id.as_ref().ok_or_else(|| {
         BrokerError::Custom("Jupiter execute: missing v2 requestId".into())
@@ -332,8 +390,17 @@ pub(crate) async fn jupiter_execute_v2_order(
         .get("code")
         .map(|v| v.to_string())
         .unwrap_or_else(|| "?".into());
+    let detail = format!("status={status} code={code}: {err}");
+    let tag = if code.contains("15001")
+        || err.to_ascii_lowercase().contains("slippage tolerance exceeded")
+    {
+        "SLIPPAGE"
+    } else {
+        "EXECUTE_FAILED"
+    };
+    log_jupiter_fail(tag, mint_log, raw_log, &detail);
     Err(BrokerError::TransactionFailed(format!(
-        "Jupiter execute status={status} code={code}: {err}"
+        "Jupiter execute {detail}"
     )))
 }
 
