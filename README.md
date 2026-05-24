@@ -193,7 +193,8 @@ final_amount_sol = min(tier_sol, operator_cap)
 - Стартовый пол: `**exit_profit_floor`** (−16% по mcap).
 - Первые `**sl_grace_secs**` (5 сек) SL **не активен**.
 - SL срабатывает только если **3 тика подряд** (sl_confirm_ticks) mcap ≤ пола.
-- После сильного профита включается **profit lock (лестница)** — пол поднимается (например после +50% пика → пол +15%): выход `SL (floor 15.0%, 3 ticks, …)`.
+- После сильного профита включается **profit lock (лестница)** — пол поднимается (например после +50% пика → пол +15%): выход `SL trigger_pnl=… floor=15.0% …`.
+- **SL CRASH** — мгновенный выход при `trigger_pnl ≤ sl_crash_pnl_pct` (−28%) или падении raw mcap ≥ `sl_crash_tick_drop_pct` (18%) за тик; без grace/confirm/800ms delay.
 
 ### 8.4 Take profit (TP) — частичные продажи
 
@@ -396,8 +397,8 @@ Dashboard **HISTORY** и график тянутся из `bot_trades` + `trades
 | ------------------------------- | ----------------------------------------------- |
 | `TP1 (50%) [runner|…]`          | Первая фиксация прибыли, часть позиции          |
 | `TP2 …` / `TP3 …`               | Следующие ступени                               |
-| `SL (floor -16.0%, 3 ticks, …)` | Стоп по mcap, подтверждён 3 тиками              |
-| `SL (floor 15.0%, …)`           | Profit-lock: защита прибыли после большого пика |
+| `SL … trigger_pnl=…` / `SL CRASH …` | Стоп: pessimistic PnL; crash = instant, no delay |
+| `SL … floor=15.0% …`            | Profit-lock: защита прибыли после большого пика |
 | `TIME KILL`                     | Время вышло, профит так и не стал ≥ 10%         |
 | `MOMENTUM DECAY`                | Лента умерла (скорость/продажи)                 |
 | `MOMENTUM DECAY [distribution]` | Фаза «распределение», score на дне              |

@@ -33,6 +33,10 @@ buy_config:
   sl_confirm_ticks: 3
   # SL: no stop-loss for this many seconds after entry (V4 decay grace is separate).
   sl_grace_secs: 5
+  # Emergency SL: instant exit, no grace/confirm/delay (min filtered vs raw PnL).
+  sl_crash_pnl_pct: -28.0
+  # Emergency SL: raw mcap drop % vs previous 100ms tick (catches cliff dumps).
+  sl_crash_tick_drop_pct: 18.0
   # Median filter on bonding-curve mcap for exit decisions (ring length in ticks).
   exit_mcap_median_ticks: 5
   exit_mcap_band_low_ratio: 0.02

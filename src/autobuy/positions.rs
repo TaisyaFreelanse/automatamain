@@ -75,6 +75,8 @@ pub struct Position {
     pub exit_mcap_ticks: Vec<f64>,
     /// Consecutive ticks with filtered PnL at or below `exit_profit_floor` (SL confirm).
     pub sl_below_floor_streak: u8,
+    /// Previous raw pool mcap (100ms tick) for single-tick crash detection.
+    pub sl_prev_raw_mcap: Option<f64>,
 }
 
 impl Position {
@@ -138,6 +140,7 @@ impl Position {
             live_tape_curr: None,
             exit_mcap_ticks: Vec::new(),
             sl_below_floor_streak: 0,
+            sl_prev_raw_mcap: None,
         }
     }
 

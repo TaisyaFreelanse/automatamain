@@ -3,7 +3,9 @@ use crate::{
         broker::{Broker, BuyReceipt},
         exit_engine::{
             adaptive_moonbag_sell_pct, adaptive_trailing, apply_phase_to_tp,
-            calculate_live_score, entry_live_score_floor, in_exit_grace_period, in_sl_grace_period,
+            calculate_live_score, entry_live_score_floor, format_sl_close_reason,
+            in_exit_grace_period, in_sl_grace_period, sl_crash_triggered, sl_raw_tick_drop_pct,
+            sl_trigger_pnl_pct,
             live_metrics_from_snapshot, live_metrics_lite, maybe_upgrade_runner,
             momentum_decay_detected, profit_lock_staircase_floor,
             resolve_entry_profile, transition_position_phase, ExitEngineV4Config, ExitProfile,
@@ -227,6 +229,12 @@ pub struct SmartBuyConfig {
     /// SL: no stop-loss until held this many seconds after entry (decay grace is separate).
     #[serde(default = "default_sl_grace_secs")]
     pub sl_grace_secs: u64,
+    /// Emergency SL: instant exit when pessimistic PnL <= this (bypasses grace + confirm).
+    #[serde(default = "default_sl_crash_pnl_pct")]
+    pub sl_crash_pnl_pct: f64,
+    /// Emergency SL: instant exit when raw mcap drops this % vs previous tick (bypasses grace).
+    #[serde(default = "default_sl_crash_tick_drop_pct")]
+    pub sl_crash_tick_drop_pct: f64,
     /// Ring buffer length for exit mcap median filter (~500ms at 100ms ticks when 5).
     #[serde(default = "default_exit_mcap_median_ticks")]
     pub exit_mcap_median_ticks: usize,
@@ -252,6 +260,14 @@ fn default_sl_confirm_ticks() -> u32 {
 
 fn default_sl_grace_secs() -> u64 {
     5
+}
+
+fn default_sl_crash_pnl_pct() -> f64 {
+    -28.0
+}
+
+fn default_sl_crash_tick_drop_pct() -> f64 {
+    18.0
 }
 
 fn default_exit_mcap_median_ticks() -> usize {
@@ -324,6 +340,8 @@ impl Default for SmartBuyConfig {
             fill_mcap_abort_max_ratio: default_fill_mcap_abort_max_ratio(),
             sl_confirm_ticks: default_sl_confirm_ticks(),
             sl_grace_secs: default_sl_grace_secs(),
+            sl_crash_pnl_pct: default_sl_crash_pnl_pct(),
+            sl_crash_tick_drop_pct: default_sl_crash_tick_drop_pct(),
             exit_mcap_median_ticks: default_exit_mcap_median_ticks(),
             exit_mcap_band_low_ratio: default_exit_mcap_band_low_ratio(),
             exit_mcap_band_high_ratio: default_exit_mcap_band_high_ratio(),
@@ -1488,7 +1506,7 @@ impl PositionManagerActor {
         let v4_cfg = self.config.exit_v4.clone();
         let global_cfg = self.config.clone();
 
-        let mut actions: Vec<(solana_address::Address, f64, String)> = Vec::new();
+        let mut actions: Vec<(solana_address::Address, f64, String, bool)> = Vec::new();
 
         for (mint, pos) in self.positions.iter_mut() {
             // Skip positions that are already queued for a full close.
@@ -1508,6 +1526,12 @@ impl PositionManagerActor {
             pos.time_kill_note_mcap_sample(current_time, current_mcap);
 
             let profit = pos.pnl_filtered(band_lo, band_hi);
+            let profit_raw = pos.pnl_at_mcap(raw_mcap);
+            let sl_profit = sl_trigger_pnl_pct(profit, profit_raw);
+            let tick_drop = pos
+                .sl_prev_raw_mcap
+                .and_then(|prev| sl_raw_tick_drop_pct(prev, raw_mcap));
+            pos.sl_prev_raw_mcap = Some(raw_mcap);
             if profit > pos.peak_profit_pct {
                 pos.peak_profit_pct = profit;
             }
@@ -1619,7 +1643,7 @@ impl PositionManagerActor {
                     } else {
                         "MOMENTUM DECAY".to_string()
                     };
-                    actions.push((*mint, 100.0, reason));
+                    actions.push((*mint, 100.0, reason, false));
                     continue;
                 }
             }
@@ -1639,16 +1663,40 @@ impl PositionManagerActor {
                 && profit < global_cfg.time_kill_min_profit_pct
             {
                 pos.is_closing = true;
-                actions.push((*mint, 100.0, "TIME KILL".to_string()));
+                actions.push((*mint, 100.0, "TIME KILL".to_string(), false));
                 continue;
             }
 
             // --- 2. Stop Loss / Smart Stop ---
-            // Filtered mcap + N-tick confirm + post-entry grace (avoids one stale WS tick).
+            // Pessimistic PnL (min filtered, raw) + N-tick confirm + grace; crash bypasses both.
             let in_sl_grace = in_sl_grace_period(held_secs, global_cfg.sl_grace_secs);
+            let sl_confirm = global_cfg.sl_confirm_ticks.max(1);
+            let crash = sl_crash_triggered(
+                sl_profit,
+                tick_drop,
+                global_cfg.sl_crash_pnl_pct,
+                global_cfg.sl_crash_tick_drop_pct,
+            );
+            if crash {
+                pos.is_closing = true;
+                let reason = format_sl_close_reason(
+                    true,
+                    sl_profit,
+                    pos.exit_profit_floor,
+                    profit,
+                    profit_raw,
+                    current_mcap,
+                    raw_mcap,
+                    None,
+                    tick_drop,
+                );
+                eprintln!("[EXIT] {mint}: {reason}");
+                actions.push((*mint, 100.0, reason, true));
+                continue;
+            }
             if in_sl_grace {
                 pos.sl_below_floor_streak = 0;
-            } else if profit <= pos.exit_profit_floor {
+            } else if sl_profit <= pos.exit_profit_floor {
                 pos.sl_below_floor_streak = pos
                     .sl_below_floor_streak
                     .saturating_add(1)
@@ -1656,19 +1704,21 @@ impl PositionManagerActor {
             } else {
                 pos.sl_below_floor_streak = 0;
             }
-            let sl_confirm = global_cfg.sl_confirm_ticks.max(1);
             if !in_sl_grace && pos.sl_below_floor_streak >= sl_confirm as u8 {
                 pos.is_closing = true;
-                actions.push((
-                    *mint,
-                    100.0,
-                    format!(
-                        "SL (floor {:.1}%, {} ticks, filt mcap {:.1})",
-                        pos.exit_profit_floor,
-                        sl_confirm,
-                        current_mcap
-                    ),
-                ));
+                let reason = format_sl_close_reason(
+                    false,
+                    sl_profit,
+                    pos.exit_profit_floor,
+                    profit,
+                    profit_raw,
+                    current_mcap,
+                    raw_mcap,
+                    Some(sl_confirm),
+                    tick_drop,
+                );
+                eprintln!("[EXIT] {mint}: {reason}");
+                actions.push((*mint, 100.0, reason, false));
                 continue;
             }
 
@@ -1694,6 +1744,7 @@ impl PositionManagerActor {
                     *mint,
                     sell_pct,
                     format!("MCAP CEILING ({sell_pct:.0}% lock, moonbag)"),
+                    false,
                 ));
                 eprintln!(
                     "[EXIT] {mint}: MCAP CEILING partial sell {sell_pct:.0}% at filt mcap \
@@ -1713,7 +1764,7 @@ impl PositionManagerActor {
                     } else {
                         "TRAILING EXIT".to_string()
                     };
-                    actions.push((*mint, 100.0, reason));
+                    actions.push((*mint, 100.0, reason, false));
                     continue;
                 }
             }
@@ -1766,6 +1817,7 @@ impl PositionManagerActor {
                     *mint,
                     tp_cfg.tp1_sell_pct,
                     tp_label(1, tp_cfg.tp1_pct),
+                    false,
                 ));
                 continue;
             }
@@ -1777,6 +1829,7 @@ impl PositionManagerActor {
                     *mint,
                     tp_cfg.tp2_sell_pct,
                     tp_label(2, tp_cfg.tp2_pct),
+                    false,
                 ));
                 continue;
             }
@@ -1788,6 +1841,7 @@ impl PositionManagerActor {
                     *mint,
                     moonbag_sell(tp_cfg.tp3_sell_pct),
                     tp_label(3, tp_cfg.tp3_pct),
+                    false,
                 ));
                 continue;
             }
@@ -1799,6 +1853,7 @@ impl PositionManagerActor {
                     *mint,
                     moonbag_sell(tp_cfg.tp4_sell_pct),
                     tp_label(4, tp_cfg.tp4_pct),
+                    false,
                 ));
                 continue;
             }
@@ -1810,13 +1865,14 @@ impl PositionManagerActor {
                     *mint,
                     moonbag_sell(tp_cfg.tp5_sell_pct),
                     tp_label(5, tp_cfg.tp5_pct),
+                    false,
                 ));
             }
         }
 
         // Execute collected actions after releasing the mutable borrow.
-        for (mint, percent, reason) in actions {
-            self.schedule_sell(mint, percent, reason);
+        for (mint, percent, reason, urgent) in actions {
+            self.schedule_sell(mint, percent, reason, urgent);
         }
 
         if current_time > self.last_print_time {
@@ -1825,11 +1881,19 @@ impl PositionManagerActor {
         }
     }
 
-    /// Spawns an 800 ms delay before sending the sell order (simulates tx latency).
-    fn schedule_sell(&self, mint: solana_address::Address, percent: f64, reason: String) {
+    /// Queue sell. Emergency SL (`urgent`) skips the 800 ms delay.
+    fn schedule_sell(
+        &self,
+        mint: solana_address::Address,
+        percent: f64,
+        reason: String,
+        urgent: bool,
+    ) {
         let tx_clone = self.tx.clone();
         tokio::spawn(async move {
-            sleep(Duration::from_millis(800)).await;
+            if !urgent {
+                sleep(Duration::from_millis(800)).await;
+            }
             let _ = tx_clone
                 .send(PositionMessage::ExecuteSell {
                     mint,

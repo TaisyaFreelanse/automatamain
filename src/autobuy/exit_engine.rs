@@ -227,6 +227,58 @@ pub fn in_sl_grace_period(held_secs: u64, sl_grace_secs: u64) -> bool {
     held_secs < sl_grace_secs
 }
 
+/// Pessimistic PnL for SL: react to the worse of median-filtered and raw pool mcap.
+pub fn sl_trigger_pnl_pct(filtered_pnl_pct: f64, raw_pnl_pct: f64) -> f64 {
+    filtered_pnl_pct.min(raw_pnl_pct)
+}
+
+/// Single-tick raw mcap drop vs previous tick (%), if both samples are valid.
+pub fn sl_raw_tick_drop_pct(prev_raw_mcap: f64, raw_mcap: f64) -> Option<f64> {
+    if !exit_mcap_valid(prev_raw_mcap) || !exit_mcap_valid(raw_mcap) || prev_raw_mcap <= 0.0 {
+        return None;
+    }
+    Some((prev_raw_mcap - raw_mcap) / prev_raw_mcap * 100.0)
+}
+
+/// Instant emergency SL (bypasses grace and N-tick confirm).
+pub fn sl_crash_triggered(
+    trigger_pnl_pct: f64,
+    tick_drop_pct: Option<f64>,
+    crash_pnl_pct: f64,
+    crash_tick_drop_pct: f64,
+) -> bool {
+    trigger_pnl_pct <= crash_pnl_pct
+        || tick_drop_pct.is_some_and(|d| d >= crash_tick_drop_pct)
+}
+
+/// Human-readable SL close reason (dashboard / bot_trades).
+pub fn format_sl_close_reason(
+    crash: bool,
+    trigger_pnl_pct: f64,
+    floor_pct: f64,
+    filtered_pnl_pct: f64,
+    raw_pnl_pct: f64,
+    filt_mcap_sol: f64,
+    raw_mcap_sol: f64,
+    confirm_ticks: Option<u32>,
+    tick_drop_pct: Option<f64>,
+) -> String {
+    let tag = if crash { "SL CRASH" } else { "SL" };
+    let confirm = match confirm_ticks {
+        Some(n) => format!("{n} ticks"),
+        None => "instant".to_string(),
+    };
+    let drop = tick_drop_pct
+        .filter(|d| *d > 0.0)
+        .map(|d| format!(" tick_drop={d:.1}%"))
+        .unwrap_or_default();
+    format!(
+        "{tag} trigger_pnl={trigger_pnl_pct:.1}% floor={floor_pct:.1}% \
+         filt_pnl={filtered_pnl_pct:.1}% raw_pnl={raw_pnl_pct:.1}% | \
+         filt_mcap={filt_mcap_sol:.1} raw_mcap={raw_mcap_sol:.1} | {confirm}{drop}"
+    )
+}
+
 const EXIT_MCAP_ABS_MAX: f64 = 200_000.0;
 
 pub fn exit_mcap_valid(mcap: f64) -> bool {
@@ -865,5 +917,15 @@ mod tests {
         let samples = [73.5, 74.0, 59.0, 73.8, 74.2];
         let filtered = filtered_exit_mcap(&samples, 73.67, 0.02, 50.0);
         assert!(filtered > 65.0, "filtered was {filtered}");
+    }
+
+    #[test]
+    fn sl_pessimistic_and_crash() {
+        assert_eq!(sl_trigger_pnl_pct(-10.0, -35.0), -35.0);
+        let drop = sl_raw_tick_drop_pct(157.0, 32.0).unwrap();
+        assert!(drop > 75.0);
+        assert!(sl_crash_triggered(-30.0, None, -28.0, 18.0));
+        assert!(sl_crash_triggered(-5.0, Some(20.0), -28.0, 18.0));
+        assert!(!sl_crash_triggered(-10.0, Some(5.0), -28.0, 18.0));
     }
 }
