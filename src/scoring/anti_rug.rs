@@ -6,7 +6,7 @@ use crate::scoring::score_engine::Tier;
 
 /// Live entry skip reason (logged to `learning_skipped.stage = anti_rug`).
 pub fn entry_skip_reason(f: &TokenFeatures, cfg: &AntiRugConfig) -> Option<&'static str> {
-    if !cfg.enabled || f.buy_volume_sol < cfg.min_buy_volume_for_gates_sol {
+    if !cfg.entry_gate_enabled || f.buy_volume_sol < cfg.min_buy_volume_for_gates_sol {
         return None;
     }
     let sell_vol = f.sell_volume_window_sol;

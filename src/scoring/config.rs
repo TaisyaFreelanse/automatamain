@@ -86,8 +86,12 @@ impl Default for ScoringConfig {
 /// Anti-rug entry filters (low fee flow / one-sided pump detection).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AntiRugConfig {
+    /// Scoring tightenings (absorb/bv/b2s/tier cap). Independent of pre-buy gate.
     #[serde(default = "default_anti_rug_enabled")]
     pub enabled: bool,
+    /// Hard pre-buy SKIP gate (`entry_skip_reason`). Temporary A/B: set false to allow buys.
+    #[serde(default = "default_anti_rug_entry_gate_enabled")]
+    pub entry_gate_enabled: bool,
     /// Skip buy when `sell_volume_window_sol` is below this (and buy volume is meaningful).
     #[serde(default = "default_min_sell_volume_window_sol")]
     pub min_sell_volume_window_sol: f64,
@@ -122,6 +126,7 @@ impl Default for AntiRugConfig {
     fn default() -> Self {
         Self {
             enabled: default_anti_rug_enabled(),
+            entry_gate_enabled: default_anti_rug_entry_gate_enabled(),
             min_sell_volume_window_sol: default_min_sell_volume_window_sol(),
             min_fee_flow_ratio: default_min_fee_flow_ratio(),
             min_sell_pressure_score: default_min_sell_pressure_score(),
@@ -137,6 +142,9 @@ impl Default for AntiRugConfig {
 }
 
 fn default_anti_rug_enabled() -> bool {
+    true
+}
+fn default_anti_rug_entry_gate_enabled() -> bool {
     true
 }
 fn default_min_sell_volume_window_sol() -> f64 {

@@ -160,6 +160,8 @@ scoring:
   # Anti-rug: block one-sided low-fee pumps before buy; tighten tape score items.
   anti_rug:
     enabled: true
+    # TEMP: hard pre-buy gate off — scoring tightenings stay on (A/B vs 8 near-miss tokens).
+    entry_gate_enabled: false
     min_sell_volume_window_sol: 2.0
     min_fee_flow_ratio: 0.08
     min_sell_pressure_score: 0.05
