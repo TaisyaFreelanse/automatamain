@@ -146,7 +146,7 @@ fn default_min_fee_flow_ratio() -> f64 {
     0.08
 }
 fn default_min_sell_pressure_score() -> f64 {
-    0.08
+    0.05
 }
 fn default_min_buy_volume_for_gates_sol() -> f64 {
     8.0

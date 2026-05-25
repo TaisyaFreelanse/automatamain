@@ -162,7 +162,7 @@ scoring:
     enabled: true
     min_sell_volume_window_sol: 2.0
     min_fee_flow_ratio: 0.08
-    min_sell_pressure_score: 0.08
+    min_sell_pressure_score: 0.05
     min_buy_volume_for_gates_sol: 8.0
     absorb_strong_min_sell_vol_sol: 1.5
     buy_to_sell_max_without_min_sell_vol: 12.0
