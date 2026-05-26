@@ -32,8 +32,14 @@ impl PostExitMcapSource {
     }
 }
 
+/// How much lower Jupiter must be vs bonding/pool before we trust Jupiter for open exits.
+const OPEN_EXIT_JUPITER_DIVERGENCE_RATIO: f64 = 0.85;
+
+/// Poll interval for graduated / high-mcap open positions (moonbag trailing / SL).
+pub const OPEN_EXIT_MCAP_POLL_SECS: u64 = 3;
+
 /// Bonding curve first; Jupiter Price v3 / quote if curve complete or missing.
-async fn sample_post_exit_mcap(
+pub async fn sample_post_exit_mcap(
     rpc: &RpcClient,
     mint: &SolAddress,
     mint_str: &str,
@@ -44,6 +50,45 @@ async fn sample_post_exit_mcap(
     jupiter_implied_mcap_sol(mint_str)
         .await
         .map(|mcap| (mcap, PostExitMcapSource::Jupiter))
+}
+
+/// Resolve exit mcap for an **open** position after pump graduation.
+/// Pool WS reserves often freeze while AMM price moves; Jupiter tracks tradable price.
+pub async fn resolve_open_exit_mcap(
+    rpc: &RpcClient,
+    mint: &SolAddress,
+    mint_str: &str,
+    pool_raw_mcap: f64,
+    force_jupiter: bool,
+) -> (f64, bool) {
+    let bonding = probe_bonding_mcap_sol(rpc, mint).await;
+    let jupiter = jupiter_implied_mcap_sol(mint_str).await;
+
+    if force_jupiter {
+        if let Some(j) = jupiter.filter(|m| *m > 0.0) {
+            return (j, true);
+        }
+        if let Some(b) = bonding.filter(|m| *m > 0.0) {
+            return (b, true);
+        }
+        return (pool_raw_mcap, true);
+    }
+
+    if let (Some(j), Some(b)) = (jupiter.filter(|m| *m > 0.0), bonding.filter(|m| *m > 0.0)) {
+        if j < b * OPEN_EXIT_JUPITER_DIVERGENCE_RATIO {
+            return (j, true);
+        }
+        return (b, false);
+    }
+    if bonding.is_none() {
+        if let Some(j) = jupiter.filter(|m| *m > 0.0) {
+            return (j, true);
+        }
+    }
+    if let Some(b) = bonding.filter(|m| *m > 0.0) {
+        return (b, false);
+    }
+    (pool_raw_mcap, false)
 }
 
 async fn sleep_until(elapsed: u64, target_secs: u64) {
@@ -82,7 +127,7 @@ pub fn spawn_post_exit_tracking(
             let elapsed = started.elapsed().as_secs();
             sleep_until(elapsed, checkpoint).await;
 
-            match sample_post_exit_mcap(&rpc, &mint_addr, &mint).await {
+            match sample_post_exit_mcap(rpc.as_ref(), &mint_addr, &mint).await {
                 Some((mcap, source)) => {
                     samples.set_checkpoint(checkpoint, mcap);
                     match source {

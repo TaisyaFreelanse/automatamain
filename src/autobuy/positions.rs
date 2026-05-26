@@ -77,6 +77,12 @@ pub struct Position {
     pub sl_below_floor_streak: u8,
     /// Previous raw pool mcap (100ms tick) for single-tick crash detection.
     pub sl_prev_raw_mcap: Option<f64>,
+    /// After migration / mcap ceiling: pool WS mcap freezes; use Jupiter for exits + dashboard.
+    pub use_jupiter_exit_mcap: bool,
+    /// Last Jupiter-implied mcap (SOL) from background poll.
+    pub exit_mcap_jupiter: Option<f64>,
+    /// Wall-clock secs of last Jupiter/bonding divergence poll.
+    pub last_exit_mcap_poll_at: u64,
 }
 
 impl Position {
@@ -141,7 +147,25 @@ impl Position {
             exit_mcap_ticks: Vec::new(),
             sl_below_floor_streak: 0,
             sl_prev_raw_mcap: None,
+            use_jupiter_exit_mcap: false,
+            exit_mcap_jupiter: None,
+            last_exit_mcap_poll_at: 0,
         }
+    }
+
+    /// Raw mcap for exit ticks: Jupiter when graduated, else bonding-curve pool.
+    pub fn exit_raw_mcap(&self) -> f64 {
+        if self.use_jupiter_exit_mcap {
+            if let Some(j) = self.exit_mcap_jupiter.filter(|m| *m > 0.0) {
+                return j;
+            }
+        }
+        self.pool.market_cap().amount().to_float()
+    }
+
+    /// Dashboard / HTTP PnL uses the same mcap as the exit engine.
+    pub fn display_market_cap(&self) -> f64 {
+        self.exit_raw_mcap()
     }
 
     pub fn push_exit_mcap_tick(&mut self, raw_mcap: f64, max_ticks: usize) {
@@ -155,7 +179,7 @@ impl Position {
     }
 
     pub fn pnl(&self) -> f64 {
-        self.pnl_at_mcap(self.pool.market_cap().amount().to_float())
+        self.pnl_at_mcap(self.display_market_cap())
     }
 
     pub fn pnl_at_mcap(&self, mcap: f64) -> f64 {

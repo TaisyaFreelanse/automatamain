@@ -447,6 +447,12 @@ pub enum PositionMessage {
     },
     /// Tick: evaluate all open positions and redraw dashboard
     Tick,
+    /// Background Jupiter/bonding mcap poll for graduated moonbag (exit + dashboard).
+    ApplyExitMcapRefresh {
+        mint: solana_address::Address,
+        mcap: f64,
+        use_jupiter: bool,
+    },
 }
 
 // --- ПОЗИЦИЯ (расширена) ---
@@ -578,6 +584,28 @@ impl PositionManagerActor {
                     }
                 }
 
+                PositionMessage::ApplyExitMcapRefresh {
+                    mint,
+                    mcap,
+                    use_jupiter,
+                } => {
+                    if let Some(pos) = self.positions.get_mut(&mint) {
+                        let prev_jupiter = pos.use_jupiter_exit_mcap;
+                        if use_jupiter {
+                            pos.use_jupiter_exit_mcap = true;
+                            pos.exit_mcap_jupiter = Some(mcap);
+                        } else if !pos.use_jupiter_exit_mcap && mcap > 0.0 {
+                            // Bonding still authoritative; no pool overwrite here.
+                        }
+                        if use_jupiter && !prev_jupiter {
+                            let pool_mcap = pos.pool.market_cap().amount().to_float();
+                            eprintln!(
+                                "[EXIT MCAP] {mint}: switched to Jupiter mcap={mcap:.2} SOL \
+                                 (pool WS={pool_mcap:.2})"
+                            );
+                        }
+                    }
+                }
                 PositionMessage::ApplyLiveSnapshot { mint, live } => {
                     if let Some(pos) = self.positions.get_mut(&mint) {
                         let prev_tape = pos.live_tape_curr.clone();
@@ -1291,7 +1319,7 @@ impl PositionManagerActor {
                         .filter_map(|(mint, pos)| {
                             let open_reason = pos.open_reason.clone()?;
                             let enter_mcap = pos.enter_mcap.to_float();
-                            let market_cap = pos.pool.market_cap().amount().to_float();
+                            let market_cap = pos.display_market_cap();
                             Some(OpenPositionWire {
                                 address: mint.to_string(),
                                 open_reason,
@@ -1584,6 +1612,8 @@ impl PositionManagerActor {
         let global_cfg = self.config.clone();
 
         let mut actions: Vec<(solana_address::Address, f64, String, bool)> = Vec::new();
+        let exit_mcap_rpc = self.post_exit_rpc.clone();
+        let exit_mcap_tx = self.tx.clone();
 
         for (mint, pos) in self.positions.iter_mut() {
             // Skip positions that are already queued for a full close.
@@ -1591,7 +1621,41 @@ impl PositionManagerActor {
                 continue;
             }
 
-            let raw_mcap = pos.pool.market_cap().amount().to_float();
+            let pool_raw = pos.pool.market_cap().amount().to_float();
+            let should_poll_exit_mcap = pos.use_jupiter_exit_mcap
+                || pos.mcap_ceiling_triggered
+                || pool_raw >= 150.0;
+            if should_poll_exit_mcap
+                && current_time.saturating_sub(pos.last_exit_mcap_poll_at)
+                    >= crate::autobuy::post_exit_tracker::OPEN_EXIT_MCAP_POLL_SECS
+                && let Some(rpc) = exit_mcap_rpc.clone()
+            {
+                let force_jupiter = pos.use_jupiter_exit_mcap || pos.mcap_ceiling_triggered;
+                pos.last_exit_mcap_poll_at = current_time;
+                let tx = exit_mcap_tx.clone();
+                let mint_poll = *mint;
+                tokio::spawn(async move {
+                    let mint_str = mint_poll.to_string();
+                    let (mcap, use_jupiter) =
+                        crate::autobuy::post_exit_tracker::resolve_open_exit_mcap(
+                            &rpc,
+                            &mint_poll,
+                            &mint_str,
+                            pool_raw,
+                            force_jupiter,
+                        )
+                        .await;
+                    let _ = tx
+                        .send(PositionMessage::ApplyExitMcapRefresh {
+                            mint: mint_poll,
+                            mcap,
+                            use_jupiter,
+                        })
+                        .await;
+                });
+            }
+
+            let raw_mcap = pos.exit_raw_mcap();
             pos.push_exit_mcap_tick(raw_mcap, global_cfg.exit_mcap_median_ticks);
             let band_lo = global_cfg.exit_mcap_band_low_ratio;
             let band_hi = global_cfg.exit_mcap_band_high_ratio;
@@ -1807,6 +1871,7 @@ impl PositionManagerActor {
                 && !pos.pending_partial_sell
             {
                 pos.mcap_ceiling_triggered = true;
+                pos.use_jupiter_exit_mcap = true;
                 let sell_pct = global_cfg
                     .mcap_ceiling_partial_sell_pct
                     .clamp(1.0, 99.0);
