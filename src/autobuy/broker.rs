@@ -59,6 +59,9 @@ pub enum BrokerError {
     /// closed manually; manager clears `is_closing` and surfaces a dashboard alert.
     #[error("Jupiter sell exhausted (manual exit required): {0}")]
     JupiterSellExhausted(String),
+    /// Mint account never appeared on RPC (stale feed / dead mint / indexer lag).
+    #[error("Mint not on-chain: {mint} ({detail})")]
+    MintNotOnChain { mint: String, detail: String },
     #[error("Custom : {0}")]
     Custom(String),
 }
@@ -67,6 +70,11 @@ impl BrokerError {
     /// Full exit failed on Jupiter routing; operator should sell the ATA manually.
     pub fn requires_manual_sell(&self) -> bool {
         matches!(self, BrokerError::JupiterSellExhausted(_))
+    }
+
+    /// Pre-buy wait exhausted or mint account missing — not a failed trade attempt.
+    pub fn is_mint_not_on_chain(&self) -> bool {
+        matches!(self, BrokerError::MintNotOnChain { .. })
     }
 }
 

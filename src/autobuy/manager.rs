@@ -1,6 +1,6 @@
 use crate::{
     autobuy::{
-        broker::{Broker, BuyReceipt},
+        broker::{Broker, BrokerError, BuyReceipt},
         exit_engine::{
             adaptive_moonbag_sell_pct, adaptive_trailing, apply_phase_to_tp,
             calculate_live_score, entry_live_score_floor, format_sl_close_reason,
@@ -45,6 +45,17 @@ use tokio::{
     sync::{mpsc, oneshot},
     time::sleep,
 };
+
+/// RPC never showed the mint account (or still missing after wait) — skip quietly.
+fn is_buy_mint_unavailable(err: &BrokerError) -> bool {
+    if err.is_mint_not_on_chain() {
+        return true;
+    }
+    let msg = err.to_string().to_lowercase();
+    msg.contains("mint account not found")
+        || (msg.contains("buy mint") && msg.contains("accountnotfound"))
+        || msg.contains("not visible on rpc")
+}
 
 // --- WebSocket / dashboard wire: V3 entry tape --------------------------------
 
@@ -765,6 +776,31 @@ impl PositionManagerActor {
                                 pnl_sol_pct: None,
                             });
                             r
+                        }
+                        Err(e) if is_buy_mint_unavailable(&e) => {
+                            eprintln!(
+                                "[BUY] Skipped {mint} — mint not on RPC (stale/dead feed, not a trade): {e}"
+                            );
+                            self.closed_mints.insert(mint);
+                            if let Some(ref log) = self.learning {
+                                let log = log.clone();
+                                let mint_s = mint.to_string();
+                                let dev_s = dev_address.map(|d| d.to_string());
+                                let detail = e.to_string();
+                                tokio::spawn(async move {
+                                    let _ = log
+                                        .log_skipped(
+                                            &mint_s,
+                                            dev_s.as_deref(),
+                                            "buy_rpc",
+                                            "mint_not_on_chain",
+                                            json!({ "detail": detail }),
+                                            now_secs(),
+                                        )
+                                        .await;
+                                });
+                            }
+                            continue;
                         }
                         Err(e) => {
                             eprintln!("[BUY] Failed {mint}: {e}");

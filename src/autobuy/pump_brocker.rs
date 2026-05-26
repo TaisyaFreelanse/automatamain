@@ -1174,7 +1174,9 @@ impl Broker for SolanaBroker {
             &self.rpc_client,
             &mint,
             "BUY mint",
-            Duration::from_millis(5_000),
+            Duration::from_millis(3_500),
+            3,
+            Duration::from_millis(300),
         )
         .await?;
 
@@ -1818,6 +1820,11 @@ async fn fetch_balance_sol(
 }
 
 fn is_transient_balance_error(msg: &str) -> bool {
+    is_transient_rpc_error(msg)
+}
+
+/// HTTP / transport failures from Helius and other RPCs (retry, do not abort buy wait).
+fn is_transient_rpc_error(msg: &str) -> bool {
     let m = msg.to_lowercase();
     m.contains("429")
         || m.contains("too many requests")
@@ -1829,6 +1836,18 @@ fn is_transient_balance_error(msg: &str) -> bool {
         || m.contains("connection reset")
         || m.contains("broken pipe")
         || m.contains("temporarily unavailable")
+        || m.contains("error sending request")
+        || m.contains("connection closed")
+        || m.contains("dns")
+}
+
+/// Mint not indexed yet or already gone — poll, do not fail immediately.
+fn is_rpc_account_missing(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("accountnotfound")
+        || m.contains("account not found")
+        || m.contains("could not find account")
+        || m.contains("mint account not found")
 }
 
 /// Helius and other RPCs often return HTTP 429 during bursts (e.g. right after
@@ -2164,9 +2183,10 @@ async fn fetch_mint_token_kind(
         .await
         .map_err(|e| BrokerError::Custom(format!("get_account mint {mint_str}: {e}")))?;
 
-    let acc = resp
-        .value
-        .ok_or_else(|| BrokerError::Custom(format!("mint account not found: {mint_str}")))?;
+    let acc = resp.value.ok_or_else(|| BrokerError::MintNotOnChain {
+        mint: mint_str.clone(),
+        detail: "fetch_mint_token_kind: account empty at confirmed".into(),
+    })?;
 
     let owner = acc.owner.to_string();
     let kind = match owner.as_str() {
@@ -2398,13 +2418,15 @@ async fn poll_ata_confirms_sell(
 }
 
 /// Poll `get_account_with_commitment(Confirmed)` until the account is visible
-/// or the budget expires. Returns Ok on first sighting; otherwise a
-/// descriptive error the caller can surface to the position manager.
+/// or the budget expires. Treats `AccountNotFound` and empty responses as
+/// "not yet indexed" (common when Create arrives before RPC confirmed view).
 async fn wait_for_account_visible(
     rpc: &RpcClient,
     address: &SolAddress,
     label: &str,
     total_timeout: Duration,
+    min_polls: u32,
+    poll_delay: Duration,
 ) -> Result<(), BrokerError> {
     let pubkey_str = address.to_string();
     let pubkey = pubkey_str
@@ -2412,7 +2434,6 @@ async fn wait_for_account_visible(
         .map_err(|_| BrokerError::Custom(format!("{label}: invalid pubkey '{pubkey_str}'")))?;
 
     let started = std::time::Instant::now();
-    let poll_delay = Duration::from_millis(150);
     let mut attempts: u32 = 0;
 
     loop {
@@ -2435,7 +2456,7 @@ async fn wait_for_account_visible(
             }
             Err(e) => {
                 let msg = e.to_string();
-                if !is_transient_balance_error(&msg) {
+                if !is_rpc_account_missing(&msg) && !is_transient_rpc_error(&msg) {
                     return Err(BrokerError::Custom(format!(
                         "{label}: get_account_with_commitment {pubkey_str} failed: {msg}"
                     )));
@@ -2443,12 +2464,39 @@ async fn wait_for_account_visible(
             }
         }
 
-        if started.elapsed() >= total_timeout {
-            return Err(BrokerError::TransactionFailed(format!(
-                "{label}: account {pubkey_str} not visible on RPC after {:?}",
-                total_timeout
-            )));
+        let elapsed = started.elapsed();
+        if elapsed >= total_timeout && attempts >= min_polls {
+            return Err(BrokerError::MintNotOnChain {
+                mint: pubkey_str,
+                detail: format!(
+                    "{label}: not visible on RPC after {attempts} polls in {elapsed:?}"
+                ),
+            });
+        }
+        if elapsed >= total_timeout {
+            return Err(BrokerError::MintNotOnChain {
+                mint: pubkey_str,
+                detail: format!("{label}: timeout {total_timeout:?} before min_polls"),
+            });
         }
         tokio::time::sleep(poll_delay).await;
+    }
+}
+
+#[cfg(test)]
+mod wait_account_tests {
+    use super::{is_rpc_account_missing, is_transient_rpc_error};
+
+    #[test]
+    fn account_not_found_is_missing_not_fatal() {
+        let msg = "AccountNotFound: pubkey=abc: error sending request for url (https://beta.helius-rpc.com/)";
+        assert!(is_rpc_account_missing(msg));
+        assert!(is_transient_rpc_error(msg));
+    }
+
+    #[test]
+    fn transport_only_is_transient() {
+        assert!(is_transient_rpc_error("error sending request for url (http://rpc/)"));
+        assert!(!is_rpc_account_missing("error sending request for url (http://rpc/)"));
     }
 }
