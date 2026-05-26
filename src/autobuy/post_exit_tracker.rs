@@ -52,6 +52,43 @@ pub async fn sample_post_exit_mcap(
         .map(|mcap| (mcap, PostExitMcapSource::Jupiter))
 }
 
+/// Pure decision logic (unit-tested); async wrapper fetches bonding + Jupiter.
+pub fn decide_open_exit_mcap(
+    bonding: Option<f64>,
+    jupiter: Option<f64>,
+    pool_raw_mcap: f64,
+    force_jupiter: bool,
+) -> (f64, bool) {
+    if force_jupiter {
+        if let Some(j) = jupiter.filter(|m| m.is_finite() && *m > 0.0) {
+            return (j, true);
+        }
+        if let Some(b) = bonding.filter(|m| m.is_finite() && *m > 0.0) {
+            return (b, true);
+        }
+        return (pool_raw_mcap, true);
+    }
+
+    if let (Some(j), Some(b)) = (
+        jupiter.filter(|m| m.is_finite() && *m > 0.0),
+        bonding.filter(|m| m.is_finite() && *m > 0.0),
+    ) {
+        if j < b * OPEN_EXIT_JUPITER_DIVERGENCE_RATIO {
+            return (j, true);
+        }
+        return (b, false);
+    }
+    if bonding.is_none() {
+        if let Some(j) = jupiter.filter(|m| m.is_finite() && *m > 0.0) {
+            return (j, true);
+        }
+    }
+    if let Some(b) = bonding.filter(|m| m.is_finite() && *m > 0.0) {
+        return (b, false);
+    }
+    (pool_raw_mcap, false)
+}
+
 /// Resolve exit mcap for an **open** position after pump graduation.
 /// Pool WS reserves often freeze while AMM price moves; Jupiter tracks tradable price.
 pub async fn resolve_open_exit_mcap(
@@ -63,32 +100,40 @@ pub async fn resolve_open_exit_mcap(
 ) -> (f64, bool) {
     let bonding = probe_bonding_mcap_sol(rpc, mint).await;
     let jupiter = jupiter_implied_mcap_sol(mint_str).await;
+    decide_open_exit_mcap(bonding, jupiter, pool_raw_mcap, force_jupiter)
+}
 
-    if force_jupiter {
-        if let Some(j) = jupiter.filter(|m| *m > 0.0) {
-            return (j, true);
-        }
-        if let Some(b) = bonding.filter(|m| *m > 0.0) {
-            return (b, true);
-        }
-        return (pool_raw_mcap, true);
+#[cfg(test)]
+mod open_exit_mcap_tests {
+    use super::*;
+
+    #[test]
+    fn force_jupiter_prefers_jupiter_over_frozen_pool() {
+        let (m, u) = decide_open_exit_mcap(Some(410.0), Some(42.0), 410.88, true);
+        assert!(u);
+        assert!((m - 42.0).abs() < 1e-6);
     }
 
-    if let (Some(j), Some(b)) = (jupiter.filter(|m| *m > 0.0), bonding.filter(|m| *m > 0.0)) {
-        if j < b * OPEN_EXIT_JUPITER_DIVERGENCE_RATIO {
-            return (j, true);
-        }
-        return (b, false);
+    #[test]
+    fn divergence_switches_when_jupiter_below_bonding() {
+        let (m, u) = decide_open_exit_mcap(Some(410.0), Some(100.0), 410.88, false);
+        assert!(u);
+        assert!((m - 100.0).abs() < 1e-6);
     }
-    if bonding.is_none() {
-        if let Some(j) = jupiter.filter(|m| *m > 0.0) {
-            return (j, true);
-        }
+
+    #[test]
+    fn no_divergence_keeps_bonding() {
+        let (m, u) = decide_open_exit_mcap(Some(100.0), Some(90.0), 100.0, false);
+        assert!(!u);
+        assert!((m - 100.0).abs() < 1e-6);
     }
-    if let Some(b) = bonding.filter(|m| *m > 0.0) {
-        return (b, false);
+
+    #[test]
+    fn migrated_curve_uses_jupiter() {
+        let (m, u) = decide_open_exit_mcap(None, Some(55.5), 410.88, false);
+        assert!(u);
+        assert!((m - 55.5).abs() < 1e-6);
     }
-    (pool_raw_mcap, false)
 }
 
 async fn sleep_until(elapsed: u64, target_secs: u64) {

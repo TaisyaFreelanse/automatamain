@@ -597,12 +597,22 @@ impl PositionManagerActor {
                         } else if !pos.use_jupiter_exit_mcap && mcap > 0.0 {
                             // Bonding still authoritative; no pool overwrite here.
                         }
-                        if use_jupiter && !prev_jupiter {
+                        if use_jupiter {
                             let pool_mcap = pos.pool.market_cap().amount().to_float();
-                            eprintln!(
-                                "[EXIT MCAP] {mint}: switched to Jupiter mcap={mcap:.2} SOL \
-                                 (pool WS={pool_mcap:.2})"
-                            );
+                            if !prev_jupiter {
+                                eprintln!(
+                                    "[EXIT MCAP] {mint}: switched to Jupiter mcap={mcap:.2} SOL \
+                                     (pool WS={pool_mcap:.2})"
+                                );
+                            } else if pos
+                                .exit_mcap_jupiter
+                                .is_none_or(|prev| (prev - mcap).abs() / prev.max(1.0) > 0.02)
+                            {
+                                eprintln!(
+                                    "[EXIT MCAP] {mint}: jupiter refresh mcap={mcap:.2} SOL \
+                                     (pool WS={pool_mcap:.2})"
+                                );
+                            }
                         }
                     }
                 }
