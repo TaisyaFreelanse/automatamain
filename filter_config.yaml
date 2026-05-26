@@ -220,6 +220,14 @@ scoring:
     # Tier A: smaller than A+; operator cap must be >= a_plus_sol (see buy_config.amount_sol).
     a_sol: 0.3
 
+# After our bot cliff exit (SL CRASH / deep SL / large tick drop), block this dev's
+# new mints until expires_at (stored in dev_blacklist table).
+dev_blacklist:
+  enabled: true
+  cooldown_secs: 604800
+  min_pnl_pct_for_sl: -30.0
+  min_tick_drop_pct: 40.0
+
 # Strategy controller — risk caps applied at the InitiateBuy gate inside the
 # position manager. None of these touch open positions.
 strategy:

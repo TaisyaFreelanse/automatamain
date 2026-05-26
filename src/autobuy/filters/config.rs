@@ -37,6 +37,50 @@ pub struct Config {
     /// Self-learning: trade/skip logging + conservative threshold tuning.
     #[serde(default)]
     pub learning: LearningConfig,
+
+    /// Block devs after our bot cliff/rug exits (DB-backed cooldown).
+    #[serde(default)]
+    pub dev_blacklist: DevBlacklistConfig,
+}
+
+/// Cooldown on dev wallet after bot SL CRASH / deep SL on our trades.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DevBlacklistConfig {
+    #[serde(default = "dev_blacklist_default_enabled")]
+    pub enabled: bool,
+    /// How long new mints from this dev are skipped (`expires_at = closed_at + cooldown`).
+    #[serde(default = "dev_blacklist_default_cooldown_secs")]
+    pub cooldown_secs: i64,
+    /// Plain `SL` (non-crash) blacklists when realized PnL % (SOL) is at or below this.
+    #[serde(default = "dev_blacklist_default_min_pnl_pct")]
+    pub min_pnl_pct_for_sl: f64,
+    /// Plain `SL` also blacklists when `tick_drop=` in close reason is at or above this %.
+    #[serde(default = "dev_blacklist_default_min_tick_drop")]
+    pub min_tick_drop_pct: f64,
+}
+
+impl Default for DevBlacklistConfig {
+    fn default() -> Self {
+        Self {
+            enabled: dev_blacklist_default_enabled(),
+            cooldown_secs: dev_blacklist_default_cooldown_secs(),
+            min_pnl_pct_for_sl: dev_blacklist_default_min_pnl_pct(),
+            min_tick_drop_pct: dev_blacklist_default_min_tick_drop(),
+        }
+    }
+}
+
+fn dev_blacklist_default_enabled() -> bool {
+    true
+}
+fn dev_blacklist_default_cooldown_secs() -> i64 {
+    7 * 24 * 3600
+}
+fn dev_blacklist_default_min_pnl_pct() -> f64 {
+    -30.0
+}
+fn dev_blacklist_default_min_tick_drop() -> f64 {
+    40.0
 }
 
 /// Knobs for the optional learning loop (see `crate::learning`).

@@ -174,8 +174,11 @@ async fn main() {
     setup_logging();
     let config = Arc::new(load_config().unwrap());
     let pool = setup_postgres_pool(30).await;
-    let (creators, tokens, trades, bot_trades_pg) = setup_repositories(pool.clone()).await;
+    let (creators, tokens, trades, bot_trades_pg, dev_blacklist_pg) =
+        setup_repositories(pool.clone()).await;
     let bot_trades_pg = Arc::new(bot_trades_pg);
+    let dev_blacklist: Arc<dyn loggaper::persistence::dev_blacklist::DevBlacklistRepository + Send + Sync> =
+        Arc::new(dev_blacklist_pg);
     let (creators, tokens, trades) = (
         Arc::new(creators),
         Arc::new(tokens),
@@ -265,6 +268,8 @@ async fn main() {
             config.start_balance_sol,
             config.buy_config.clone(),
             bot_trades,
+            dev_blacklist.clone(),
+            config.dev_blacklist.clone(),
             post_exit_repo,
             post_exit_rpc,
             config.strategy.clone(),
@@ -1055,6 +1060,8 @@ async fn main() {
                 let buy_cap = buy_size_state.clone();
                 let learning_log_create = learning_log.clone();
                 let learning_overrides_spawn = learning_overrides.clone();
+                let dev_blacklist_create = dev_blacklist.clone();
+                let dev_blacklist_cfg_create = config.dev_blacklist.clone();
 
                 tokio::spawn({
                     let creators = creators.clone();
@@ -1065,6 +1072,58 @@ async fn main() {
                                 .map(|d| d.as_secs() as i64)
                                 .unwrap_or(0)
                         };
+
+                        if dev_blacklist_cfg_create.enabled {
+                            let dev_s = general_create.user.to_string();
+                            let now = unix_now();
+                            match dev_blacklist_create.active_for_dev(&dev_s, now).await {
+                                Ok(Some(active)) => {
+                                    let detail = loggaper::autobuy::dev_blacklist::format_skip_detail(
+                                        &active.reason,
+                                        &active.mint,
+                                    );
+                                    eprintln!(
+                                        "[FILTER] {} skipped: dev_blacklist ({detail})",
+                                        general_create.mint
+                                    );
+                                    bot_metrics_create.note_filter_rejected();
+                                    if let Some(ref log) = learning_log_create {
+                                        let log = log.clone();
+                                        let mint_s = general_create.mint.to_string();
+                                        let ts = now;
+                                        let payload = serde_json::json!({
+                                            "dev_wallet": dev_s,
+                                            "trigger_mint": active.mint,
+                                            "trigger_reason": active.reason,
+                                            "trigger_pnl_sol": active.pnl_sol,
+                                            "trigger_close_reason": active.close_reason,
+                                            "expires_at": active.expires_at,
+                                        });
+                                        tokio::spawn(async move {
+                                            let _ = log
+                                                .log_skipped(
+                                                    &mint_s,
+                                                    Some(dev_s.as_str()),
+                                                    "filter_dev_blacklist",
+                                                    "dev_blacklist",
+                                                    payload,
+                                                    ts,
+                                                )
+                                                .await;
+                                        });
+                                    }
+                                    return;
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    eprintln!(
+                                        "[FILTER] dev_blacklist lookup failed for {}: {e}",
+                                        general_create.user
+                                    );
+                                }
+                            }
+                        }
+
                         // --- Stage 1: cheap pre-gate on dev history ---------
                         // Operator-tuned creator_config still acts as the
                         // hard pre-filter. Score Engine runs *after* this so

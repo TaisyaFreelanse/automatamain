@@ -6,8 +6,11 @@ use sqlx::{Pool, Postgres};
 use crate::{
     autobuy::filters::config::Config,
     persistence::postgres::{
-        bot_trades::BotTradesRepositoryPostgres, creators::CreatorsRepositoryPostgres,
-        tokens::TokenRepositoryPostgres, traders::TraderRepositoryPostgres,
+        bot_trades::BotTradesRepositoryPostgres,
+        creators::CreatorsRepositoryPostgres,
+        dev_blacklist::DevBlacklistRepositoryPostgres,
+        tokens::TokenRepositoryPostgres,
+        traders::TraderRepositoryPostgres,
     },
 };
 
@@ -59,6 +62,7 @@ pub async fn setup_repositories(
     TokenRepositoryPostgres,
     TraderRepositoryPostgres,
     BotTradesRepositoryPostgres,
+    DevBlacklistRepositoryPostgres,
 ) {
     sqlx::migrate!("./migrations")
         .run(&pool)
@@ -69,8 +73,15 @@ pub async fn setup_repositories(
     let trader_repo = TraderRepositoryPostgres::new(pool.clone());
     let creators_repo = CreatorsRepositoryPostgres::new(pool.clone());
     let bot_trades_repo = BotTradesRepositoryPostgres::new(pool.clone());
+    let dev_blacklist_repo = DevBlacklistRepositoryPostgres::new(pool.clone());
 
-    (creators_repo, token_repo, trader_repo, bot_trades_repo)
+    (
+        creators_repo,
+        token_repo,
+        trader_repo,
+        bot_trades_repo,
+        dev_blacklist_repo,
+    )
 }
 
 pub fn load_config() -> Result<Config, Box<dyn std::error::Error>> {

@@ -12,6 +12,8 @@ use crate::{
             PositionPhase, TkEntryThresholds,
         },
         positions::Position,
+        dev_blacklist,
+        filters::config::DevBlacklistConfig,
     },
     generalize::general_pool::Pool,
     helper::Amount,
@@ -20,6 +22,7 @@ use crate::{
     persistence::{
         bot_trade_post_exit::BotTradePostExitRepository,
         bot_trades::{BotTradeEntry, BotTradeRepository},
+        dev_blacklist::{DevBlacklistEntry, DevBlacklistRepository},
     },
     scoring::{
         config::StrategyConfig,
@@ -482,6 +485,8 @@ pub struct PositionManagerActor {
     last_print_time: u64,
     event_tx: mpsc::Sender<WsFeedMessage>,
     bot_trades: Arc<dyn BotTradeRepository + Send + Sync>,
+    dev_blacklist: Arc<dyn DevBlacklistRepository + Send + Sync>,
+    dev_blacklist_cfg: DevBlacklistConfig,
     post_exit_repo: Arc<dyn BotTradePostExitRepository + Send + Sync>,
     post_exit_rpc: Option<Arc<solana_client::nonblocking::rpc_client::RpcClient>>,
     /// When true, InitiateBuy signals are dropped; open positions still managed.
@@ -500,6 +505,8 @@ impl PositionManagerActor {
         initial_balance_sol: f64,
         config: SmartBuyConfig,
         bot_trades: Arc<dyn BotTradeRepository + Send + Sync>,
+        dev_blacklist: Arc<dyn DevBlacklistRepository + Send + Sync>,
+        dev_blacklist_cfg: DevBlacklistConfig,
         post_exit_repo: Arc<dyn BotTradePostExitRepository + Send + Sync>,
         post_exit_rpc: Option<Arc<solana_client::nonblocking::rpc_client::RpcClient>>,
         strategy_cfg: StrategyConfig,
@@ -530,6 +537,8 @@ impl PositionManagerActor {
             last_print_time: 0,
             event_tx,
             bot_trades,
+            dev_blacklist,
+            dev_blacklist_cfg,
             post_exit_repo,
             post_exit_rpc,
             paused: false,
@@ -1111,6 +1120,38 @@ impl PositionManagerActor {
                             // Strategy controller bookkeeping (loss streak,
                             // daily caps, regime pause).
                             self.strategy.note_position_closed(pnl_sol);
+
+                            if let Some(dev) = close_dev_address {
+                                if dev_blacklist::should_blacklist_dev(
+                                    &reason,
+                                    pnl_pct_sol,
+                                    &self.dev_blacklist_cfg,
+                                ) {
+                                    let tag = dev_blacklist::cliff_reason_tag(&reason);
+                                    let summary_reason =
+                                        format!("{tag} {:.0}%", pnl_pct_sol.round());
+                                    let closed_at_ts = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_secs() as i64;
+                                    let entry = DevBlacklistEntry {
+                                        dev_wallet: dev.to_string(),
+                                        reason: summary_reason,
+                                        mint: mint.to_string(),
+                                        pnl_sol,
+                                        close_reason: reason.clone(),
+                                        created_at: closed_at_ts,
+                                        expires_at: closed_at_ts
+                                            + self.dev_blacklist_cfg.cooldown_secs,
+                                    };
+                                    let repo = self.dev_blacklist.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(e) = repo.insert(entry).await {
+                                            eprintln!("[DEV BLACKLIST] insert failed: {e}");
+                                        }
+                                    });
+                                }
+                            }
 
                             // Dev ranker / smart money updates. Both async,
                             // spawned so the actor loop doesn't block.
