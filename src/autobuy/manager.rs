@@ -12,8 +12,9 @@ use crate::{
             PositionPhase, TkEntryThresholds,
         },
         positions::Position,
+        curve_quarantine::{self, CurveQuarantineCache},
         dev_blacklist,
-        filters::config::DevBlacklistConfig,
+        filters::config::{CurveQuarantineConfig, DevBlacklistConfig},
     },
     generalize::general_pool::Pool,
     helper::Amount,
@@ -237,6 +238,9 @@ pub struct SmartBuyConfig {
     /// Max allowed `fill_mcap / score_mcap` (e.g. 1.5 = abort if fill is 50%+ above score).
     #[serde(default = "default_fill_mcap_abort_max_ratio")]
     pub fill_mcap_abort_max_ratio: f64,
+    /// Abort when `fill_mcap / score_mcap` is below this (adverse fill vs score tape).
+    #[serde(default = "default_fill_mcap_abort_min_ratio")]
+    pub fill_mcap_abort_min_ratio: f64,
     /// SL: consecutive ticks (100ms) with filtered PnL <= floor before full exit.
     #[serde(default = "default_sl_confirm_ticks")]
     pub sl_confirm_ticks: u32,
@@ -312,12 +316,18 @@ fn default_fill_mcap_abort_max_ratio() -> f64 {
     1.5
 }
 
+fn default_fill_mcap_abort_min_ratio() -> f64 {
+    0.78
+}
+
 /// Score-time vs post-fill mcap comparison for spike abort.
 struct FillMcapSpike {
     score_mcap_sol: f64,
     fill_mcap_sol: f64,
     ratio: f64,
     max_ratio: f64,
+    min_ratio: f64,
+    adverse: bool,
 }
 
 impl Default for SmartBuyConfig {
@@ -352,6 +362,7 @@ impl Default for SmartBuyConfig {
             trailing_stop_drawdown_pct: 26.0, // exit if mcap drops 26% from peak
             fill_mcap_abort_enabled: default_fill_mcap_abort_enabled(),
             fill_mcap_abort_max_ratio: default_fill_mcap_abort_max_ratio(),
+            fill_mcap_abort_min_ratio: default_fill_mcap_abort_min_ratio(),
             sl_confirm_ticks: default_sl_confirm_ticks(),
             sl_grace_secs: default_sl_grace_secs(),
             sl_crash_pnl_pct: default_sl_crash_pnl_pct(),
@@ -493,6 +504,8 @@ pub struct PositionManagerActor {
     bot_trades: Arc<dyn BotTradeRepository + Send + Sync>,
     dev_blacklist: Arc<dyn DevBlacklistRepository + Send + Sync>,
     dev_blacklist_cfg: DevBlacklistConfig,
+    curve_quarantine_cfg: CurveQuarantineConfig,
+    curve_quarantine: CurveQuarantineCache,
     post_exit_repo: Arc<dyn BotTradePostExitRepository + Send + Sync>,
     post_exit_rpc: Option<Arc<solana_client::nonblocking::rpc_client::RpcClient>>,
     /// When true, InitiateBuy signals are dropped; open positions still managed.
@@ -513,6 +526,7 @@ impl PositionManagerActor {
         bot_trades: Arc<dyn BotTradeRepository + Send + Sync>,
         dev_blacklist: Arc<dyn DevBlacklistRepository + Send + Sync>,
         dev_blacklist_cfg: DevBlacklistConfig,
+        curve_quarantine_cfg: CurveQuarantineConfig,
         post_exit_repo: Arc<dyn BotTradePostExitRepository + Send + Sync>,
         post_exit_rpc: Option<Arc<solana_client::nonblocking::rpc_client::RpcClient>>,
         strategy_cfg: StrategyConfig,
@@ -545,6 +559,8 @@ impl PositionManagerActor {
             bot_trades,
             dev_blacklist,
             dev_blacklist_cfg,
+            curve_quarantine_cfg,
+            curve_quarantine: CurveQuarantineCache::default(),
             post_exit_repo,
             post_exit_rpc,
             paused: false,
@@ -711,6 +727,21 @@ impl PositionManagerActor {
                         continue;
                     }
 
+                    let wall_secs = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    self.curve_quarantine.prune(wall_secs);
+                    if self.curve_quarantine_cfg.enabled
+                        && self.curve_quarantine.is_active(&mint, wall_secs)
+                    {
+                        eprintln!(
+                            "[FILTER] {mint} skipped: {}",
+                            curve_quarantine::format_skip_detail(&mint.to_string())
+                        );
+                        continue;
+                    }
+
                     // --- Strategy controller gate -----------------------------------
                     let open_now = (self.positions.len() + self.pending_buys.len()) as u32;
                     match self.strategy.can_open(open_now) {
@@ -723,6 +754,7 @@ impl PositionManagerActor {
                                 let dev_s = dev_address.map(|d| d.to_string());
                                 let r = format!("{block:?}");
                                 let payload = json!({ "tier_sol": amount_sol });
+                                let skip_ts = wall_secs as i64;
                                 tokio::spawn(async move {
                                     let _ = log
                                         .log_skipped(
@@ -731,7 +763,7 @@ impl PositionManagerActor {
                                             "strategy_gate",
                                             &r,
                                             payload,
-                                            now_secs(),
+                                            skip_ts,
                                         )
                                         .await;
                                 });
@@ -908,6 +940,14 @@ impl PositionManagerActor {
                         current_time,
                         receipt.entry_mcap_fill_sol,
                     );
+                    if let Some(entry_mcap) = receipt.entry_mcap_fill_sol.filter(|m| *m > 0.0) {
+                        position.exit_mcap_ticks.clear();
+                        position.push_exit_mcap_tick(
+                            entry_mcap,
+                            self.config.exit_mcap_median_ticks,
+                        );
+                        position.sl_prev_raw_mcap = Some(entry_mcap);
+                    }
                     position.exit_profit_floor = self.config.exit_profit_floor;
                     position.spent_sol = amount_sol;
                     position.dev_address = dev_address;
@@ -987,6 +1027,10 @@ impl PositionManagerActor {
                     reason,
                 } => {
                     if let Some(mut pos) = self.positions.remove(&mint) {
+                        let band_lo = self.config.exit_mcap_band_low_ratio;
+                        let band_hi = self.config.exit_mcap_band_high_ratio;
+                        let filt_pnl_at_sell = pos.pnl_filtered(band_lo, band_hi);
+                        let raw_pnl_at_sell = pos.pnl_at_mcap(pos.exit_raw_mcap());
                         let mcap_pnl_pct = pos.pnl();
                         let entry_mcap_sol = pos.enter_mcap.to_float();
                         let invested_sol = pos.initial_holdings.to_float();
@@ -1158,6 +1202,27 @@ impl PositionManagerActor {
                             // Strategy controller bookkeeping (loss streak,
                             // daily caps, regime pause).
                             self.strategy.note_position_closed(pnl_sol);
+
+                            if curve_quarantine::should_quarantine_mint(
+                                &reason,
+                                pnl_pct_sol,
+                                filt_pnl_at_sell,
+                                raw_pnl_at_sell,
+                                &self.curve_quarantine_cfg,
+                            ) {
+                                let closed_at_secs = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs();
+                                let expires = closed_at_secs
+                                    + self.curve_quarantine_cfg.cooldown_secs;
+                                self.curve_quarantine.insert(mint, expires);
+                                eprintln!(
+                                    "[CURVE QUARANTINE] {mint} until +{}s (pnl_sol={pnl_pct_sol:.1}% \
+                                     filt_pnl={filt_pnl_at_sell:.1}% raw_pnl={raw_pnl_at_sell:.1}%)",
+                                    self.curve_quarantine_cfg.cooldown_secs
+                                );
+                            }
 
                             if let Some(dev) = close_dev_address {
                                 if dev_blacklist::should_blacklist_dev(
@@ -1379,12 +1444,24 @@ impl PositionManagerActor {
         let fill_mcap = receipt.entry_mcap_fill_sol.filter(|m| *m > 0.0)?;
         let ratio = fill_mcap / score_mcap;
         let max_ratio = cfg.fill_mcap_abort_max_ratio.max(1.0);
+        let min_ratio = cfg.fill_mcap_abort_min_ratio.clamp(0.1, 1.0);
         if ratio > max_ratio {
             Some(FillMcapSpike {
                 score_mcap_sol: score_mcap,
                 fill_mcap_sol: fill_mcap,
                 ratio,
                 max_ratio,
+                min_ratio,
+                adverse: false,
+            })
+        } else if ratio < min_ratio {
+            Some(FillMcapSpike {
+                score_mcap_sol: score_mcap,
+                fill_mcap_sol: fill_mcap,
+                ratio,
+                max_ratio,
+                min_ratio,
+                adverse: true,
             })
         } else {
             None
@@ -1404,13 +1481,23 @@ impl PositionManagerActor {
         dev_address: Option<Address>,
         now: u64,
     ) -> bool {
-        let reason = format!(
-            "FILL MCAP SPIKE ABORT ({:.2}x > {:.2}x: {:.1}→{:.1} SOL)",
-            spike.ratio,
-            spike.max_ratio,
-            spike.score_mcap_sol,
-            spike.fill_mcap_sol,
-        );
+        let reason = if spike.adverse {
+            format!(
+                "FILL MCAP ADVERSE ABORT ({:.2}x < {:.2}x: score {:.1}→fill {:.1} SOL)",
+                spike.ratio,
+                spike.min_ratio,
+                spike.score_mcap_sol,
+                spike.fill_mcap_sol,
+            )
+        } else {
+            format!(
+                "FILL MCAP SPIKE ABORT ({:.2}x > {:.2}x: {:.1}→{:.1} SOL)",
+                spike.ratio,
+                spike.max_ratio,
+                spike.score_mcap_sol,
+                spike.fill_mcap_sol,
+            )
+        };
 
         eprintln!("[BUY ABORT] {mint}: {reason}");
 
@@ -1824,9 +1911,11 @@ impl PositionManagerActor {
             let sl_confirm = global_cfg.sl_confirm_ticks.max(1);
             let crash = sl_crash_triggered(
                 sl_profit,
+                profit_raw,
                 tick_drop,
                 global_cfg.sl_crash_pnl_pct,
                 global_cfg.sl_crash_tick_drop_pct,
+                in_sl_grace,
             );
             if crash {
                 pos.is_closing = true;

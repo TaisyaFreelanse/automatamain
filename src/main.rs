@@ -270,6 +270,7 @@ async fn main() {
             bot_trades,
             dev_blacklist.clone(),
             config.dev_blacklist.clone(),
+            config.curve_quarantine.clone(),
             post_exit_repo,
             post_exit_rpc,
             config.strategy.clone(),

@@ -66,6 +66,16 @@ buy_config:
   # After buy: if on-chain post-fill mcap > score_mcap * ratio, sell immediately (no OPEN).
   fill_mcap_abort_enabled: true
   fill_mcap_abort_max_ratio: 2.0
+  # Abort when on-chain fill mcap is far below score-time tape (adverse curve / stale WS).
+  fill_mcap_abort_min_ratio: 0.78
+
+curve_quarantine:
+  enabled: true
+  cooldown_secs: 86400
+  min_mcap_sol_divergence_pct: 35.0
+  max_pnl_sol_pct: -10.0
+  sl_crash_false_positive_min_filt_pnl: 10.0
+  sl_crash_false_positive_max_raw_pnl: 5.0
 
   # Adaptive Exit Engine V4 (full doc): FSM phases, live tape, HOLD, staircase, decay.
   exit_v4:

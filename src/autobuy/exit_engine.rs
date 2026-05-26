@@ -240,15 +240,26 @@ pub fn sl_raw_tick_drop_pct(prev_raw_mcap: f64, raw_mcap: f64) -> Option<f64> {
     Some((prev_raw_mcap - raw_mcap) / prev_raw_mcap * 100.0)
 }
 
-/// Instant emergency SL (bypasses grace and N-tick confirm).
+/// Instant emergency SL (bypasses grace and N-tick confirm for deep PnL only).
+///
+/// `tick_drop` path is restricted: must be past SL grace, and raw pool PnL must
+/// show a real loss (< 0%) — avoids WS mcap spikes (filt +23% / raw 0%) firing
+/// the first ticks after fill (e.g. B4Lhn: filt 42.3 → raw 34.3 entry).
 pub fn sl_crash_triggered(
     trigger_pnl_pct: f64,
+    raw_pnl_pct: f64,
     tick_drop_pct: Option<f64>,
     crash_pnl_pct: f64,
     crash_tick_drop_pct: f64,
+    in_sl_grace: bool,
 ) -> bool {
-    trigger_pnl_pct <= crash_pnl_pct
-        || tick_drop_pct.is_some_and(|d| d >= crash_tick_drop_pct)
+    if trigger_pnl_pct <= crash_pnl_pct {
+        return true;
+    }
+    if in_sl_grace {
+        return false;
+    }
+    tick_drop_pct.is_some_and(|d| d >= crash_tick_drop_pct) && raw_pnl_pct < 0.0
 }
 
 /// Human-readable SL close reason (dashboard / bot_trades).
@@ -924,8 +935,31 @@ mod tests {
         assert_eq!(sl_trigger_pnl_pct(-10.0, -35.0), -35.0);
         let drop = sl_raw_tick_drop_pct(157.0, 32.0).unwrap();
         assert!(drop > 75.0);
-        assert!(sl_crash_triggered(-30.0, None, -28.0, 18.0));
-        assert!(sl_crash_triggered(-5.0, Some(20.0), -28.0, 18.0));
-        assert!(!sl_crash_triggered(-10.0, Some(5.0), -28.0, 18.0));
+        assert!(sl_crash_triggered(-30.0, -30.0, None, -28.0, 18.0, false));
+        assert!(sl_crash_triggered(
+            -5.0,
+            -8.0,
+            Some(20.0),
+            -28.0,
+            18.0,
+            false
+        ));
+        assert!(!sl_crash_triggered(
+            0.0,
+            0.0,
+            Some(18.9),
+            -28.0,
+            18.0,
+            false
+        ));
+        assert!(!sl_crash_triggered(
+            0.0,
+            0.0,
+            Some(20.0),
+            -28.0,
+            18.0,
+            true
+        ));
+        assert!(!sl_crash_triggered(-10.0, 5.0, Some(20.0), -28.0, 18.0, false));
     }
 }

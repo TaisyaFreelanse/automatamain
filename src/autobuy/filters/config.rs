@@ -8,6 +8,58 @@ use crate::{
     scoring::config::{PersistenceConfig, ScoringConfig, StrategyConfig},
 };
 
+/// In-memory mint cooldown after mcap/SOL divergence or false SL CRASH on WS glitch.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CurveQuarantineConfig {
+    #[serde(default = "curve_quarantine_default_enabled")]
+    pub enabled: bool,
+    #[serde(default = "curve_quarantine_default_cooldown_secs")]
+    pub cooldown_secs: u64,
+    /// Quarantine when `filt_pnl - pnl_sol` >= this (e.g. mcap +23%, SOL -21%).
+    #[serde(default = "curve_quarantine_default_min_divergence")]
+    pub min_mcap_sol_divergence_pct: f64,
+    /// Only when realized SOL PnL is at or below this.
+    #[serde(default = "curve_quarantine_default_max_pnl_sol")]
+    pub max_pnl_sol_pct: f64,
+    /// SL CRASH with filt above this and raw at/below max_raw → quarantine.
+    #[serde(default = "curve_quarantine_default_sl_crash_filt")]
+    pub sl_crash_false_positive_min_filt_pnl: f64,
+    #[serde(default = "curve_quarantine_default_sl_crash_raw")]
+    pub sl_crash_false_positive_max_raw_pnl: f64,
+}
+
+impl Default for CurveQuarantineConfig {
+    fn default() -> Self {
+        Self {
+            enabled: curve_quarantine_default_enabled(),
+            cooldown_secs: curve_quarantine_default_cooldown_secs(),
+            min_mcap_sol_divergence_pct: curve_quarantine_default_min_divergence(),
+            max_pnl_sol_pct: curve_quarantine_default_max_pnl_sol(),
+            sl_crash_false_positive_min_filt_pnl: curve_quarantine_default_sl_crash_filt(),
+            sl_crash_false_positive_max_raw_pnl: curve_quarantine_default_sl_crash_raw(),
+        }
+    }
+}
+
+fn curve_quarantine_default_enabled() -> bool {
+    true
+}
+fn curve_quarantine_default_cooldown_secs() -> u64 {
+    24 * 3600
+}
+fn curve_quarantine_default_min_divergence() -> f64 {
+    35.0
+}
+fn curve_quarantine_default_max_pnl_sol() -> f64 {
+    -10.0
+}
+fn curve_quarantine_default_sl_crash_filt() -> f64 {
+    10.0
+}
+fn curve_quarantine_default_sl_crash_raw() -> f64 {
+    5.0
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Config {
     pub creator_config: CreatorStatisticsFilter,
@@ -41,6 +93,10 @@ pub struct Config {
     /// Block devs after our bot cliff/rug exits (DB-backed cooldown).
     #[serde(default)]
     pub dev_blacklist: DevBlacklistConfig,
+
+    /// Block re-buy on mints that showed bonding WS vs SOL PnL divergence.
+    #[serde(default)]
+    pub curve_quarantine: CurveQuarantineConfig,
 }
 
 /// Cooldown on dev wallet after bot SL CRASH / deep SL on our trades.

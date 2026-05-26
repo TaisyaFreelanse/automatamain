@@ -22,6 +22,22 @@ DIVERGENCE = 0.85
 ENV_PATH = os.environ.get("AUTOMATA_ENV", "/home/automata/.env")
 
 
+def _jupiter_api_key_from_loggaper_proc() -> str | None:
+    import subprocess
+
+    try:
+        pid = subprocess.check_output(
+            ["pgrep", "-f", "/home/automata/loggaper"], text=True
+        ).strip().split("\n")[0]
+        raw = open(f"/proc/{pid}/environ", "rb").read().split(b"\0")
+        for item in raw:
+            if item.startswith(b"JUPITER_API_KEY="):
+                return item.split(b"=", 1)[1].decode()
+    except (OSError, subprocess.SubprocessError, IndexError, ValueError):
+        return None
+    return None
+
+
 def jupiter_api_key_from_systemd() -> str | None:
     import subprocess
 
@@ -64,6 +80,8 @@ def http_json(url: str, api_key: str | None = None, data: bytes | None = None) -
         url, data=data, method="POST" if data else "GET"
     )
     req.add_header("Content-Type", "application/json")
+    # Jupiter sits behind Cloudflare; default Python urllib UA gets 403 (error 1010).
+    req.add_header("User-Agent", "automata-verify/1.0")
     if api_key:
         req.add_header("x-api-key", api_key)
     with urllib.request.urlopen(req, timeout=20) as resp:
@@ -79,7 +97,8 @@ def jupiter_implied_mcap_sol(mint: str, api_key: str | None) -> float | None:
         if isinstance(data, dict) and m in data:
             row = data[m]
             if isinstance(row, dict):
-                return float(row.get("price") or 0)
+                p = row.get("usdPrice") or row.get("price")
+                return float(p or 0)
         return 0.0
 
     tu, su = usd(mint), usd(WSOL)
@@ -186,7 +205,11 @@ def main() -> int:
         or env.get("SOLANA_RPC_URL")
         or env.get("SOLANA_HTTP")
     )
-    api_key = env.get("JUPITER_API_KEY") or jupiter_api_key_from_systemd()
+    api_key = (
+        env.get("JUPITER_API_KEY")
+        or jupiter_api_key_from_systemd()
+        or _jupiter_api_key_from_loggaper_proc()
+    )
     if not api_key:
         print("WARN: JUPITER_API_KEY missing — Jupiter price may 403")
 

@@ -30,6 +30,9 @@ const JUPITER_EXECUTE_V2: &str = "https://api.jup.ag/swap/v2/execute";
 const JUPITER_PRICE_V3: &str = "https://api.jup.ag/price/v3";
 /// pump.fun total token supply (whole tokens) for implied SOL mcap from spot price.
 const PUMP_FUN_TOKEN_SUPPLY: f64 = 1_000_000_000.0;
+/// Cloudflare blocks default scripted UAs on `api.jup.ag`; match a normal client.
+const JUPITER_USER_AGENT: &str = "loggaper/1.0 (Jupiter Swap API; +https://github.com/TaisyaFreelanse/automatamain)";
+const JUPITER_PRICE_LOG_BODY_MAX: usize = 400;
 
 /// Jupiter labels for on-curve / Pump AMM hops (`InstructionError Custom(6005)` after graduation).
 /// See https://lite-api.jup.ag/swap/v1/program-id-to-label — spaces as `+` in query string.
@@ -110,9 +113,34 @@ fn http() -> &'static Client {
     HTTP.get_or_init(|| {
         Client::builder()
             .timeout(std::time::Duration::from_secs(45))
+            .user_agent(JUPITER_USER_AGENT)
             .build()
             .expect("jupiter http client")
     })
+}
+
+fn truncate_log_body(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max])
+    }
+}
+
+fn jupiter_api_key_present() -> bool {
+    std::env::var("JUPITER_API_KEY")
+        .map(|k| !k.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn warn_jupiter_api_key_missing_once() {
+    static WARNED: OnceLock<()> = OnceLock::new();
+    if !jupiter_api_key_present() && WARNED.set(()).is_ok() {
+        eprintln!(
+            "[JUPITER PRICE] WARN: JUPITER_API_KEY unset in process env \
+             (set via systemd for loggaper; not in /home/automata/.env on prod)"
+        );
+    }
 }
 
 /// Log-safe quote URL (no API keys in query).
@@ -176,13 +204,55 @@ fn jupiter_request(
     method: reqwest::Method,
     url: &str,
 ) -> reqwest::RequestBuilder {
-    let mut b = client.request(method, url).header("Accept", "application/json");
+    let mut b = client
+        .request(method, url)
+        .header("Accept", "application/json")
+        .header("User-Agent", JUPITER_USER_AGENT);
     if let Ok(key) = std::env::var("JUPITER_API_KEY") {
         if !key.trim().is_empty() {
             b = b.header("x-api-key", key.trim());
         }
     }
     b
+}
+
+/// Shared GET for Price API v3 — same client/headers as swap; logs failures as `[JUPITER PRICE]`.
+async fn jupiter_fetch_price_v3(ids: &str) -> Result<Value, BrokerError> {
+    warn_jupiter_api_key_missing_once();
+    let url = format!("{JUPITER_PRICE_V3}?ids={ids}");
+    let resp = jupiter_request(http(), reqwest::Method::GET, &url)
+        .send()
+        .await
+        .map_err(|e| BrokerError::Custom(format!("Jupiter PRICE request: {e}")))?;
+    let status = resp.status();
+    let code = status.as_u16();
+    let body_text = resp
+        .text()
+        .await
+        .unwrap_or_else(|e| format!("<body read error: {e}>"));
+    if !status.is_success() {
+        let cf = body_text.contains("1010") || body_text.to_ascii_lowercase().contains("cloudflare");
+        let hint = if cf {
+            " cloudflare_blocked=true (use x-api-key + User-Agent)"
+        } else {
+            ""
+        };
+        eprintln!(
+            "[JUPITER PRICE] HTTP {code} ids={ids}{hint} body={}",
+            truncate_log_body(&body_text, JUPITER_PRICE_LOG_BODY_MAX)
+        );
+        return Err(BrokerError::Custom(format!(
+            "Jupiter PRICE HTTP {code}: {}",
+            truncate_log_body(&body_text, 200)
+        )));
+    }
+    serde_json::from_str(&body_text).map_err(|e| {
+        eprintln!(
+            "[JUPITER PRICE] JSON ids={ids}: {e} body={}",
+            truncate_log_body(&body_text, JUPITER_PRICE_LOG_BODY_MAX)
+        );
+        BrokerError::Custom(format!("Jupiter PRICE JSON: {e}"))
+    })
 }
 
 /// Deserialize Jupiter `swapTransaction` payload (raw bytes after base64 decode).
@@ -425,25 +495,40 @@ fn parse_price_v3_decimals(body: &Value, mint: &str) -> Option<u8> {
 
 /// Implied pump-style mcap in SOL from Jupiter Price API v3 (USD / USD).
 pub async fn jupiter_implied_mcap_sol_price_v3(mint: &str) -> Option<f64> {
-    let url = format!("{JUPITER_PRICE_V3}?ids={mint},{WSOL_MINT}");
-    let body: Value = jupiter_request(http(), reqwest::Method::GET, &url)
-        .send()
-        .await
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .json()
-        .await
-        .ok()?;
-    let token_usd = parse_price_v3_usd(&body, mint)?;
-    let sol_usd = parse_price_v3_usd(&body, WSOL_MINT)?;
+    let ids = format!("{mint},{WSOL_MINT}");
+    let body = match jupiter_fetch_price_v3(&ids).await {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[JUPITER PRICE] mint={mint} price/v3 unavailable: {e}");
+            return None;
+        }
+    };
+    let token_usd = match parse_price_v3_usd(&body, mint) {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "[JUPITER PRICE] mint={mint} missing usdPrice in price/v3 body keys={:?}",
+                body.as_object().map(|o| o.keys().collect::<Vec<_>>())
+            );
+            return None;
+        }
+    };
+    let sol_usd = match parse_price_v3_usd(&body, WSOL_MINT) {
+        Some(p) => p,
+        None => {
+            eprintln!("[JUPITER PRICE] mint={mint} missing WSOL usdPrice in price/v3");
+            return None;
+        }
+    };
     if sol_usd <= 0.0 {
+        eprintln!("[JUPITER PRICE] mint={mint} invalid sol_usd={sol_usd}");
         return None;
     }
     let mcap = (token_usd / sol_usd) * PUMP_FUN_TOKEN_SUPPLY;
     if mcap.is_finite() && mcap > 0.0 {
         Some(mcap)
     } else {
+        eprintln!("[JUPITER PRICE] mint={mint} invalid implied mcap={mcap}");
         None
     }
 }
@@ -478,16 +563,7 @@ pub async fn jupiter_implied_mcap_sol_quote(mint: &str) -> Option<f64> {
 }
 
 async fn jupiter_token_decimals(mint: &str) -> Option<u8> {
-    let url = format!("{JUPITER_PRICE_V3}?ids={mint}");
-    let body: Value = jupiter_request(http(), reqwest::Method::GET, &url)
-        .send()
-        .await
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .json()
-        .await
-        .ok()?;
+    let body = jupiter_fetch_price_v3(mint).await.ok()?;
     parse_price_v3_decimals(&body, mint)
 }
 
@@ -496,7 +572,29 @@ pub async fn jupiter_implied_mcap_sol(mint: &str) -> Option<f64> {
     if let Some(m) = jupiter_implied_mcap_sol_price_v3(mint).await {
         return Some(m);
     }
-    jupiter_implied_mcap_sol_quote(mint).await
+    eprintln!("[JUPITER PRICE] mint={mint} falling back to swap/v1 quote for implied mcap");
+    match jupiter_implied_mcap_sol_quote(mint).await {
+        Some(m) => Some(m),
+        None => {
+            eprintln!("[JUPITER PRICE] mint={mint} quote fallback also failed — no Jupiter mcap");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod price_v3_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_price_v3_usd_reads_usd_price_field() {
+        let body = json!({
+            "MintA": { "usdPrice": 0.00001 },
+            "So11111111111111111111111111111111111111112": { "usdPrice": 80.0 }
+        });
+        assert_eq!(parse_price_v3_usd(&body, "MintA").unwrap(), 0.00001);
+    }
 }
 
 /// Generic ExactIn quote + swap (input/output mints are caller-defined).

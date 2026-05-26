@@ -1,4 +1,5 @@
 pub mod broker;
+pub mod curve_quarantine;
 pub mod dev_blacklist;
 pub mod exit_engine;
 pub mod broker_mock;
