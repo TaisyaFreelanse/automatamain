@@ -98,10 +98,10 @@ impl LearningLogPg {
             SELECT
                 COUNT(*)::bigint AS n,
                 COUNT(*) FILTER (WHERE pnl_sol_pct > 0.0)::bigint AS wins,
-                COALESCE(AVG(smart_wallets) FILTER (WHERE pnl_sol_pct > 0.0), 0.0) AS win_smart,
-                COALESCE(AVG(smart_wallets) FILTER (WHERE pnl_sol_pct <= 0.0), 0.0) AS loss_smart,
-                COALESCE(AVG(buyer_count) FILTER (WHERE pnl_sol_pct > 0.0), 0.0) AS win_buyers,
-                COALESCE(AVG(buyer_count) FILTER (WHERE pnl_sol_pct <= 0.0), 0.0) AS loss_buyers,
+                COALESCE(AVG(smart_wallets) FILTER (WHERE pnl_sol_pct > 0.0), 0.0)::float8 AS win_smart,
+                COALESCE(AVG(smart_wallets) FILTER (WHERE pnl_sol_pct <= 0.0), 0.0)::float8 AS loss_smart,
+                COALESCE(AVG(buyer_count) FILTER (WHERE pnl_sol_pct > 0.0), 0.0)::float8 AS win_buyers,
+                COALESCE(AVG(buyer_count) FILTER (WHERE pnl_sol_pct <= 0.0), 0.0)::float8 AS loss_buyers,
                 COALESCE(MAX(id), 0)::bigint AS max_id
             FROM learning_trades
             "#,
