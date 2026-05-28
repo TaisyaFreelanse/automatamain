@@ -81,9 +81,17 @@ curve_quarantine:
   exit_v4:
     enabled: true
     live_score_refresh_secs: 3
-    # No decay exit / Distribution phase until held this long (SL floor still active).
-    # 12s was too slow on fast dumps (e.g. BrS69Z); 3s allows decay after entry settles.
-    exit_grace_secs: 3
+    # Entry stabilization window (doc 6.1): no decay/phase exit until held this long.
+    # SL CRASH/SL still protect against fast dumps (separate sl_grace_secs), so 8s is
+    # safe and lets healthy pullbacks settle before the decay engine engages.
+    exit_grace_secs: 8
+    # Multi-tick confirmed deterioration (doc 6.3/6.4): consecutive weak ticks before
+    # a MOMENTUM DECAY full exit; 1 = legacy single-tick.
+    decay_confirm_ticks: 3
+    # Drawdown from local high (%) that marks a flush and opens recovery scoring (doc 4/5).
+    flush_drop_pct: 18.0
+    # Recovery score at/above this during a flush = healthy pullback -> hold (doc 5.1/6.5).
+    recovery_min_score: 8
     hold_min_live_score: 13
     hold_min_b2s: 2.2
     hold_min_smart: 5

@@ -75,6 +75,14 @@ pub struct Position {
     pub exit_mcap_ticks: Vec<f64>,
     /// Consecutive ticks with filtered PnL at or below `exit_profit_floor` (SL confirm).
     pub sl_below_floor_streak: u8,
+    /// Consecutive qualifying ticks of momentum deterioration (multi-tick decay confirm).
+    pub decay_streak: u8,
+    /// True while in a flush (drawdown from local high beyond `flush_drop_pct`).
+    pub flush_active: bool,
+    /// Lowest mcap observed since the current flush started (for higher-low detection).
+    pub flush_low_mcap: f64,
+    /// Last computed recovery score (doc 5) — dashboard / observability.
+    pub recovery_score: i32,
     /// Previous raw pool mcap (100ms tick) for single-tick crash detection.
     pub sl_prev_raw_mcap: Option<f64>,
     /// After migration / mcap ceiling: pool WS mcap freezes; use Jupiter for exits + dashboard.
@@ -146,6 +154,10 @@ impl Position {
             live_tape_curr: None,
             exit_mcap_ticks: Vec::new(),
             sl_below_floor_streak: 0,
+            decay_streak: 0,
+            flush_active: false,
+            flush_low_mcap: 0.0,
+            recovery_score: 0,
             sl_prev_raw_mcap: None,
             use_jupiter_exit_mcap: false,
             exit_mcap_jupiter: None,

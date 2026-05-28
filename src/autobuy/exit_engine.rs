@@ -162,6 +162,17 @@ pub struct ExitEngineV4Config {
     pub adaptive_moonbag_enabled: bool,
     #[serde(default = "default_bundle_tolerance")]
     pub bundle_similar_tolerance: f64,
+    /// Consecutive qualifying ticks of deterioration required before a MOMENTUM
+    /// DECAY full exit fires (doc 6.3 / 6.4). 1 = legacy single-tick behaviour.
+    #[serde(default = "default_decay_confirm_ticks")]
+    pub decay_confirm_ticks: u8,
+    /// Drop from local high (%) that marks a flush, opening recovery evaluation (doc 4 / 5).
+    #[serde(default = "default_flush_drop_pct")]
+    pub flush_drop_pct: f64,
+    /// Recovery score at/above this after a flush = healthy pullback -> suppress
+    /// the decay exit and hold (doc 5.1 / 6.5).
+    #[serde(default = "default_recovery_min_score")]
+    pub recovery_min_score: i32,
 }
 
 fn default_true() -> bool {
@@ -209,7 +220,19 @@ fn default_live_score_refresh_secs() -> u64 {
 }
 
 fn default_exit_grace_secs() -> u64 {
+    8
+}
+
+fn default_decay_confirm_ticks() -> u8 {
     3
+}
+
+fn default_flush_drop_pct() -> f64 {
+    18.0
+}
+
+fn default_recovery_min_score() -> i32 {
+    8
 }
 
 /// Floor for in-position `live_score` (matches entry profile resolution).
@@ -518,6 +541,9 @@ impl Default for ExitEngineV4Config {
             re_expansion_min_profit_pct: default_re_expansion_min_profit_pct(),
             adaptive_moonbag_enabled: default_true(),
             bundle_similar_tolerance: default_bundle_tolerance(),
+            decay_confirm_ticks: default_decay_confirm_ticks(),
+            flush_drop_pct: default_flush_drop_pct(),
+            recovery_min_score: default_recovery_min_score(),
         }
     }
 }
@@ -673,6 +699,63 @@ pub fn live_metrics_lite(
         bundle_detected: bundle_similar > cfg.hold_max_bundle_similar || bundle_identical > 0.25,
         momentum_overheated: entry_vel >= cfg.hold_momentum_overheated_pct || profit_pct >= 120.0,
     }
+}
+
+/// Recovery score after a flush (doc 5). Positive = healthy pullback that is
+/// recovering (buyers/volume returning, higher-lows, reclaiming local high);
+/// negative = dead momentum (no bounce, volume collapse, lower-highs). Used to
+/// decide hold-through-pullback vs confirmed-deterioration exit.
+pub fn recovery_score(
+    metrics: &LiveMetrics,
+    current_mcap: f64,
+    flush_low_mcap: f64,
+    local_high_mcap: f64,
+) -> i32 {
+    let mut score = 0;
+
+    // buyers/sec returning (doc 5.1) vs disappearing (doc 5.2)
+    if metrics.buyers_per_sec > 2.0 {
+        score += 2;
+    } else if metrics.buyers_per_sec <= 0.5 {
+        score -= 2;
+    }
+
+    // volume returning vs collapsing
+    if metrics.volume_delta > 0.0 {
+        score += 2;
+    } else {
+        score -= 1;
+    }
+
+    if metrics.buy_sell_ratio > 1.5 {
+        score += 1;
+    }
+    if metrics.sell_pressure_score > 1.2 {
+        score -= 2;
+    }
+    if metrics.smart_wallet_exits >= 1 {
+        score -= 1;
+    }
+
+    // higher-low vs lower-low relative to the flush bottom
+    if flush_low_mcap > 0.0 {
+        if current_mcap > flush_low_mcap * 1.05 {
+            score += 2;
+        } else if current_mcap < flush_low_mcap {
+            score -= 2;
+        }
+    }
+
+    // reclaiming the local high (doc 5.1)
+    if local_high_mcap > 0.0 && current_mcap >= local_high_mcap * 0.9 {
+        score += 2;
+    }
+
+    if metrics.momentum_decay {
+        score -= 2;
+    }
+
+    score
 }
 
 pub fn momentum_decay_detected(
@@ -920,6 +1003,47 @@ mod tests {
     fn profit_staircase() {
         assert_eq!(profit_lock_staircase_floor(55.0), Some(15.0));
         assert_eq!(profit_lock_staircase_floor(120.0), Some(40.0));
+    }
+
+    #[test]
+    fn recovery_score_healthy_vs_dead() {
+        let cfg = ExitEngineV4Config::default();
+        // Healthy pullback: buyers + volume returning, higher-low, reclaiming high.
+        let healthy = LiveMetrics {
+            buyers_per_sec: 4.0,
+            buy_sell_ratio: 2.0,
+            volume_delta: 1.0,
+            sell_pressure_score: 0.2,
+            smart_wallet_exits: 0,
+            momentum_decay: false,
+            ..Default::default()
+        };
+        let s_healthy = recovery_score(&healthy, 95.0, 80.0, 100.0);
+        assert!(
+            s_healthy >= cfg.recovery_min_score,
+            "healthy recovery score was {s_healthy}"
+        );
+
+        // Dead momentum: no buyers, volume collapse, lower-low, sell pressure.
+        let dead = LiveMetrics {
+            buyers_per_sec: 0.2,
+            buy_sell_ratio: 0.5,
+            volume_delta: -1.0,
+            sell_pressure_score: 1.5,
+            smart_wallet_exits: 2,
+            momentum_decay: true,
+            ..Default::default()
+        };
+        let s_dead = recovery_score(&dead, 60.0, 78.0, 100.0);
+        assert!(s_dead < cfg.recovery_min_score, "dead score was {s_dead}");
+        assert!(s_dead < 0, "dead momentum should score negative, was {s_dead}");
+    }
+
+    #[test]
+    fn decay_confirm_default_is_multi_tick() {
+        // Guards doc 6.4: default must not be single-tick.
+        assert!(ExitEngineV4Config::default().decay_confirm_ticks >= 3);
+        assert!(ExitEngineV4Config::default().exit_grace_secs >= 8);
     }
 
     #[test]

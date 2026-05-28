@@ -7,7 +7,7 @@ use crate::{
             in_exit_grace_period, in_sl_grace_period, sl_crash_triggered, sl_raw_tick_drop_pct,
             sl_trigger_pnl_pct,
             live_metrics_from_snapshot, live_metrics_lite, maybe_upgrade_runner,
-            momentum_decay_detected, profit_lock_staircase_floor,
+            momentum_decay_detected, profit_lock_staircase_floor, recovery_score,
             resolve_entry_profile, transition_position_phase, ExitEngineV4Config, ExitProfile,
             PositionPhase, TkEntryThresholds,
         },
@@ -1855,7 +1855,10 @@ impl PositionManagerActor {
                 time_kill_after_secs: Some(pos.last_time_kill_after_secs),
             });
 
-            // --- 0. Phase 2: momentum decay full exit ---
+            // --- 0. Phase 2: momentum decay full exit (multi-tick confirmed) ---
+            // doc 6.3/6.4: a single flush must not exit. Require `decay_confirm_ticks`
+            // consecutive qualifying ticks, and suppress the exit while a flush is
+            // recovering healthily (doc 5.1 / 6.5 recovery score).
             if v4_enabled
                 && v4_cfg.momentum_decay_exit_enabled
                 && !in_grace
@@ -1866,20 +1869,64 @@ impl PositionManagerActor {
                     .as_ref()
                     .map(|s| s.sell_pressure_score)
                     .unwrap_or(0.0);
-                if momentum_decay_detected(
+                let decay_now = momentum_decay_detected(
                     pos.live_buyers_per_sec,
                     pos.live_prev_buyers_per_sec,
                     sell_p,
                     vel,
-                )
-                    || pos.exit_phase == PositionPhase::Distribution
-                        && pos.live_score <= v4_cfg.phase_distribution_max_score
-                {
+                ) || (pos.exit_phase == PositionPhase::Distribution
+                    && pos.live_score <= v4_cfg.phase_distribution_max_score);
+
+                // Flush tracking: drawdown from session high opens a flush window
+                // and records its bottom for higher-low detection on recovery.
+                let drawdown_from_high = if pos.highest_mcap > 0.0 {
+                    (pos.highest_mcap - current_mcap) / pos.highest_mcap * 100.0
+                } else {
+                    0.0
+                };
+                if drawdown_from_high >= v4_cfg.flush_drop_pct {
+                    if !pos.flush_active {
+                        pos.flush_active = true;
+                        pos.flush_low_mcap = current_mcap;
+                    } else if current_mcap < pos.flush_low_mcap {
+                        pos.flush_low_mcap = current_mcap;
+                    }
+                } else if current_mcap >= pos.highest_mcap * 0.99 {
+                    // reclaimed the high: flush resolved
+                    pos.flush_active = false;
+                }
+
+                let snap_ref = pos.learning_snapshot.as_ref();
+                let rec_metrics = live_metrics_lite(pos, vel, profit, snap_ref, &v4_cfg);
+                pos.recovery_score = recovery_score(
+                    &rec_metrics,
+                    current_mcap,
+                    pos.flush_low_mcap,
+                    pos.highest_mcap,
+                );
+                let healthy_recovery =
+                    pos.flush_active && pos.recovery_score >= v4_cfg.recovery_min_score;
+
+                if decay_now && !healthy_recovery {
+                    pos.decay_streak = pos.decay_streak.saturating_add(1);
+                } else {
+                    pos.decay_streak = 0;
+                }
+
+                if pos.decay_streak >= v4_cfg.decay_confirm_ticks.max(1) {
                     pos.is_closing = true;
                     let reason = if pos.exit_phase == PositionPhase::Distribution {
-                        format!("MOMENTUM DECAY [{}]", pos.exit_phase.as_str())
+                        format!(
+                            "MOMENTUM DECAY [{}] ({} ticks, rec={})",
+                            pos.exit_phase.as_str(),
+                            pos.decay_streak,
+                            pos.recovery_score
+                        )
                     } else {
-                        "MOMENTUM DECAY".to_string()
+                        format!(
+                            "MOMENTUM DECAY ({} ticks, rec={})",
+                            pos.decay_streak, pos.recovery_score
+                        )
                     };
                     actions.push((*mint, 100.0, reason, false));
                     continue;
