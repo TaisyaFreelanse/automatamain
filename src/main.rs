@@ -51,8 +51,11 @@ use tokio_tungstenite::accept_async;
 
 /// Solana mainnet ~2.5 slots per second (≈400 ms slot time).
 const CHART_SLOTS_PER_SEC: f64 = 2.5;
-const CHART_PRE_SECS: i64 = 10;
+/// Show bonding-curve context before bot entry (terminal-style pre-migration view).
+const CHART_PRE_SECS: i64 = 300;
 const CHART_POST_SECS: i64 = 120;
+/// Max chart span from first sample (avoid multi-hour tails on dead mints).
+const CHART_MAX_SPAN_SECS: i64 = 3600;
 
 const CHART_MCAP_ABS_MAX: f64 = 200_000.0;
 
@@ -109,6 +112,7 @@ fn chart_infer_slot_by_mcap(target: f64, series: &[(i64, f64)]) -> i64 {
         .unwrap_or_else(|| series.first().map(|p| p.0).unwrap_or(0))
 }
 
+/// Marker times on the same axis as chart points (`unix_secs` or slot-derived secs).
 fn chart_normalize_marker_secs(
     entry_at: i64,
     closed_at: i64,
@@ -116,17 +120,13 @@ fn chart_normalize_marker_secs(
     exit_mcap: f64,
     series: &[(i64, f64)],
     slot0: i64,
+    timeline_unix: bool,
 ) -> (i64, i64) {
     let entry_unix = entry_at > 0 && chart_is_unix_secs(entry_at);
     let close_unix = closed_at > 0 && chart_is_unix_secs(closed_at);
 
-    // Prefer wall-clock hold duration; do not infer exit time from exit_mcap
-    // (same mcap often repeats on the long post-trade tail).
-    if entry_unix && close_unix && closed_at >= entry_at {
-        let held = closed_at - entry_at;
-        let entry_slot = chart_infer_slot_by_mcap(entry_mcap, series);
-        let entry_sec = chart_slot_to_sec(entry_slot, slot0);
-        return (entry_sec, entry_sec + held);
+    if timeline_unix && entry_unix && close_unix && closed_at >= entry_at {
+        return (entry_at, closed_at);
     }
 
     let exit_slot = chart_infer_slot_by_mcap(exit_mcap, series);
@@ -134,6 +134,8 @@ fn chart_normalize_marker_secs(
 
     let entry_sec = if entry_at > 0 && !entry_unix {
         chart_slot_to_sec(entry_at, slot0)
+    } else if entry_unix {
+        entry_at
     } else {
         let entry_slot = chart_infer_slot_by_mcap(entry_mcap, series);
         chart_slot_to_sec(entry_slot, slot0)
@@ -141,11 +143,28 @@ fn chart_normalize_marker_secs(
 
     let closed_sec = if closed_at > 0 && !close_unix {
         chart_slot_to_sec(closed_at, slot0)
+    } else if close_unix {
+        closed_at
     } else {
         exit_sec.max(entry_sec)
     };
 
     (entry_sec, closed_sec)
+}
+
+fn chart_dedup_points(mut points: Vec<(i64, f64)>) -> Vec<(i64, f64)> {
+    points.sort_by_key(|(t, _)| *t);
+    let mut out: Vec<(i64, f64)> = Vec::new();
+    for (t, m) in points {
+        if let Some(last) = out.last_mut() {
+            if last.0 == t {
+                last.1 = m;
+                continue;
+            }
+        }
+        out.push((t, m));
+    }
+    out
 }
 
 fn chart_trade_window_bounds(marker_times: &[(i64, i64)], points: &[(i64, f64)]) -> (i64, i64) {
@@ -159,8 +178,8 @@ fn chart_trade_window_bounds(marker_times: &[(i64, i64)], points: &[(i64, f64)])
     }
     if let (Some(lo), Some(hi)) = (points.first().map(|p| p.0), points.last().map(|p| p.0)) {
         let span = hi.saturating_sub(lo);
-        if span > 180 {
-            return (lo.saturating_sub(CHART_PRE_SECS), lo + 180);
+        if span > CHART_MAX_SPAN_SECS {
+            return (lo.saturating_sub(CHART_PRE_SECS), lo + CHART_MAX_SPAN_SECS);
         }
         return (lo.saturating_sub(CHART_PRE_SECS), hi + 60);
     }
@@ -597,21 +616,39 @@ async fn main() {
                 markers: Vec<ChartMarker>,
             }
 
-            let point_rows = match sqlx::query_as::<_, ChartPointRow>(
-                "SELECT CAST(slot_time AS BIGINT) AS t, market_cap::float8 AS mcap \
-                 FROM trades \
-                 WHERE coin_address = $1 AND currency = 'sol' \
-                 ORDER BY slot_time ASC \
-                 LIMIT 3000",
+            let tape_rows: Vec<ChartPointRow> = sqlx::query_as::<_, ChartPointRow>(
+                "SELECT ts_unix AS t, mcap_sol AS mcap \
+                 FROM coin_mcap_tape \
+                 WHERE coin_address = $1 \
+                 ORDER BY ts_unix ASC \
+                 LIMIT 10000",
             )
             .bind(&mint)
             .fetch_all(&state.pool)
             .await
-            {
-                Ok(rows) => rows,
-                Err(e) => {
-                    eprintln!("[HTTP] chart price query error: {e}");
-                    return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            .unwrap_or_default();
+
+            let use_unix_tape = !tape_rows.is_empty();
+
+            let point_rows = if use_unix_tape {
+                tape_rows
+            } else {
+                match sqlx::query_as::<_, ChartPointRow>(
+                    "SELECT CAST(slot_time AS BIGINT) AS t, market_cap::float8 AS mcap \
+                     FROM trades \
+                     WHERE coin_address = $1 AND currency = 'sol' \
+                     ORDER BY slot_time ASC \
+                     LIMIT 3000",
+                )
+                .bind(&mint)
+                .fetch_all(&state.pool)
+                .await
+                {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        eprintln!("[HTTP] chart price query error: {e}");
+                        return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
                 }
             };
 
@@ -632,42 +669,54 @@ async fn main() {
                 }
             };
 
+            let mut raw_series: Vec<(i64, f64)> = Vec::new();
             let mut slot_series: Vec<(i64, f64)> = Vec::new();
             for row in point_rows {
                 if !chart_mcap_valid(row.mcap) {
                     continue;
                 }
-                if let Some(last) = slot_series.last_mut() {
+                if use_unix_tape {
+                    raw_series.push((row.t, row.mcap));
+                } else if let Some(last) = slot_series.last_mut() {
                     if last.0 == row.t {
                         last.1 = row.mcap;
-                        continue;
+                    } else {
+                        slot_series.push((row.t, row.mcap));
                     }
+                } else {
+                    slot_series.push((row.t, row.mcap));
                 }
-                slot_series.push((row.t, row.mcap));
             }
 
-            let median = chart_tape_median(&slot_series.iter().map(|(_, m)| *m).collect::<Vec<_>>());
-            slot_series.retain(|(_, m)| chart_mcap_matches_tape(*m, median));
+            let median = if use_unix_tape {
+                chart_tape_median(&raw_series.iter().map(|(_, m)| *m).collect::<Vec<_>>())
+            } else {
+                chart_tape_median(&slot_series.iter().map(|(_, m)| *m).collect::<Vec<_>>())
+            };
+
+            if use_unix_tape {
+                raw_series.retain(|(_, m)| chart_mcap_matches_tape(*m, median));
+            } else {
+                slot_series.retain(|(_, m)| chart_mcap_matches_tape(*m, median));
+            }
 
             let slot0 = slot_series.first().map(|p| p.0).unwrap_or(0);
-            let mut points: Vec<ChartPoint> = slot_series
-                .iter()
-                .map(|(slot, mcap)| ChartPoint {
-                    t: chart_slot_to_sec(*slot, slot0),
-                    mcap: *mcap,
-                })
-                .collect();
-            let mut deduped: Vec<ChartPoint> = Vec::new();
-            for p in points {
-                if let Some(last) = deduped.last_mut() {
-                    if last.t == p.t {
-                        last.mcap = p.mcap;
-                        continue;
-                    }
-                }
-                deduped.push(p);
-            }
-            points = deduped;
+            let mut point_series: Vec<(i64, f64)> = if use_unix_tape {
+                chart_dedup_points(raw_series)
+            } else {
+                chart_dedup_points(
+                    slot_series
+                        .iter()
+                        .map(|(slot, mcap)| (chart_slot_to_sec(*slot, slot0), *mcap))
+                        .collect(),
+                )
+            };
+
+            let series_for_markers: &[(i64, f64)] = if use_unix_tape {
+                &point_series
+            } else {
+                &slot_series
+            };
 
             let mut markers: Vec<ChartMarker> = marker_rows
                 .into_iter()
@@ -682,8 +731,9 @@ async fn main() {
                         m.closed_at,
                         m.entry_mcap_sol,
                         m.exit_mcap_sol,
-                        &slot_series,
+                        series_for_markers,
                         slot0,
+                        use_unix_tape,
                     );
                     if closed_at < entry_at {
                         return None;
@@ -703,17 +753,20 @@ async fn main() {
                 .iter()
                 .map(|m| (m.entry_at, m.closed_at))
                 .collect();
-            let point_series: Vec<(i64, f64)> = points.iter().map(|p| (p.t, p.mcap)).collect();
             let (win_lo, win_hi) = chart_trade_window_bounds(&marker_times, &point_series);
-            points.retain(|p| p.t >= win_lo && p.t <= win_hi);
+            point_series.retain(|(t, _)| *t >= win_lo && *t <= win_hi);
             let entry_base = markers
                 .iter()
                 .map(|m| m.entry_at)
                 .min()
                 .unwrap_or(win_lo);
-            for p in &mut points {
-                p.t = p.t.saturating_sub(entry_base);
-            }
+            let points: Vec<ChartPoint> = point_series
+                .into_iter()
+                .map(|(t, mcap)| ChartPoint {
+                    t: t.saturating_sub(entry_base),
+                    mcap,
+                })
+                .collect();
             for m in &mut markers {
                 m.entry_at = m.entry_at.clamp(win_lo, win_hi).saturating_sub(entry_base);
                 m.closed_at = m.closed_at.clamp(win_lo, win_hi).saturating_sub(entry_base);
@@ -1641,6 +1694,7 @@ async fn main() {
                     let trades = trades.clone();
                     let waiter = waiter_handle.clone();
                     let bucket = bucket.clone();
+                    let tape_pool = pool.clone();
                     let _tx = manager_tx.clone();
 
                     async move {
@@ -1651,10 +1705,19 @@ async fn main() {
                             None => return,
                         };
 
-                        let _now = SystemTime::now();
+                        let mint_s = trade_action.mint().to_string();
+                        let mcap_sol = bucket.pool().market_cap().amount().to_float();
+                        let _ = loggaper::persistence::coin_mcap_tape::record(
+                            &tape_pool,
+                            &mint_s,
+                            mcap_sol,
+                            "trade",
+                        )
+                        .await;
+
                         let entry = TraderEntry {
                             trader_address: trade_action.trader().to_string(),
-                            coin_address: trade_action.mint().to_string(),
+                            coin_address: mint_s,
                             realized_pnl: trader.pnl_percent(),
                             slot,
                             is_buy: trade_action.is_buy(),

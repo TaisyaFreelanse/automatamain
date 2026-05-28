@@ -235,7 +235,8 @@ struct ChartData {
 
 /// Pump.fun tape mcaps are SOL; reject slot-sized garbage and NaN/inf.
 const CHART_MCAP_ABS_MAX: f64 = 200_000.0;
-const CHART_PRE_SECS: i64 = 10;
+/// Must match server `CHART_PRE_SECS` (pre-migration context before entry).
+const CHART_PRE_SECS: i64 = 300;
 const CHART_POST_SECS: i64 = 120;
 
 fn chart_mcap_valid(mcap: f64) -> bool {
