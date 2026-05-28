@@ -452,7 +452,7 @@ async fn main() {
                 println!(
                     "[metrics:bot] creates={} no_history={} filter_rejected={} \
                      passed_filter={} score_skip={} score_a={} score_a_plus={} \
-                     strategy_blocked={} positions_initiated={}",
+                     continuation_skipped={} strategy_blocked={} positions_initiated={}",
                     b.creates_total,
                     b.creates_no_history,
                     b.creates_filter_rejected,
@@ -460,6 +460,7 @@ async fn main() {
                     b.score_skipped,
                     b.score_a,
                     b.score_a_plus,
+                    b.continuation_skipped,
                     b.strategy_blocked,
                     b.positions_initiated,
                 );
@@ -1591,6 +1592,68 @@ async fn main() {
                             operator_cap,
                             amount_sol,
                         );
+                        // --- Continuation Validation Layer (doc 2.1/2.2/2.3) -----
+                        // After scoring + gates pass, observe one short confirm
+                        // window and abort transient / fake-momentum entries.
+                        if filter_config.execution.mode == ExecutionMode::Live
+                            && filter_config.scoring.continuation.enabled
+                        {
+                            let cont_cfg = &filter_config.scoring.continuation;
+                            let baseline_buyers = regular_buyer_count + sniper_count;
+                            let confirm = features::observe_early_tape_points_live(
+                                &launchpad_for_score,
+                                mint_address,
+                                cont_cfg.confirm_window_ms,
+                                cont_cfg.confirm_slices,
+                                None,
+                            )
+                            .await;
+                            if let Err(reason) = features::evaluate_continuation(
+                                cont_cfg,
+                                token_features.buy_to_sell_ratio,
+                                baseline_buyers,
+                                &confirm.points,
+                                cont_cfg.confirm_window_ms,
+                            ) {
+                                eprintln!(
+                                    "[BUY] {} skipped (continuation): {} | mcap_init={:.1} \
+                                     mcap_now={:.1} baseline_buyers={} b2s={:.2}",
+                                    general_create.mint,
+                                    reason,
+                                    confirm.initial_mcap_sol,
+                                    confirm.current_mcap_sol,
+                                    baseline_buyers,
+                                    token_features.buy_to_sell_ratio,
+                                );
+                                bot_metrics_create.note_continuation_skip();
+                                if let Some(ref log) = learning_log_create {
+                                    let log = log.clone();
+                                    let mint_s = general_create.mint.to_string();
+                                    let dev_s = general_create.user.to_string();
+                                    let snap = LearningTradeSnapshot::from_scoring(
+                                        &token_features,
+                                        &breakdown,
+                                    );
+                                    let payload = serde_json::to_value(&snap)
+                                        .unwrap_or_else(|_| serde_json::json!({}));
+                                    let ts = unix_now();
+                                    tokio::spawn(async move {
+                                        let _ = log
+                                            .log_skipped(
+                                                &mint_s,
+                                                Some(dev_s.as_str()),
+                                                "continuation",
+                                                reason,
+                                                payload,
+                                                ts,
+                                            )
+                                            .await;
+                                    });
+                                }
+                                return;
+                            }
+                        }
+
                         let open_reason = OpenReason::DevStats(dev_stats);
                         let learning_snapshot =
                             LearningTradeSnapshot::from_scoring(&token_features, &breakdown);

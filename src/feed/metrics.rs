@@ -265,6 +265,7 @@ pub struct BotSnapshot {
     pub score_skipped: u64,
     pub score_a: u64,
     pub score_a_plus: u64,
+    pub continuation_skipped: u64,
     pub strategy_blocked: u64,
     pub positions_initiated: u64,
     pub uptime_secs: u64,
@@ -278,6 +279,7 @@ pub struct BotMetrics {
     pub score_skipped: AtomicU64,
     pub score_a: AtomicU64,
     pub score_a_plus: AtomicU64,
+    pub continuation_skipped: AtomicU64,
     pub strategy_blocked: AtomicU64,
     pub positions_initiated: AtomicU64,
     pub started_unix: u64,
@@ -293,6 +295,7 @@ impl BotMetrics {
             score_skipped: AtomicU64::new(0),
             score_a: AtomicU64::new(0),
             score_a_plus: AtomicU64::new(0),
+            continuation_skipped: AtomicU64::new(0),
             strategy_blocked: AtomicU64::new(0),
             positions_initiated: AtomicU64::new(0),
             started_unix: now_unix(),
@@ -320,6 +323,9 @@ impl BotMetrics {
     pub fn note_score_a_plus(&self) {
         self.score_a_plus.fetch_add(1, Ordering::Relaxed);
     }
+    pub fn note_continuation_skip(&self) {
+        self.continuation_skipped.fetch_add(1, Ordering::Relaxed);
+    }
     pub fn note_strategy_blocked(&self) {
         self.strategy_blocked.fetch_add(1, Ordering::Relaxed);
     }
@@ -337,6 +343,7 @@ impl BotMetrics {
             score_skipped: self.score_skipped.load(Ordering::Relaxed),
             score_a: self.score_a.load(Ordering::Relaxed),
             score_a_plus: self.score_a_plus.load(Ordering::Relaxed),
+            continuation_skipped: self.continuation_skipped.load(Ordering::Relaxed),
             strategy_blocked: self.strategy_blocked.load(Ordering::Relaxed),
             positions_initiated: self.positions_initiated.load(Ordering::Relaxed),
             uptime_secs: uptime,

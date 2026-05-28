@@ -63,6 +63,11 @@ pub struct ScoringConfig {
     /// Pre-buy anti-rug: low sell-side / fake pump gates and scoring tightenings.
     #[serde(default)]
     pub anti_rug: AntiRugConfig,
+
+    /// Continuation validation layer: short post-score confirmation poll that
+    /// aborts entries on broken continuation (fake / transient momentum).
+    #[serde(default)]
+    pub continuation: ContinuationConfig,
 }
 
 impl Default for ScoringConfig {
@@ -79,8 +84,81 @@ impl Default for ScoringConfig {
             thresholds: FeatureThresholds::default(),
             size: TierSize::default(),
             anti_rug: AntiRugConfig::default(),
+            continuation: ContinuationConfig::default(),
         }
     }
+}
+
+/// Continuation Validation Layer (doc 2.1 / 2.2 / 2.3). After a token passes
+/// scoring + the existing gates, observe the tape for one short confirmation
+/// window and abort the buy if continuation is breaking down: no price upticks,
+/// worsening buy/sell ratio, sell absorption, or no new unique buyers (fake
+/// momentum). Ships dark (`enabled = false`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContinuationConfig {
+    #[serde(default = "default_continuation_enabled")]
+    pub enabled: bool,
+    /// Confirmation poll duration after the score passes (ms).
+    #[serde(default = "default_continuation_confirm_window_ms")]
+    pub confirm_window_ms: u64,
+    /// Number of equal sub-samples inside `confirm_window_ms`.
+    #[serde(default = "default_continuation_confirm_slices")]
+    pub confirm_slices: usize,
+    /// Require mcap to rise across at least this many of the confirm slices (doc 2.1).
+    #[serde(default = "default_continuation_min_upticks")]
+    pub min_upticks: u32,
+    /// Require at least this many new unique buyers during the window (doc 2.3).
+    #[serde(default = "default_continuation_min_new_buyers")]
+    pub min_new_unique_buyers: u64,
+    /// Abort if confirm-window b2s falls below this fraction of its scoring value (doc 2.1).
+    #[serde(default = "default_continuation_max_b2s_drop_ratio")]
+    pub max_b2s_drop_ratio: f64,
+    /// Abort if confirm-window sell volume / buy volume exceeds this (sell absorption).
+    #[serde(default = "default_continuation_max_sell_absorption_ratio")]
+    pub max_sell_absorption_ratio: f64,
+    /// Minimum sustained buys/sec during window. `0` disables this check (doc 2.2).
+    #[serde(default = "default_continuation_min_buys_per_sec")]
+    pub min_buys_per_sec: f64,
+}
+
+impl Default for ContinuationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_continuation_enabled(),
+            confirm_window_ms: default_continuation_confirm_window_ms(),
+            confirm_slices: default_continuation_confirm_slices(),
+            min_upticks: default_continuation_min_upticks(),
+            min_new_unique_buyers: default_continuation_min_new_buyers(),
+            max_b2s_drop_ratio: default_continuation_max_b2s_drop_ratio(),
+            max_sell_absorption_ratio: default_continuation_max_sell_absorption_ratio(),
+            min_buys_per_sec: default_continuation_min_buys_per_sec(),
+        }
+    }
+}
+
+fn default_continuation_enabled() -> bool {
+    false
+}
+fn default_continuation_confirm_window_ms() -> u64 {
+    1500
+}
+fn default_continuation_confirm_slices() -> usize {
+    2
+}
+fn default_continuation_min_upticks() -> u32 {
+    1
+}
+fn default_continuation_min_new_buyers() -> u64 {
+    1
+}
+fn default_continuation_max_b2s_drop_ratio() -> f64 {
+    0.6
+}
+fn default_continuation_max_sell_absorption_ratio() -> f64 {
+    1.5
+}
+fn default_continuation_min_buys_per_sec() -> f64 {
+    0.0
 }
 
 /// Anti-rug entry filters (low fee flow / one-sided pump detection).

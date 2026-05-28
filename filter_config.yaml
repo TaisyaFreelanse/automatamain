@@ -182,6 +182,18 @@ scoring:
     buyer_velocity_min_slices: 2
     low_mcap_peak_sol: 90.0
     low_mcap_min_buy_volume_sol: 25.0
+  # Continuation Validation Layer (doc 2.1/2.2/2.3): after score+gates pass, poll
+  # one short confirm window and abort transient / fake-momentum entries. Ships
+  # dark (enabled: false). Live mode only.
+  continuation:
+    enabled: false
+    confirm_window_ms: 1500
+    confirm_slices: 2
+    min_upticks: 1
+    min_new_unique_buyers: 1
+    max_b2s_drop_ratio: 0.6
+    max_sell_absorption_ratio: 1.5
+    min_buys_per_sec: 0.0
   weights:
     dev_history_strong: 4
     dev_history_weak: 2

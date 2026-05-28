@@ -11,7 +11,7 @@ use crate::launchpads::{
 };
 use crate::persistence::creators::CreatorStatistics;
 use crate::scoring::anti_bundle::{compute_bundle_stats, BundleStats};
-use crate::scoring::config::FeatureThresholds;
+use crate::scoring::config::{ContinuationConfig, FeatureThresholds};
 use crate::scoring::dev_ranker::{DevCategory, DevRecord};
 use crate::trading::trader::TraderType;
 
@@ -298,6 +298,82 @@ pub async fn observe_early_tape_points_live(
     result
 }
 
+/// Continuation Validation Layer (doc 2.1 / 2.2 / 2.3). Pure decision over a
+/// freshly observed confirmation tape, given the scoring-window baseline.
+/// Returns `Ok(())` to proceed with the buy, or `Err(reason)` to skip.
+///
+/// `baseline_b2s` / `baseline_buyer_count` come from the scoring window.
+/// `confirm` is the tape sampled during the confirmation window (chronological).
+pub fn evaluate_continuation(
+    cfg: &ContinuationConfig,
+    baseline_b2s: f64,
+    baseline_buyer_count: u64,
+    confirm: &[EarlyTapePoint],
+    window_ms: u64,
+) -> Result<(), &'static str> {
+    // Not enough samples to judge continuation: fail safe (skip).
+    if confirm.len() < 2 {
+        return Err("cont_no_data");
+    }
+    let first = &confirm[0];
+    let last = confirm.last().unwrap();
+
+    // --- price upticks across confirm slices (doc 2.1) ---
+    let mut upticks: u32 = 0;
+    for w in confirm.windows(2) {
+        if w[1].mcap_sol > w[0].mcap_sol {
+            upticks += 1;
+        }
+    }
+    if upticks < cfg.min_upticks {
+        return Err("cont_no_uptick");
+    }
+
+    // --- new unique buyers during the window (doc 2.3) ---
+    let new_buyers = last.buyer_count.saturating_sub(baseline_buyer_count);
+    if new_buyers < cfg.min_new_unique_buyers {
+        return Err("cont_no_new_buyers");
+    }
+
+    // --- sustained buys/sec (doc 2.2) ---
+    if cfg.min_buys_per_sec > 0.0 {
+        let secs = (window_ms.max(1) as f64) / 1000.0;
+        let buys_per_sec = new_buyers as f64 / secs;
+        if buys_per_sec < cfg.min_buys_per_sec {
+            return Err("cont_low_buys_per_sec");
+        }
+    }
+
+    // --- buy/sell deltas across the confirm window ---
+    let buy_delta = (last.buy_volume_sol - first.buy_volume_sol).max(0.0);
+    let sell_delta_sol = lamports_to_sol(last.cum_sell_raw.saturating_sub(first.cum_sell_raw));
+
+    // --- sell absorption: sells overwhelming buys in-window (doc 2.1 / 2.2) ---
+    if buy_delta > 0.0 {
+        let absorption = sell_delta_sol / buy_delta;
+        if absorption > cfg.max_sell_absorption_ratio {
+            return Err("cont_sell_absorption");
+        }
+    }
+
+    // --- buy/sell ratio must not worsen vs scoring baseline (doc 2.1) ---
+    if baseline_b2s > 0.0 {
+        let confirm_b2s = if sell_delta_sol > 0.0 {
+            buy_delta / sell_delta_sol
+        } else if buy_delta > 0.0 {
+            // no sells in-window: ratio is at least as healthy as baseline.
+            baseline_b2s
+        } else {
+            0.0
+        };
+        if confirm_b2s < baseline_b2s * cfg.max_b2s_drop_ratio {
+            return Err("cont_b2s_worsening");
+        }
+    }
+
+    Ok(())
+}
+
 /// `slices` evenly spaced samples across `window_ms` (last point refreshed at window end).
 pub async fn observe_early_tape_points(
     bucket: &TokenBucket,
@@ -567,5 +643,89 @@ pub fn assemble(
         sell_volume_window_sol: tape.sell_volume_window_sol,
         repeat_dump_slices: tape.repeat_dump_slices,
         smart_wallet_early_exits: tape.smart_wallet_early_exits,
+    }
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::*;
+    use crate::scoring::config::ContinuationConfig;
+
+    fn pt(buyers: u64, buy_vol: f64, cum_sell_raw: u64, mcap: f64) -> EarlyTapePoint {
+        EarlyTapePoint {
+            buyer_count: buyers,
+            still_long: buyers,
+            already_sold: 0,
+            buy_volume_sol: buy_vol,
+            cum_sell_raw,
+            cum_sell_events: 0,
+            mcap_sol: mcap,
+        }
+    }
+
+    fn cfg() -> ContinuationConfig {
+        ContinuationConfig {
+            enabled: true,
+            ..ContinuationConfig::default()
+        }
+    }
+
+    #[test]
+    fn healthy_continuation_passes() {
+        // rising mcap, new buyers, modest sells -> Ok
+        let confirm = vec![pt(20, 10.0, 0, 60.0), pt(24, 13.0, 200_000_000, 66.0)];
+        assert_eq!(evaluate_continuation(&cfg(), 3.0, 20, &confirm, 1500), Ok(()));
+    }
+
+    #[test]
+    fn flat_mcap_no_uptick() {
+        let confirm = vec![pt(20, 10.0, 0, 60.0), pt(24, 13.0, 0, 60.0)];
+        assert_eq!(
+            evaluate_continuation(&cfg(), 3.0, 20, &confirm, 1500),
+            Err("cont_no_uptick")
+        );
+    }
+
+    #[test]
+    fn no_new_buyers_is_fake_momentum() {
+        let confirm = vec![pt(20, 10.0, 0, 60.0), pt(20, 11.0, 0, 64.0)];
+        assert_eq!(
+            evaluate_continuation(&cfg(), 3.0, 20, &confirm, 1500),
+            Err("cont_no_new_buyers")
+        );
+    }
+
+    #[test]
+    fn sell_absorption_blocks() {
+        // tiny buy delta, huge sell delta in-window
+        let confirm = vec![pt(20, 10.0, 0, 60.0), pt(24, 10.2, 5_000_000_000, 64.0)];
+        assert_eq!(
+            evaluate_continuation(&cfg(), 3.0, 20, &confirm, 1500),
+            Err("cont_sell_absorption")
+        );
+    }
+
+    #[test]
+    fn b2s_worsening_blocks() {
+        // baseline b2s very high; in-window sells make confirm b2s collapse,
+        // but keep absorption under the cap so the b2s gate is what fires.
+        let c = ContinuationConfig {
+            max_sell_absorption_ratio: 100.0,
+            ..cfg()
+        };
+        let confirm = vec![pt(20, 10.0, 0, 60.0), pt(24, 13.0, 2_500_000_000, 64.0)];
+        assert_eq!(
+            evaluate_continuation(&c, 50.0, 20, &confirm, 1500),
+            Err("cont_b2s_worsening")
+        );
+    }
+
+    #[test]
+    fn insufficient_data_fails_safe() {
+        let confirm = vec![pt(20, 10.0, 0, 60.0)];
+        assert_eq!(
+            evaluate_continuation(&cfg(), 3.0, 20, &confirm, 1500),
+            Err("cont_no_data")
+        );
     }
 }
