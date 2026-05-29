@@ -376,6 +376,7 @@ impl Default for SmartBuyConfig {
             fill_mcap_abort_enabled: default_fill_mcap_abort_enabled(),
             fill_mcap_abort_max_ratio: default_fill_mcap_abort_max_ratio(),
             fill_mcap_abort_min_ratio: default_fill_mcap_abort_min_ratio(),
+            honest_entry_baseline: default_honest_entry_baseline(),
             sl_confirm_ticks: default_sl_confirm_ticks(),
             sl_grace_secs: default_sl_grace_secs(),
             sl_crash_pnl_pct: default_sl_crash_pnl_pct(),
