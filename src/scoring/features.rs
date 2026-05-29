@@ -310,6 +310,7 @@ pub fn evaluate_continuation(
     baseline_buyer_count: u64,
     confirm: &[EarlyTapePoint],
     window_ms: u64,
+    is_a_plus: bool,
 ) -> Result<(), &'static str> {
     // Not enough samples to judge continuation: fail safe (skip).
     if confirm.len() < 2 {
@@ -318,6 +319,14 @@ pub fn evaluate_continuation(
     let first = &confirm[0];
     let last = confirm.last().unwrap();
 
+    // Net mcap direction across the confirm window (== mcap_now vs mcap_init in
+    // the [BUY] skip log). A window that closes flat-or-up is healthy even when
+    // the discrete per-slice upticks are sparse: many real runners pause/dip for
+    // a slice before continuing, and the short 1.5s window would otherwise cut
+    // them as "no uptick".
+    let mcap_net_nonneg = last.mcap_sol >= first.mcap_sol;
+    let mcap_rising = last.mcap_sol > first.mcap_sol;
+
     // --- price upticks across confirm slices (doc 2.1) ---
     let mut upticks: u32 = 0;
     for w in confirm.windows(2) {
@@ -325,7 +334,9 @@ pub fn evaluate_continuation(
             upticks += 1;
         }
     }
-    if upticks < cfg.min_upticks {
+    // Only treat as dead momentum when upticks are sparse AND the window closed
+    // below where it opened. Flat-or-up windows pass regardless of uptick count.
+    if upticks < cfg.min_upticks && !mcap_net_nonneg {
         return Err("cont_no_uptick");
     }
 
@@ -367,7 +378,12 @@ pub fn evaluate_continuation(
             0.0
         };
         if confirm_b2s < baseline_b2s * cfg.max_b2s_drop_ratio {
-            return Err("cont_b2s_worsening");
+            // Soften for strong (A+) setups whose mcap is still rising in-window:
+            // a temporary b2s dip on a climbing A+ runner is healthy churn, not a
+            // fade. Lower tiers (and flat/declining A+) still get cut here.
+            if !(is_a_plus && mcap_rising) {
+                return Err("cont_b2s_worsening");
+            }
         }
     }
 
@@ -719,15 +735,30 @@ mod continuation_tests {
     fn healthy_continuation_passes() {
         // rising mcap, new buyers, modest sells -> Ok
         let confirm = vec![pt(20, 10.0, 0, 60.0), pt(24, 13.0, 200_000_000, 66.0)];
-        assert_eq!(evaluate_continuation(&cfg(), 3.0, 20, &confirm, 1500), Ok(()));
+        assert_eq!(
+            evaluate_continuation(&cfg(), 3.0, 20, &confirm, 1500, false),
+            Ok(())
+        );
     }
 
     #[test]
-    fn flat_mcap_no_uptick() {
+    fn declining_mcap_no_uptick() {
+        // window closes below where it opened and upticks are sparse -> dead.
+        let confirm = vec![pt(20, 10.0, 0, 60.0), pt(24, 13.0, 0, 58.0)];
+        assert_eq!(
+            evaluate_continuation(&cfg(), 3.0, 20, &confirm, 1500, false),
+            Err("cont_no_uptick")
+        );
+    }
+
+    #[test]
+    fn flat_mcap_passes_uptick_gate() {
+        // mcap_now == mcap_init (net non-negative): sparse upticks are allowed,
+        // so the uptick gate must not fire (other gates may still pass it).
         let confirm = vec![pt(20, 10.0, 0, 60.0), pt(24, 13.0, 0, 60.0)];
         assert_eq!(
-            evaluate_continuation(&cfg(), 3.0, 20, &confirm, 1500),
-            Err("cont_no_uptick")
+            evaluate_continuation(&cfg(), 3.0, 20, &confirm, 1500, false),
+            Ok(())
         );
     }
 
@@ -735,7 +766,7 @@ mod continuation_tests {
     fn no_new_buyers_is_fake_momentum() {
         let confirm = vec![pt(20, 10.0, 0, 60.0), pt(20, 11.0, 0, 64.0)];
         assert_eq!(
-            evaluate_continuation(&cfg(), 3.0, 20, &confirm, 1500),
+            evaluate_continuation(&cfg(), 3.0, 20, &confirm, 1500, false),
             Err("cont_no_new_buyers")
         );
     }
@@ -745,7 +776,7 @@ mod continuation_tests {
         // tiny buy delta, huge sell delta in-window
         let confirm = vec![pt(20, 10.0, 0, 60.0), pt(24, 10.2, 5_000_000_000, 64.0)];
         assert_eq!(
-            evaluate_continuation(&cfg(), 3.0, 20, &confirm, 1500),
+            evaluate_continuation(&cfg(), 3.0, 20, &confirm, 1500, false),
             Err("cont_sell_absorption")
         );
     }
@@ -760,8 +791,22 @@ mod continuation_tests {
         };
         let confirm = vec![pt(20, 10.0, 0, 60.0), pt(24, 13.0, 2_500_000_000, 64.0)];
         assert_eq!(
-            evaluate_continuation(&c, 50.0, 20, &confirm, 1500),
+            evaluate_continuation(&c, 50.0, 20, &confirm, 1500, false),
             Err("cont_b2s_worsening")
+        );
+    }
+
+    #[test]
+    fn b2s_worsening_relaxed_for_rising_a_plus() {
+        // same worsening b2s, but A+ with mcap rising in-window -> allowed.
+        let c = ContinuationConfig {
+            max_sell_absorption_ratio: 100.0,
+            ..cfg()
+        };
+        let confirm = vec![pt(20, 10.0, 0, 60.0), pt(24, 13.0, 2_500_000_000, 64.0)];
+        assert_eq!(
+            evaluate_continuation(&c, 50.0, 20, &confirm, 1500, true),
+            Ok(())
         );
     }
 
@@ -769,7 +814,7 @@ mod continuation_tests {
     fn insufficient_data_fails_safe() {
         let confirm = vec![pt(20, 10.0, 0, 60.0)];
         assert_eq!(
-            evaluate_continuation(&cfg(), 3.0, 20, &confirm, 1500),
+            evaluate_continuation(&cfg(), 3.0, 20, &confirm, 1500, false),
             Err("cont_no_data")
         );
     }

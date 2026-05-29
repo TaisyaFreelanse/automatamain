@@ -1681,6 +1681,7 @@ async fn main() {
                                     baseline_buyers,
                                     &confirm.points,
                                     cont_cfg.confirm_window_ms,
+                                    breakdown.tier == Tier::APlus,
                                 ) {
                                     eprintln!(
                                         "[BUY] {} skipped (continuation): {} | mcap_init={:.1} \
