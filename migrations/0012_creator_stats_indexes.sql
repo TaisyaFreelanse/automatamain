@@ -10,6 +10,10 @@
 -- On a fresh DB this is instant (empty table). On the live DB the index is
 -- created out-of-band with CREATE INDEX CONCURRENTLY, so this IF NOT EXISTS is a
 -- no-op there (no table lock).
+--
+-- NOTE: superseded by the COVERING index in 0013 (INCLUDE market_cap/size/is_buy/
+-- pnl). Kept here for fresh-DB history; 0013 drops this one once the covering
+-- index exists.
 CREATE INDEX IF NOT EXISTS idx_trades_coin_sol_regular
 ON trades (coin_address, trader_address, slot_time DESC, id DESC)
 WHERE currency = 'sol' AND role = 'regular';

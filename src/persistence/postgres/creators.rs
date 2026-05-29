@@ -103,6 +103,16 @@ impl CreatorRepository for CreatorsRepositoryPostgres {
             return Ok(cached);
         }
 
+        // The two aggregate CTEs each sort ~100k+ rows for prolific devs; with the
+        // default 4MB work_mem those sorts spill to disk (external merge). Bump
+        // work_mem transaction-locally so they stay in memory. SET LOCAL only
+        // applies inside a transaction and auto-resets on commit, so it never
+        // leaks to other pooled queries.
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET LOCAL work_mem = '64MB'")
+            .execute(&mut *tx)
+            .await?;
+
         let row = sqlx::query(
             r#"
             WITH creator_coins AS (
@@ -188,8 +198,10 @@ impl CreatorRepository for CreatorsRepositoryPostgres {
             "#,
         )
         .bind(&dev_address)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+
+        tx.commit().await?;
 
         let total_coins: i64 = row.get("total_coins");
 
