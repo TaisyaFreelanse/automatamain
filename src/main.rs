@@ -1780,7 +1780,6 @@ async fn main() {
                 broker.on_trade(trade_action.as_ref(), bucket.pool());
 
                 tokio::spawn({
-                    let trades = trades.clone();
                     let trade_action = trade_action.clone();
                     let bucket = bucket.clone();
                     let tx = manager_tx.clone();
@@ -1810,22 +1809,12 @@ async fn main() {
                                 }
                             }
 
-                        let start = Instant::now();
-                        let _trader_stats =
-                            match trades.get_trader_stats(trade_action.trader()).await {
-                                Ok(stats) => stats,
-                                Err(_) => return,
-                            };
-                        let _duration = start.elapsed();
-
-                        let trader_type =
-                            match bucket.swarm().get_trader(trade_action.trader()).await {
-                                Some(trader) => trader.trader_type(),
-                                None => return,
-                            };
-
-                        let _sol = trade_action.size().amount();
-                        if trader_type == loggaper::trading::trader::TraderType::Regular {}
+                        // NOTE: a per-trade `get_trader_stats` lookup used to run
+                        // here; its result was unused but the query (full
+                        // aggregate over the trader's trades) cost 2-5s on the
+                        // 25M-row trades table and stalled the trade stream. It
+                        // has been removed. Re-add a cached/bounded variant if a
+                        // consumer ever needs per-trade trader stats.
                     }
                 });
 

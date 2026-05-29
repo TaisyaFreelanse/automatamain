@@ -1,3 +1,7 @@
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use async_trait::async_trait;
 use sqlx::{PgPool, Postgres, Row};
 
@@ -11,13 +15,52 @@ use crate::{
     },
 };
 
+/// How long a computed creator-stats result stays fresh. The aggregate query is
+/// expensive (full scan over a 25M-row trades table for prolific devs), and the
+/// same dev frequently launches many tokens in a short window, so a short TTL
+/// turns repeated buy-path lookups into microsecond cache hits without letting
+/// stats drift meaningfully.
+const CREATOR_STATS_TTL: Duration = Duration::from_secs(180);
+/// Cap to keep the cache bounded; expired entries are pruned when this is hit.
+const CREATOR_STATS_CACHE_MAX: usize = 50_000;
+
+type CacheEntry = (Option<CreatorStatistics>, Instant);
+
 pub struct CreatorsRepositoryPostgres {
     pool: sqlx::Pool<Postgres>,
+    cache: Mutex<HashMap<String, CacheEntry>>,
 }
 
 impl CreatorsRepositoryPostgres {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn cache_get(&self, dev: &str) -> Option<Option<CreatorStatistics>> {
+        let cache = self.cache.lock().ok()?;
+        let (val, at) = cache.get(dev)?;
+        if at.elapsed() < CREATOR_STATS_TTL {
+            Some(val.clone())
+        } else {
+            None
+        }
+    }
+
+    fn cache_put(&self, dev: String, val: Option<CreatorStatistics>) {
+        if let Ok(mut cache) = self.cache.lock() {
+            if cache.len() >= CREATOR_STATS_CACHE_MAX {
+                let now = Instant::now();
+                cache.retain(|_, (_, at)| now.duration_since(*at) < CREATOR_STATS_TTL);
+                // Still full of fresh entries: drop this insert rather than grow unbounded.
+                if cache.len() >= CREATOR_STATS_CACHE_MAX {
+                    return;
+                }
+            }
+            cache.insert(dev, (val, Instant::now()));
+        }
     }
 }
 
@@ -28,6 +71,11 @@ impl CreatorRepository for CreatorsRepositoryPostgres {
         dev_address: Address,
     ) -> Result<Option<CreatorStatistics>, Error> {
         let dev_address = dev_address.to_string();
+
+        // Fast path: fresh cached result (covers repeat tokens by the same dev).
+        if let Some(cached) = self.cache_get(&dev_address) {
+            return Ok(cached);
+        }
 
         let row = sqlx::query(
             r#"
@@ -120,10 +168,11 @@ impl CreatorRepository for CreatorsRepositoryPostgres {
         let total_coins: i64 = row.get("total_coins");
 
         if total_coins == 0 {
+            self.cache_put(dev_address, None);
             return Ok(None);
         }
 
-        Ok(Some(CreatorStatistics {
+        let stats = CreatorStatistics {
             median_market_cap: Currency::from_float_native(row.get::<f64, _>("median_market_cap")),
             trader_pnl_average: row.get("trader_pnl_average"),
             total_holders_average: row.get::<f64, _>("total_holders_average").round() as u64,
@@ -134,6 +183,8 @@ impl CreatorRepository for CreatorsRepositoryPostgres {
                 row.get::<f64, _>("average_buy_trader_size"),
             ),
             total_coins: total_coins as u64,
-        }))
+        };
+        self.cache_put(dev_address, Some(stats.clone()));
+        Ok(Some(stats))
     }
 }
