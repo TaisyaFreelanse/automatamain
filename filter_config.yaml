@@ -72,6 +72,9 @@ buy_config:
   fill_mcap_abort_max_ratio: 2.0
   # Abort when on-chain fill mcap is far below score-time tape (adverse curve / stale WS).
   fill_mcap_abort_min_ratio: 0.78
+  # SL baseline = min(post-fill mcap, score-time mcap) so the stop measures real
+  # market downside, not our own buy's price impact / post-fill inflation.
+  honest_entry_baseline: true
 
 curve_quarantine:
   enabled: true
@@ -176,6 +179,9 @@ scoring:
   # --- Live-only gates (ignored when execution.mode: demo) ---------------
   # Require bonding-curve mcap growth into the "good" band during the window.
   require_momentum_good: true
+  # Strong smart-money count that bypasses require_momentum_good (smart money is
+  # itself a momentum signal; let such tokens reach the continuation layer). 0 = off.
+  momentum_good_smart_bypass: 2
   # Live: tier must be at least this. Use `A` so both A and A+ can buy when
   # `require_momentum_good` passes; set `APlus` only if you want top-tier-only.
   minimum_tier_for_buy: A

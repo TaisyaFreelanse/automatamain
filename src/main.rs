@@ -1490,7 +1490,14 @@ async fn main() {
                                 .iter()
                                 .any(|(name, _)| *name == "momentum_good");
 
-                            if filter_config.scoring.require_momentum_good && !has_momentum_good {
+                            // Strong smart money is itself a momentum signal: let
+                            // such tokens reach the continuation layer instead of
+                            // being cut here for a missing `momentum_good` item.
+                            let smart_bypass = filter_config.scoring.momentum_good_smart_bypass;
+                            let momentum_good_satisfied = has_momentum_good
+                                || (smart_bypass > 0 && smart_count >= smart_bypass);
+
+                            if filter_config.scoring.require_momentum_good && !momentum_good_satisfied {
                                 eprintln!(
                                     "[BUY] {} skipped (live): require_momentum_good=true but no \
                                      momentum_good in items={:?}",

@@ -37,6 +37,14 @@ pub struct ScoringConfig {
     #[serde(default)]
     pub require_momentum_good: bool,
 
+    /// Smart-wallet count at/above which the `require_momentum_good` live gate is
+    /// bypassed: strong smart money is itself a momentum signal, so such tokens
+    /// should reach the continuation layer instead of being cut early for a
+    /// missing `momentum_good` item. `0` disables the bypass (gate applies to
+    /// all). Only relevant when `require_momentum_good` is `true`.
+    #[serde(default = "default_momentum_good_smart_bypass")]
+    pub momentum_good_smart_bypass: u32,
+
     /// When `execution.mode` is **live**, only this tier or higher may open a
     /// position. `A` = both A and A+ (after other gates); `APlus` = stricter,
     /// top-tier only. Pair with `require_momentum_good` so A entries still
@@ -83,6 +91,7 @@ impl Default for ScoringConfig {
             a_plus_threshold: default_a_plus(),
             a_threshold: default_a(),
             require_momentum_good: true,
+            momentum_good_smart_bypass: default_momentum_good_smart_bypass(),
             minimum_tier_for_buy: MinBuyTier::A,
             legacy_scoring: false,
             weights: ScoringWeights::default(),
@@ -93,6 +102,11 @@ impl Default for ScoringConfig {
             anti_parabolic: AntiParabolicConfig::default(),
         }
     }
+}
+
+/// Strong smart-money count that bypasses the `require_momentum_good` live gate.
+fn default_momentum_good_smart_bypass() -> u32 {
+    2
 }
 
 /// Continuation Validation Layer (doc 2.1 / 2.2 / 2.3). After a token passes

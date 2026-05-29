@@ -241,6 +241,15 @@ pub struct SmartBuyConfig {
     /// Abort when `fill_mcap / score_mcap` is below this (adverse fill vs score tape).
     #[serde(default = "default_fill_mcap_abort_min_ratio")]
     pub fill_mcap_abort_min_ratio: f64,
+    /// When true, seed the position entry/SL baseline with `min(post-fill mcap,
+    /// score-time mcap)` instead of the raw post-fill bonding-curve mcap. The
+    /// post-fill mcap is inflated by our own buy's price impact (and any buys
+    /// that piled in during our fill), so using it as the SL reference makes the
+    /// stop fire on our own slippage rather than real market downside. The
+    /// score-time mcap is a clean pre-impact reference. `false` keeps the raw
+    /// post-fill mcap.
+    #[serde(default = "default_honest_entry_baseline")]
+    pub honest_entry_baseline: bool,
     /// SL: consecutive ticks (100ms) with filtered PnL <= floor before full exit.
     #[serde(default = "default_sl_confirm_ticks")]
     pub sl_confirm_ticks: u32,
@@ -318,6 +327,10 @@ fn default_fill_mcap_abort_max_ratio() -> f64 {
 
 fn default_fill_mcap_abort_min_ratio() -> f64 {
     0.78
+}
+
+fn default_honest_entry_baseline() -> bool {
+    true
 }
 
 /// Score-time vs post-fill mcap comparison for spike abort.
@@ -934,13 +947,33 @@ impl PositionManagerActor {
                     }
 
                     let tokens = Amount::from_float_native(receipt.tokens_received);
+                    // Honest entry baseline: the raw post-fill bonding-curve mcap
+                    // is inflated by our own buy's price impact, so using it as the
+                    // SL reference makes the stop fire on our own slippage. Prefer
+                    // `min(post-fill, score-time)` — the score-time mcap is a clean
+                    // pre-impact reference and tracks our true cost basis.
+                    let entry_baseline_mcap =
+                        receipt.entry_mcap_fill_sol.filter(|m| *m > 0.0).map(|fill| {
+                            if self.config.honest_entry_baseline {
+                                match learning_snapshot
+                                    .as_ref()
+                                    .map(|s| s.entry_mcap_sol)
+                                    .filter(|m| *m > 0.0)
+                                {
+                                    Some(score) => fill.min(score),
+                                    None => fill,
+                                }
+                            } else {
+                                fill
+                            }
+                        });
                     let mut position = Position::new(
                         latest_pool,
                         tokens,
                         current_time,
-                        receipt.entry_mcap_fill_sol,
+                        entry_baseline_mcap,
                     );
-                    if let Some(entry_mcap) = receipt.entry_mcap_fill_sol.filter(|m| *m > 0.0) {
+                    if let Some(entry_mcap) = entry_baseline_mcap.filter(|m| *m > 0.0) {
                         position.exit_mcap_ticks.clear();
                         position.push_exit_mcap_tick(
                             entry_mcap,
@@ -997,8 +1030,16 @@ impl PositionManagerActor {
                     position.open_reason = Some(open_reason.clone());
                     let enter_mcap = position.enter_mcap.to_float();
                     position.push_exit_mcap_tick(enter_mcap, self.config.exit_mcap_median_ticks);
+                    let impact_adjusted = matches!(
+                        (receipt.entry_mcap_fill_sol.filter(|m| *m > 0.0), entry_baseline_mcap),
+                        (Some(fill), Some(base)) if base < fill
+                    );
                     let mcap_src = if receipt.entry_mcap_fill_sol.is_some() {
-                        "on-chain fill"
+                        if impact_adjusted {
+                            "on-chain fill, impact-adj"
+                        } else {
+                            "on-chain fill"
+                        }
                     } else {
                         "WS pool cache"
                     };
