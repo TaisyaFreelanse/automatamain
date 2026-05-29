@@ -16,6 +16,9 @@ pub struct FeedSnapshot {
     pub name: String,
     pub subscribed: u64,
     pub reconnects: u64,
+    /// Reconnects forced by the idle watchdog (stream nominally connected but no
+    /// created/trade event produced within the idle window). Subset of reconnects.
+    pub idle_reconnects: u64,
     pub stream_errors: u64,
 
     pub messages: u64,
@@ -52,6 +55,7 @@ pub struct FeedMetrics {
     pub name: &'static str,
     pub subscribed: AtomicU64,
     pub reconnects: AtomicU64,
+    pub idle_reconnects: AtomicU64,
     pub stream_errors: AtomicU64,
 
     pub messages: AtomicU64,
@@ -78,6 +82,7 @@ impl FeedMetrics {
             name,
             subscribed: AtomicU64::new(0),
             reconnects: AtomicU64::new(0),
+            idle_reconnects: AtomicU64::new(0),
             stream_errors: AtomicU64::new(0),
             messages: AtomicU64::new(0),
             events: AtomicU64::new(0),
@@ -100,6 +105,9 @@ impl FeedMetrics {
     }
     pub fn note_reconnect(&self) {
         self.reconnects.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn note_idle_reconnect(&self) {
+        self.idle_reconnects.fetch_add(1, Ordering::Relaxed);
     }
     pub fn note_stream_error(&self) {
         self.stream_errors.fetch_add(1, Ordering::Relaxed);
@@ -156,6 +164,7 @@ impl FeedMetrics {
             name: self.name.to_string(),
             subscribed: self.subscribed.load(Ordering::Relaxed),
             reconnects: self.reconnects.load(Ordering::Relaxed),
+            idle_reconnects: self.idle_reconnects.load(Ordering::Relaxed),
             stream_errors: self.stream_errors.load(Ordering::Relaxed),
             messages,
             events,

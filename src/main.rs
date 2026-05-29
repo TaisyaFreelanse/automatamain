@@ -424,7 +424,8 @@ async fn main() {
                     println!(
                         "[metrics:{}] msgs/s={:.1} ema={:.1} ev/s={:.1} \
                          bytes/s={:.0} drop_failed={} drop_npd={} drop_self_dup={} \
-                         cross_dup={} parse_err={} useful={:.3} subs={} reconn={}",
+                         cross_dup={} parse_err={} useful={:.3} subs={} reconn={} \
+                         idle_reconn={}",
                         snap.name,
                         rate,
                         *ema,
@@ -438,6 +439,7 @@ async fn main() {
                         snap.useful_msg_ratio,
                         snap.subscribed,
                         snap.reconnects,
+                        snap.idle_reconnects,
                     );
 
                     if prior > 1.0 && rate > prior * 3.0 {

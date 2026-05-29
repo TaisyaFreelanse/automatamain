@@ -1,7 +1,7 @@
 use std::{
     str::FromStr,
     sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use futures::stream::StreamExt;
@@ -20,7 +20,14 @@ pub type Result<T> = core::result::Result<T, Error>;
 
 const RECONNECT_BACKOFF_INITIAL_MS: u64 = 1_000;
 const RECONNECT_BACKOFF_MAX_MS: u64 = 60_000;
-const STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
+/// Idle watchdog: if the stream produces no *useful* event (a parsed
+/// created/trade we forward downstream) within this window, treat the
+/// connection as dead and force a reconnect — even while the WebSocket is
+/// nominally `connected`. This guards the silent-stall failure mode where
+/// Helius keeps delivering junk (failed txs / non-program-data) but no real
+/// pump events, which a raw-message idle timer never catches. Observed stall:
+/// 2026-05-29 23:21–23:39 (~18 min) lost every token in the window.
+const STREAM_USEFUL_IDLE_TIMEOUT_SECS: u64 = 15;
 const RECONNECT_LOG_EVERY: u64 = 25;
 const SELF_DEDUP_CAPACITY: usize = 4096;
 const PROGRAM_DATA_PREFIX: &str = "Program data: ";
@@ -50,16 +57,35 @@ where
                         .await?;
 
                 failure_counter.store(0, Ordering::Relaxed);
+                // A fresh, working subscription: reset backoff so that a later
+                // drop (incl. a watchdog reconnect) recovers fast instead of
+                // inheriting a grown backoff from earlier failures.
+                backoff_ms = RECONNECT_BACKOFF_INITIAL_MS;
                 self.metrics.note_subscribed();
                 println!("[{}] connected (subscribed)", feed_name);
 
+                let useful_idle = Duration::from_secs(STREAM_USEFUL_IDLE_TIMEOUT_SECS);
+                // Last time we forwarded a real created/trade event downstream.
+                let mut last_event = Instant::now();
+                let mut idle_triggered = false;
+
                 loop {
-                    match timeout(
-                        Duration::from_secs(STREAM_IDLE_TIMEOUT_SECS),
-                        log_notification.next(),
-                    )
-                    .await
-                    {
+                    // Watchdog: deadline-based on *useful* events. We wait only
+                    // until the remaining idle budget, so the timeout fires
+                    // precisely at the idle limit even if junk keeps arriving.
+                    let waited = last_event.elapsed();
+                    if waited >= useful_idle {
+                        println!(
+                            "[{}] [PUMP WATCHDOG] idle timeout ({}s, no created/trade), reconnecting",
+                            feed_name, STREAM_USEFUL_IDLE_TIMEOUT_SECS
+                        );
+                        self.metrics.note_idle_reconnect();
+                        idle_triggered = true;
+                        break;
+                    }
+                    let remaining = useful_idle - waited;
+
+                    match timeout(remaining, log_notification.next()).await {
                         Ok(Some(log_info)) => {
                             // Approximate payload size: sum of all log string
                             // lengths plus the signature.
@@ -133,6 +159,9 @@ where
                                 match T::from_str(&log) {
                                     Ok(event) => {
                                         self.metrics.note_event();
+                                        // Real event forwarded: feed is alive,
+                                        // reset the idle watchdog deadline.
+                                        last_event = Instant::now();
                                         if self
                                             .tx
                                             .send((log_info.context.slot, event))
@@ -141,7 +170,7 @@ where
                                         {
                                             println!("[{}] receiver dropped", feed_name);
                                             let _ = log_unsubscribe().await;
-                                            return Ok(());
+                                            return Ok(false);
                                         }
                                     }
                                     Err(_) => {
@@ -155,12 +184,15 @@ where
                         }
 
                         Ok(None) => break,
-                        Err(_) => break,
+                        // Timed out waiting for the next message: loop back to
+                        // the top, which re-checks the idle deadline and either
+                        // keeps waiting or fires the watchdog.
+                        Err(_) => continue,
                     }
                 }
 
                 let _ = log_unsubscribe().await;
-                Ok::<(), Error>(())
+                Ok::<bool, Error>(idle_triggered)
             }
             .await;
 
@@ -169,8 +201,9 @@ where
             let should_log = failures == 1 || failures % RECONNECT_LOG_EVERY == 0;
 
             match res {
-                Ok(_) => {
-                    if should_log {
+                Ok(idle_triggered) => {
+                    // Idle watchdog already logged its own [PUMP WATCHDOG] line.
+                    if !idle_triggered && should_log {
                         println!(
                             "[{}] stream ended cleanly, reconnecting (#{failures})",
                             feed_name
