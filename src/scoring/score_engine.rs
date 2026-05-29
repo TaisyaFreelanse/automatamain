@@ -59,6 +59,17 @@ impl<'a> ScoreEngine<'a> {
             }
         };
 
+        // Prolific serial launcher: heavy creator-stats was skipped, so this
+        // token must earn its tier on tape alone — apply the spam penalty.
+        if f.is_spam_dev {
+            add(
+                "spam_dev_penalty",
+                self.cfg.spam_dev_penalty,
+                &mut total,
+                &mut items,
+            );
+        }
+
         if f.dev_has_history {
             let strong = f.dev_total_coins >= t.dev_strong_min_coins
                 && f.dev_pnl_avg >= t.dev_strong_min_pnl_pct;
@@ -175,6 +186,17 @@ impl<'a> ScoreEngine<'a> {
                 items.push((name, points));
             }
         };
+
+        // Prolific serial launcher: heavy creator-stats was skipped, so this
+        // token must earn its tier on tape alone — apply the spam penalty.
+        if f.is_spam_dev {
+            add(
+                "spam_dev_penalty",
+                self.cfg.spam_dev_penalty,
+                &mut total,
+                &mut items,
+            );
+        }
 
         // --- Dev history (static historical table) -------------------------
         if f.dev_has_history {

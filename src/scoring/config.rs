@@ -52,6 +52,21 @@ pub struct ScoringConfig {
     #[serde(default)]
     pub minimum_tier_for_buy: MinBuyTier,
 
+    /// Score adjustment applied when the dev is a prolific serial launcher
+    /// (> `creator_config.spam_skip_coins`). We no longer hard-skip such devs:
+    /// we skip only the expensive creator-stats SQL and let the token compete
+    /// on tape strength, but with this penalty so only an exceptional tape
+    /// survives. Negative = penalty (recommended). `0` disables.
+    #[serde(default = "default_spam_dev_penalty")]
+    pub spam_dev_penalty: i32,
+
+    /// When `true` (live), a spam-dev token may only open a position at **A+**
+    /// tier — its tape must be exceptional, not just A. Pairs with
+    /// `spam_dev_penalty` to keep rare strong runners from prolific devs while
+    /// dropping the rest. Ignored in demo mode.
+    #[serde(default = "default_spam_dev_require_a_plus")]
+    pub spam_dev_require_a_plus: bool,
+
     /// When `true`, use the pre–entry-filter-V2 score path: overheated-before-good
     /// momentum ordering, bundle penalty = `bundle_identical` else `bundle_similar`,
     /// smart-wallet buckets fixed at 3+/1+, and **YAML `thresholds` only** (learning
@@ -93,6 +108,8 @@ impl Default for ScoringConfig {
             require_momentum_good: true,
             momentum_good_smart_bypass: default_momentum_good_smart_bypass(),
             minimum_tier_for_buy: MinBuyTier::A,
+            spam_dev_penalty: default_spam_dev_penalty(),
+            spam_dev_require_a_plus: default_spam_dev_require_a_plus(),
             legacy_scoring: false,
             weights: ScoringWeights::default(),
             thresholds: FeatureThresholds::default(),
@@ -107,6 +124,16 @@ impl Default for ScoringConfig {
 /// Strong smart-money count that bypasses the `require_momentum_good` live gate.
 fn default_momentum_good_smart_bypass() -> u32 {
     2
+}
+
+/// Default scoring penalty for prolific spam devs (see `spam_dev_penalty`).
+fn default_spam_dev_penalty() -> i32 {
+    -3
+}
+
+/// Default: spam-dev tokens require A+ tier to buy (see `spam_dev_require_a_plus`).
+fn default_spam_dev_require_a_plus() -> bool {
+    true
 }
 
 /// Continuation Validation Layer (doc 2.1 / 2.2 / 2.3). After a token passes

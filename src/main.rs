@@ -1185,41 +1185,28 @@ async fn main() {
                         }
 
                         // --- Stage 0: cheap spam-dev gate -------------------
-                        // Prolific devs (serial spam/ruggers) are almost always
-                        // junk and make the creator-stats aggregation scan
-                        // hundreds of thousands of trade rows. Bail out early
-                        // with a capped count (cost independent of dev size)
-                        // before paying for the heavy analytics.
+                        // Prolific devs (serial spam/ruggers) make the
+                        // creator-stats aggregation scan hundreds of thousands
+                        // of trade rows. A capped count (cost independent of dev
+                        // size) flags them so we can SKIP the heavy analytics
+                        // *without* banning the token: it competes on tape
+                        // strength alone, with a scoring penalty + an A+-only
+                        // buy gate, so rare strong runners from prolific devs
+                        // are no longer lost.
+                        let mut is_spam_dev = false;
                         if let Some(spam_cap) = filter_config.creator_config.spam_skip_coins {
                             match creators
                                 .count_creator_coins_capped(general_create.user, spam_cap)
                                 .await
                             {
                                 Ok(n) if n > spam_cap => {
+                                    is_spam_dev = true;
                                     eprintln!(
-                                        "[FILTER] {} skipped: spam_dev (>{} coins)",
+                                        "[FILTER] {} spam_dev (>{} coins): skipping creator-stats, \
+                                         continuing with penalty",
                                         general_create.mint, spam_cap
                                     );
                                     bot_metrics_create.note_spam_dev_skip();
-                                    if let Some(ref log) = learning_log_create {
-                                        let log = log.clone();
-                                        let mint_s = general_create.mint.to_string();
-                                        let dev_s = general_create.user.to_string();
-                                        let ts = unix_now();
-                                        tokio::spawn(async move {
-                                            let _ = log
-                                                .log_skipped(
-                                                    &mint_s,
-                                                    Some(dev_s.as_str()),
-                                                    "filter_spam_dev",
-                                                    "spam_dev",
-                                                    serde_json::json!({ "coins_gt": spam_cap }),
-                                                    ts,
-                                                )
-                                                .await;
-                                        });
-                                    }
-                                    return;
                                 }
                                 Ok(_) => {}
                                 Err(e) => {
@@ -1234,27 +1221,97 @@ async fn main() {
                         }
 
                         // --- Stage 1: cheap pre-gate on dev history ---------
-                        // Operator-tuned creator_config still acts as the
-                        // hard pre-filter. Score Engine runs *after* this so
-                        // we don't burn a scoring window on hopeless devs.
-                        let dev_stats_opt =
-                            match creators.get_creator_stats_in_sol(general_create.user).await {
-                                Ok(stats) => stats,
-                                Err(e) => {
-                                    eprintln!("[FILTER] DB error for {}: {e}", general_create.user);
+                        // Operator-tuned creator_config acts as the hard
+                        // pre-filter for normal devs. For spam devs we skip the
+                        // expensive query *and* the hard filter, leaning on the
+                        // scoring penalty + A+-only gate instead. Score Engine
+                        // runs after this so we don't burn a scoring window on
+                        // hopeless devs.
+                        let dev_stats: Option<loggaper::persistence::creators::CreatorStatistics> =
+                            if is_spam_dev {
+                                None
+                            } else {
+                                let dev_stats_opt = match creators
+                                    .get_creator_stats_in_sol(general_create.user)
+                                    .await
+                                {
+                                    Ok(stats) => stats,
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[FILTER] DB error for {}: {e}",
+                                            general_create.user
+                                        );
+                                        if let Some(ref log) = learning_log_create {
+                                            let log = log.clone();
+                                            let mint_s = general_create.mint.to_string();
+                                            let dev_s = general_create.user.to_string();
+                                            let ts = unix_now();
+                                            let msg = format!("{e}");
+                                            tokio::spawn(async move {
+                                                let _ = log
+                                                    .log_skipped(
+                                                        &mint_s,
+                                                        Some(dev_s.as_str()),
+                                                        "filter_db",
+                                                        &msg,
+                                                        serde_json::json!({}),
+                                                        ts,
+                                                    )
+                                                    .await;
+                                            });
+                                        }
+                                        return;
+                                    }
+                                };
+
+                                let s = match dev_stats_opt {
+                                    Some(s) => s,
+                                    None => {
+                                        eprintln!(
+                                            "[FILTER] {} skipped: no creator history",
+                                            general_create.mint
+                                        );
+                                        bot_metrics_create.note_no_history();
+                                        if let Some(ref log) = learning_log_create {
+                                            let log = log.clone();
+                                            let mint_s = general_create.mint.to_string();
+                                            let dev_s = general_create.user.to_string();
+                                            let ts = unix_now();
+                                            tokio::spawn(async move {
+                                                let _ = log
+                                                    .log_skipped(
+                                                        &mint_s,
+                                                        Some(dev_s.as_str()),
+                                                        "filter_no_history",
+                                                        "no_creator_history",
+                                                        serde_json::json!({}),
+                                                        ts,
+                                                    )
+                                                    .await;
+                                            });
+                                        }
+                                        return;
+                                    }
+                                };
+
+                                if !filter_config.creator_config.filter(&s) {
+                                    eprintln!(
+                                        "[FILTER] {} rejected by creator_config",
+                                        general_create.mint
+                                    );
+                                    bot_metrics_create.note_filter_rejected();
                                     if let Some(ref log) = learning_log_create {
                                         let log = log.clone();
                                         let mint_s = general_create.mint.to_string();
                                         let dev_s = general_create.user.to_string();
                                         let ts = unix_now();
-                                        let msg = format!("{e}");
                                         tokio::spawn(async move {
                                             let _ = log
                                                 .log_skipped(
                                                     &mint_s,
                                                     Some(dev_s.as_str()),
-                                                    "filter_db",
-                                                    &msg,
+                                                    "filter_creator",
+                                                    "creator_config_rejected",
                                                     serde_json::json!({}),
                                                     ts,
                                                 )
@@ -1263,65 +1320,9 @@ async fn main() {
                                     }
                                     return;
                                 }
+                                registry.save(mint_address, s.clone()).await;
+                                Some(s)
                             };
-
-                        let dev_stats = match dev_stats_opt {
-                            Some(s) => s,
-                            None => {
-                                eprintln!(
-                                    "[FILTER] {} skipped: no creator history",
-                                    general_create.mint
-                                );
-                                bot_metrics_create.note_no_history();
-                                if let Some(ref log) = learning_log_create {
-                                    let log = log.clone();
-                                    let mint_s = general_create.mint.to_string();
-                                    let dev_s = general_create.user.to_string();
-                                    let ts = unix_now();
-                                    tokio::spawn(async move {
-                                        let _ = log
-                                            .log_skipped(
-                                                &mint_s,
-                                                Some(dev_s.as_str()),
-                                                "filter_no_history",
-                                                "no_creator_history",
-                                                serde_json::json!({}),
-                                                ts,
-                                            )
-                                            .await;
-                                    });
-                                }
-                                return;
-                            }
-                        };
-
-                        if !filter_config.creator_config.filter(&dev_stats) {
-                            eprintln!(
-                                "[FILTER] {} rejected by creator_config",
-                                general_create.mint
-                            );
-                            bot_metrics_create.note_filter_rejected();
-                            if let Some(ref log) = learning_log_create {
-                                let log = log.clone();
-                                let mint_s = general_create.mint.to_string();
-                                let dev_s = general_create.user.to_string();
-                                let ts = unix_now();
-                                tokio::spawn(async move {
-                                    let _ = log
-                                        .log_skipped(
-                                            &mint_s,
-                                            Some(dev_s.as_str()),
-                                            "filter_creator",
-                                            "creator_config_rejected",
-                                            serde_json::json!({}),
-                                            ts,
-                                        )
-                                        .await;
-                                });
-                            }
-                            return;
-                        }
-                        registry.save(mint_address, dev_stats.clone()).await;
                         bot_metrics_create.note_passed_filter();
 
                         // --- Stage 2: scoring window + early tape ---------
@@ -1403,10 +1404,10 @@ async fn main() {
                         let regular_buyer_count = early_buyers.regulars.len() as u64;
                         let sniper_count = early_buyers.snipers.len() as u64;
 
-                        let token_features = features::assemble(
+                        let mut token_features = features::assemble(
                             general_create.mint,
                             general_create.user,
-                            Some(&dev_stats),
+                            dev_stats.as_ref(),
                             dev_category,
                             dev_record,
                             initial_mcap_sol,
@@ -1422,6 +1423,7 @@ async fn main() {
                             smart_count,
                             tape,
                         );
+                        token_features.is_spam_dev = is_spam_dev;
 
                         let engine = ScoreEngine::new(&filter_config.scoring);
                         let thr_score = if filter_config.scoring.legacy_scoring {
@@ -1594,6 +1596,46 @@ async fn main() {
                                                 Some(dev_s.as_str()),
                                                 "live_gate_tier",
                                                 "minimum_tier_APlus",
+                                                payload,
+                                                ts,
+                                            )
+                                            .await;
+                                    });
+                                }
+                                return;
+                            }
+
+                            // Spam-dev tape gate: prolific serial launchers
+                            // bypassed the creator-stats hard filter, so we only
+                            // let them buy when the tape is exceptional (A+),
+                            // never plain A. This keeps the rare real runners
+                            // from such devs without re-admitting the trash.
+                            if is_spam_dev
+                                && filter_config.scoring.spam_dev_require_a_plus
+                                && breakdown.tier != Tier::APlus
+                            {
+                                eprintln!(
+                                    "[BUY] {} skipped (spam_dev): tier={:?} but spam devs require A+",
+                                    general_create.mint,
+                                    breakdown.tier
+                                );
+                                bot_metrics_create.note_spam_dev_skip();
+                                if let Some(ref log) = learning_log_create {
+                                    let log = log.clone();
+                                    let mint_s = general_create.mint.to_string();
+                                    let dev_s = general_create.user.to_string();
+                                    let snap =
+                                        LearningTradeSnapshot::from_scoring(&token_features, &breakdown);
+                                    let payload =
+                                        serde_json::to_value(&snap).unwrap_or_else(|_| serde_json::json!({}));
+                                    let ts = unix_now();
+                                    tokio::spawn(async move {
+                                        let _ = log
+                                            .log_skipped(
+                                                &mint_s,
+                                                Some(dev_s.as_str()),
+                                                "spam_dev_weak",
+                                                "spam_dev_require_a_plus",
                                                 payload,
                                                 ts,
                                             )
@@ -1791,7 +1833,10 @@ async fn main() {
                             }
                         }
 
-                        let open_reason = OpenReason::DevStats(dev_stats);
+                        let open_reason = match dev_stats {
+                            Some(s) => OpenReason::DevStats(s),
+                            None => OpenReason::TraderStats,
+                        };
                         let learning_snapshot =
                             LearningTradeSnapshot::from_scoring(&token_features, &breakdown);
 

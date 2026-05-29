@@ -78,6 +78,7 @@ mod tests {
             dev_category: DevCategory::Neutral,
             dev_rank_score: 0.0,
             dev_rank_record: DevRecord::default(),
+            is_spam_dev: false,
             current_mcap_sol: 60.0,
             initial_mcap_sol: 50.0,
             peak_mcap_sol: 58.0,

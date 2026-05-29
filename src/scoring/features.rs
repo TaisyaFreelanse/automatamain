@@ -51,6 +51,12 @@ pub struct TokenFeatures {
     pub dev_rank_score: f64,
     pub dev_rank_record: DevRecord,
 
+    /// Prolific serial launcher (> `spam_skip_coins`). We skip the heavy
+    /// creator-stats SQL for these devs and let the token compete on tape
+    /// strength, but the scorer applies `spam_dev_penalty` so only an
+    /// exceptional tape survives.
+    pub is_spam_dev: bool,
+
     // Pool / market state
     pub current_mcap_sol: f64,
     pub initial_mcap_sol: f64,
@@ -684,6 +690,9 @@ pub fn assemble(
         dev_category,
         dev_rank_score: dev_rank_record.score,
         dev_rank_record,
+        // Set by the caller after assembly; the feature builder has no view of
+        // the spam-dev gate.
+        is_spam_dev: false,
         current_mcap_sol,
         initial_mcap_sol,
         peak_mcap_sol,

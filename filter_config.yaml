@@ -189,6 +189,12 @@ scoring:
   # Live: tier must be at least this. Use `A` so both A and A+ can buy when
   # `require_momentum_good` passes; set `APlus` only if you want top-tier-only.
   minimum_tier_for_buy: A
+  # Spam-dev handling: devs with > creator_config.spam_skip_coins launches skip
+  # the heavy creator-stats SQL (perf) but are NOT banned. Instead they get this
+  # scoring penalty and may only buy at A+ (their tape must be exceptional), so
+  # rare real runners from prolific devs survive while the trash is dropped.
+  spam_dev_penalty: -3
+  spam_dev_require_a_plus: true
   # Anti-rug: block one-sided low-fee pumps before buy; tighten tape score items.
   anti_rug:
     enabled: true
