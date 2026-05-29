@@ -75,6 +75,10 @@ buy_config:
   # SL baseline = min(post-fill mcap, score-time mcap) so the stop measures real
   # market downside, not our own buy's price impact / post-fill inflation.
   honest_entry_baseline: true
+  # Lower bound for the honest baseline as a fraction of post-fill mcap. On a big
+  # fill/score gap (hard spike during our buy) this keeps the SL baseline from
+  # dropping so low it disables the stop. 1.0 = no honest adjustment.
+  honest_entry_baseline_min_ratio: 0.85
 
 curve_quarantine:
   enabled: true

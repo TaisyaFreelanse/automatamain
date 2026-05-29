@@ -250,6 +250,14 @@ pub struct SmartBuyConfig {
     /// post-fill mcap.
     #[serde(default = "default_honest_entry_baseline")]
     pub honest_entry_baseline: bool,
+    /// Lower bound for the honest entry baseline as a fraction of the post-fill
+    /// mcap. The honest baseline is `min(post-fill, score-time)` but never below
+    /// `post-fill * this`. Guards the pathological case where score is far below
+    /// fill (big spike during our buy): without the clamp the SL baseline would
+    /// sit so low it effectively disables the stop while we are deep underwater
+    /// in SOL. `1.0` disables the honest adjustment (baseline == post-fill).
+    #[serde(default = "default_honest_entry_baseline_min_ratio")]
+    pub honest_entry_baseline_min_ratio: f64,
     /// SL: consecutive ticks (100ms) with filtered PnL <= floor before full exit.
     #[serde(default = "default_sl_confirm_ticks")]
     pub sl_confirm_ticks: u32,
@@ -333,6 +341,10 @@ fn default_honest_entry_baseline() -> bool {
     true
 }
 
+fn default_honest_entry_baseline_min_ratio() -> f64 {
+    0.85
+}
+
 /// Score-time vs post-fill mcap comparison for spike abort.
 struct FillMcapSpike {
     score_mcap_sol: f64,
@@ -377,6 +389,7 @@ impl Default for SmartBuyConfig {
             fill_mcap_abort_max_ratio: default_fill_mcap_abort_max_ratio(),
             fill_mcap_abort_min_ratio: default_fill_mcap_abort_min_ratio(),
             honest_entry_baseline: default_honest_entry_baseline(),
+            honest_entry_baseline_min_ratio: default_honest_entry_baseline_min_ratio(),
             sl_confirm_ticks: default_sl_confirm_ticks(),
             sl_grace_secs: default_sl_grace_secs(),
             sl_crash_pnl_pct: default_sl_crash_pnl_pct(),
@@ -961,7 +974,19 @@ impl PositionManagerActor {
                                     .map(|s| s.entry_mcap_sol)
                                     .filter(|m| *m > 0.0)
                                 {
-                                    Some(score) => fill.min(score),
+                                    // Strip our own price impact (use score-time
+                                    // mcap), but never let the baseline drop below
+                                    // `fill * min_ratio`: on a big fill/score gap a
+                                    // too-low baseline would disable the SL while we
+                                    // are deep underwater in SOL.
+                                    Some(score) => {
+                                        let floor = fill
+                                            * self
+                                                .config
+                                                .honest_entry_baseline_min_ratio
+                                                .clamp(0.0, 1.0);
+                                        fill.min(score).max(floor)
+                                    }
                                     None => fill,
                                 }
                             } else {
