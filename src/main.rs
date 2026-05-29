@@ -451,12 +451,13 @@ async fn main() {
                 let b = bot_for_logger.snapshot();
                 println!(
                     "[metrics:bot] creates={} no_history={} filter_rejected={} \
-                     passed_filter={} score_skip={} score_a={} score_a_plus={} \
-                     continuation_skipped={} parabolic_skipped={} strategy_blocked={} \
-                     positions_initiated={}",
+                     spam_dev_skipped={} passed_filter={} score_skip={} score_a={} \
+                     score_a_plus={} continuation_skipped={} parabolic_skipped={} \
+                     strategy_blocked={} positions_initiated={}",
                     b.creates_total,
                     b.creates_no_history,
                     b.creates_filter_rejected,
+                    b.spam_dev_skipped,
                     b.creates_passed_filter,
                     b.score_skipped,
                     b.score_a,
@@ -1175,6 +1176,55 @@ async fn main() {
                                 Err(e) => {
                                     eprintln!(
                                         "[FILTER] dev_blacklist lookup failed for {}: {e}",
+                                        general_create.user
+                                    );
+                                }
+                            }
+                        }
+
+                        // --- Stage 0: cheap spam-dev gate -------------------
+                        // Prolific devs (serial spam/ruggers) are almost always
+                        // junk and make the creator-stats aggregation scan
+                        // hundreds of thousands of trade rows. Bail out early
+                        // with a capped count (cost independent of dev size)
+                        // before paying for the heavy analytics.
+                        if let Some(spam_cap) = filter_config.creator_config.spam_skip_coins {
+                            match creators
+                                .count_creator_coins_capped(general_create.user, spam_cap)
+                                .await
+                            {
+                                Ok(n) if n > spam_cap => {
+                                    eprintln!(
+                                        "[FILTER] {} skipped: spam_dev (>{} coins)",
+                                        general_create.mint, spam_cap
+                                    );
+                                    bot_metrics_create.note_spam_dev_skip();
+                                    if let Some(ref log) = learning_log_create {
+                                        let log = log.clone();
+                                        let mint_s = general_create.mint.to_string();
+                                        let dev_s = general_create.user.to_string();
+                                        let ts = unix_now();
+                                        tokio::spawn(async move {
+                                            let _ = log
+                                                .log_skipped(
+                                                    &mint_s,
+                                                    Some(dev_s.as_str()),
+                                                    "filter_spam_dev",
+                                                    "spam_dev",
+                                                    serde_json::json!({ "coins_gt": spam_cap }),
+                                                    ts,
+                                                )
+                                                .await;
+                                        });
+                                    }
+                                    return;
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    // Non-fatal: fall through to the full path on
+                                    // count errors rather than dropping a token.
+                                    eprintln!(
+                                        "[FILTER] spam-dev count failed for {}: {e}",
                                         general_create.user
                                     );
                                 }

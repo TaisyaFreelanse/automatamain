@@ -262,6 +262,7 @@ pub struct BotSnapshot {
     pub creates_no_history: u64,
     pub creates_filter_rejected: u64,
     pub creates_passed_filter: u64,
+    pub spam_dev_skipped: u64,
     pub score_skipped: u64,
     pub score_a: u64,
     pub score_a_plus: u64,
@@ -277,6 +278,7 @@ pub struct BotMetrics {
     pub creates_no_history: AtomicU64,
     pub creates_filter_rejected: AtomicU64,
     pub creates_passed_filter: AtomicU64,
+    pub spam_dev_skipped: AtomicU64,
     pub score_skipped: AtomicU64,
     pub score_a: AtomicU64,
     pub score_a_plus: AtomicU64,
@@ -294,6 +296,7 @@ impl BotMetrics {
             creates_no_history: AtomicU64::new(0),
             creates_filter_rejected: AtomicU64::new(0),
             creates_passed_filter: AtomicU64::new(0),
+            spam_dev_skipped: AtomicU64::new(0),
             score_skipped: AtomicU64::new(0),
             score_a: AtomicU64::new(0),
             score_a_plus: AtomicU64::new(0),
@@ -316,6 +319,9 @@ impl BotMetrics {
     }
     pub fn note_passed_filter(&self) {
         self.creates_passed_filter.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn note_spam_dev_skip(&self) {
+        self.spam_dev_skipped.fetch_add(1, Ordering::Relaxed);
     }
     pub fn note_score_skip(&self) {
         self.score_skipped.fetch_add(1, Ordering::Relaxed);
@@ -346,6 +352,7 @@ impl BotMetrics {
             creates_no_history: self.creates_no_history.load(Ordering::Relaxed),
             creates_filter_rejected: self.creates_filter_rejected.load(Ordering::Relaxed),
             creates_passed_filter: self.creates_passed_filter.load(Ordering::Relaxed),
+            spam_dev_skipped: self.spam_dev_skipped.load(Ordering::Relaxed),
             score_skipped: self.score_skipped.load(Ordering::Relaxed),
             score_a: self.score_a.load(Ordering::Relaxed),
             score_a_plus: self.score_a_plus.load(Ordering::Relaxed),

@@ -21,4 +21,14 @@ pub trait CreatorRepository {
         &self,
         dev_address: Address,
     ) -> Result<Option<CreatorStatistics>, Error>;
+
+    /// Cheap, index-only count of a dev's launched coins, capped at `cap + 1`.
+    /// Stops scanning after `cap + 1` matches, so the cost is constant regardless
+    /// of how prolific the dev is. Used as an early spam-dev gate before the
+    /// expensive full creator-stats aggregation.
+    async fn count_creator_coins_capped(
+        &self,
+        dev_address: Address,
+        cap: u64,
+    ) -> Result<u64, Error>;
 }

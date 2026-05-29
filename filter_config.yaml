@@ -1,6 +1,10 @@
 creator_config:
   min_total_coins: 0
   max_total_coins: 1000
+  # Early spam-dev cutoff: skip the token (before the heavy creator-stats query)
+  # if the dev has launched more than this many coins. Checked with a cheap
+  # capped count. Such prolific devs are almost always spam/serial ruggers.
+  spam_skip_coins: 100
 
   min_median_market_cap: 90.0
   min_trader_pnl_average: 4.0

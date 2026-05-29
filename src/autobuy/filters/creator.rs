@@ -2,10 +2,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::persistence::creators::CreatorStatistics;
 
+fn default_spam_skip_coins() -> Option<u64> {
+    Some(100)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreatorStatisticsFilter {
     pub min_total_coins: Option<u64>,
     pub max_total_coins: Option<u64>,
+
+    /// Early spam-dev cutoff: if a dev has launched more than this many coins,
+    /// skip the token *before* running the expensive creator-stats aggregation
+    /// (which would otherwise scan hundreds of thousands of trade rows). Such
+    /// prolific devs are almost always spam/serial ruggers. Checked with a cheap
+    /// capped `count` so cost is independent of how many coins the dev has.
+    /// `None` disables the early gate. Defaults to 100.
+    #[serde(default = "default_spam_skip_coins")]
+    pub spam_skip_coins: Option<u64>,
 
     pub min_median_market_cap: Option<f64>,
     pub min_trader_pnl_average: Option<f64>,

@@ -66,6 +66,32 @@ impl CreatorsRepositoryPostgres {
 
 #[async_trait]
 impl CreatorRepository for CreatorsRepositoryPostgres {
+    async fn count_creator_coins_capped(
+        &self,
+        dev_address: Address,
+        cap: u64,
+    ) -> Result<u64, Error> {
+        let dev_address = dev_address.to_string();
+        // `LIMIT cap+1` bounds the work: the index scan on coins(developer) stops
+        // after cap+1 matches, so a 10-coin dev and a 10k-coin dev cost the same.
+        let limit = (cap as i64).saturating_add(1);
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*) AS n
+            FROM (
+                SELECT 1 FROM coins WHERE developer = $1 LIMIT $2
+            ) t
+            "#,
+        )
+        .bind(&dev_address)
+        .bind(limit)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let n: i64 = row.get("n");
+        Ok(n.max(0) as u64)
+    }
+
     async fn get_creator_stats_in_sol(
         &self,
         dev_address: Address,
