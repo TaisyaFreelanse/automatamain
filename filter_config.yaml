@@ -200,7 +200,8 @@ scoring:
   continuation:
     enabled: false
     confirm_window_ms: 1500
-    confirm_slices: 2
+    # Need at least (min_upticks + 1) slices, else the uptick check can never pass.
+    confirm_slices: 4
     min_upticks: 1
     min_new_unique_buyers: 1
     max_b2s_drop_ratio: 0.6
@@ -214,7 +215,8 @@ scoring:
     near_peak_ratio: 0.97
     weak_score_max: 9
     confirm_window_ms: 1500
-    confirm_slices: 2
+    # Need at least (strong_upticks + 1) slices, else the reprieve can never trigger.
+    confirm_slices: 4
     strong_upticks: 2
     strong_new_buyers: 3
   weights:
