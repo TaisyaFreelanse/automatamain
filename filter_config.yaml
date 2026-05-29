@@ -202,6 +202,17 @@ scoring:
     max_b2s_drop_ratio: 0.6
     max_sell_absorption_ratio: 1.5
     min_buys_per_sec: 0.0
+  # Anti-parabolic peak gate: skip weak A-tier entries with no smart money bought
+  # at the local peak unless the confirm window shows strong fresh demand. A+ /
+  # smart-money / runner setups are exempt. Ships dark (enabled: false).
+  anti_parabolic:
+    enabled: false
+    near_peak_ratio: 0.97
+    weak_score_max: 9
+    confirm_window_ms: 1500
+    confirm_slices: 2
+    strong_upticks: 2
+    strong_new_buyers: 3
   weights:
     dev_history_strong: 4
     dev_history_weak: 2

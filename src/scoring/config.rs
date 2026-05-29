@@ -68,6 +68,11 @@ pub struct ScoringConfig {
     /// aborts entries on broken continuation (fake / transient momentum).
     #[serde(default)]
     pub continuation: ContinuationConfig,
+
+    /// Anti-parabolic entry gate: skip weak A-tier entries bought at the local
+    /// peak with no smart money and no strong continuation (bought-the-top).
+    #[serde(default)]
+    pub anti_parabolic: AntiParabolicConfig,
 }
 
 impl Default for ScoringConfig {
@@ -85,6 +90,7 @@ impl Default for ScoringConfig {
             size: TierSize::default(),
             anti_rug: AntiRugConfig::default(),
             continuation: ContinuationConfig::default(),
+            anti_parabolic: AntiParabolicConfig::default(),
         }
     }
 }
@@ -159,6 +165,72 @@ fn default_continuation_max_sell_absorption_ratio() -> f64 {
 }
 fn default_continuation_min_buys_per_sec() -> f64 {
     0.0
+}
+
+/// Anti-parabolic entry gate. Targets the "bought the local top" pattern: a
+/// token scored only weak A-tier, no smart money, entered while `current_mcap`
+/// is already at/near `peak_mcap` (parabolic exhaustion). Such entries are only
+/// allowed if the continuation poll shows *strong* fresh demand (upticks + new
+/// buyers). Strong A+ / smart-money / runner setups are never affected. Ships
+/// dark (`enabled = false`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AntiParabolicConfig {
+    #[serde(default = "default_anti_parabolic_enabled")]
+    pub enabled: bool,
+    /// `current_mcap >= peak_mcap * near_peak_ratio` counts as "at the peak".
+    #[serde(default = "default_anti_parabolic_near_peak_ratio")]
+    pub near_peak_ratio: f64,
+    /// Score at/below this is "weak" (eligible for the gate). Above => allow.
+    #[serde(default = "default_anti_parabolic_weak_score_max")]
+    pub weak_score_max: i32,
+    /// Confirmation poll window (ms) used when continuation is disabled.
+    #[serde(default = "default_anti_parabolic_confirm_window_ms")]
+    pub confirm_window_ms: u64,
+    /// Confirmation sub-samples used when continuation is disabled.
+    #[serde(default = "default_anti_parabolic_confirm_slices")]
+    pub confirm_slices: usize,
+    /// Upticks in the confirm window required to override the gate (strong demand).
+    #[serde(default = "default_anti_parabolic_strong_upticks")]
+    pub strong_upticks: u32,
+    /// New unique buyers in the confirm window required to override the gate.
+    #[serde(default = "default_anti_parabolic_strong_new_buyers")]
+    pub strong_new_buyers: u64,
+}
+
+impl Default for AntiParabolicConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_anti_parabolic_enabled(),
+            near_peak_ratio: default_anti_parabolic_near_peak_ratio(),
+            weak_score_max: default_anti_parabolic_weak_score_max(),
+            confirm_window_ms: default_anti_parabolic_confirm_window_ms(),
+            confirm_slices: default_anti_parabolic_confirm_slices(),
+            strong_upticks: default_anti_parabolic_strong_upticks(),
+            strong_new_buyers: default_anti_parabolic_strong_new_buyers(),
+        }
+    }
+}
+
+fn default_anti_parabolic_enabled() -> bool {
+    false
+}
+fn default_anti_parabolic_near_peak_ratio() -> f64 {
+    0.97
+}
+fn default_anti_parabolic_weak_score_max() -> i32 {
+    9
+}
+fn default_anti_parabolic_confirm_window_ms() -> u64 {
+    1500
+}
+fn default_anti_parabolic_confirm_slices() -> usize {
+    2
+}
+fn default_anti_parabolic_strong_upticks() -> u32 {
+    2
+}
+fn default_anti_parabolic_strong_new_buyers() -> u64 {
+    3
 }
 
 /// Anti-rug entry filters (low fee flow / one-sided pump detection).

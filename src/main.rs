@@ -452,7 +452,8 @@ async fn main() {
                 println!(
                     "[metrics:bot] creates={} no_history={} filter_rejected={} \
                      passed_filter={} score_skip={} score_a={} score_a_plus={} \
-                     continuation_skipped={} strategy_blocked={} positions_initiated={}",
+                     continuation_skipped={} parabolic_skipped={} strategy_blocked={} \
+                     positions_initiated={}",
                     b.creates_total,
                     b.creates_no_history,
                     b.creates_filter_rejected,
@@ -461,6 +462,7 @@ async fn main() {
                     b.score_a,
                     b.score_a_plus,
                     b.continuation_skipped,
+                    b.parabolic_skipped,
                     b.strategy_blocked,
                     b.positions_initiated,
                 );
@@ -1592,65 +1594,140 @@ async fn main() {
                             operator_cap,
                             amount_sol,
                         );
-                        // --- Continuation Validation Layer (doc 2.1/2.2/2.3) -----
+                        // --- Confirmation poll: Continuation (doc 2.1/2.2/2.3) +
+                        // Anti-parabolic peak gate (bought-the-top fix) ----------
                         // After scoring + gates pass, observe one short confirm
-                        // window and abort transient / fake-momentum entries.
-                        if filter_config.execution.mode == ExecutionMode::Live
-                            && filter_config.scoring.continuation.enabled
-                        {
+                        // window (shared by both gates) and abort transient /
+                        // fake-momentum and parabolic-peak entries.
+                        let cont_enabled = filter_config.execution.mode == ExecutionMode::Live
+                            && filter_config.scoring.continuation.enabled;
+                        let parab_enabled = filter_config.execution.mode == ExecutionMode::Live
+                            && filter_config.scoring.anti_parabolic.enabled;
+                        if cont_enabled || parab_enabled {
                             let cont_cfg = &filter_config.scoring.continuation;
+                            let parab_cfg = &filter_config.scoring.anti_parabolic;
                             let baseline_buyers = regular_buyer_count + sniper_count;
+                            // Use the continuation window when it is active; else
+                            // fall back to the anti-parabolic poll settings.
+                            let (poll_window_ms, poll_slices) = if cont_enabled {
+                                (cont_cfg.confirm_window_ms, cont_cfg.confirm_slices)
+                            } else {
+                                (parab_cfg.confirm_window_ms, parab_cfg.confirm_slices)
+                            };
                             let confirm = features::observe_early_tape_points_live(
                                 &launchpad_for_score,
                                 mint_address,
-                                cont_cfg.confirm_window_ms,
-                                cont_cfg.confirm_slices,
+                                poll_window_ms,
+                                poll_slices,
                                 None,
                             )
                             .await;
-                            if let Err(reason) = features::evaluate_continuation(
-                                cont_cfg,
-                                token_features.buy_to_sell_ratio,
-                                baseline_buyers,
-                                &confirm.points,
-                                cont_cfg.confirm_window_ms,
-                            ) {
-                                eprintln!(
-                                    "[BUY] {} skipped (continuation): {} | mcap_init={:.1} \
-                                     mcap_now={:.1} baseline_buyers={} b2s={:.2}",
-                                    general_create.mint,
-                                    reason,
-                                    confirm.initial_mcap_sol,
-                                    confirm.current_mcap_sol,
-                                    baseline_buyers,
+
+                            // Continuation gate (transient / fake momentum).
+                            if cont_enabled {
+                                if let Err(reason) = features::evaluate_continuation(
+                                    cont_cfg,
                                     token_features.buy_to_sell_ratio,
-                                );
-                                bot_metrics_create.note_continuation_skip();
-                                if let Some(ref log) = learning_log_create {
-                                    let log = log.clone();
-                                    let mint_s = general_create.mint.to_string();
-                                    let dev_s = general_create.user.to_string();
-                                    let snap = LearningTradeSnapshot::from_scoring(
-                                        &token_features,
-                                        &breakdown,
+                                    baseline_buyers,
+                                    &confirm.points,
+                                    cont_cfg.confirm_window_ms,
+                                ) {
+                                    eprintln!(
+                                        "[BUY] {} skipped (continuation): {} | mcap_init={:.1} \
+                                         mcap_now={:.1} baseline_buyers={} b2s={:.2}",
+                                        general_create.mint,
+                                        reason,
+                                        confirm.initial_mcap_sol,
+                                        confirm.current_mcap_sol,
+                                        baseline_buyers,
+                                        token_features.buy_to_sell_ratio,
                                     );
-                                    let payload = serde_json::to_value(&snap)
-                                        .unwrap_or_else(|_| serde_json::json!({}));
-                                    let ts = unix_now();
-                                    tokio::spawn(async move {
-                                        let _ = log
-                                            .log_skipped(
-                                                &mint_s,
-                                                Some(dev_s.as_str()),
-                                                "continuation",
-                                                reason,
-                                                payload,
-                                                ts,
-                                            )
-                                            .await;
-                                    });
+                                    bot_metrics_create.note_continuation_skip();
+                                    if let Some(ref log) = learning_log_create {
+                                        let log = log.clone();
+                                        let mint_s = general_create.mint.to_string();
+                                        let dev_s = general_create.user.to_string();
+                                        let snap = LearningTradeSnapshot::from_scoring(
+                                            &token_features,
+                                            &breakdown,
+                                        );
+                                        let payload = serde_json::to_value(&snap)
+                                            .unwrap_or_else(|_| serde_json::json!({}));
+                                        let ts = unix_now();
+                                        tokio::spawn(async move {
+                                            let _ = log
+                                                .log_skipped(
+                                                    &mint_s,
+                                                    Some(dev_s.as_str()),
+                                                    "continuation",
+                                                    reason,
+                                                    payload,
+                                                    ts,
+                                                )
+                                                .await;
+                                        });
+                                    }
+                                    return;
                                 }
-                                return;
+                            }
+
+                            // Anti-parabolic peak gate: weak A-tier, no smart
+                            // money, entered at the local peak, without strong
+                            // fresh demand in the confirm window. A+ / smart /
+                            // strong-continuation setups are exempt by design.
+                            if parab_enabled
+                                && features::parabolic_peak_suspect(
+                                    parab_cfg,
+                                    breakdown.tier == Tier::APlus,
+                                    breakdown.total,
+                                    smart_count,
+                                    current_mcap_sol,
+                                    peak_mcap_sol,
+                                )
+                            {
+                                let (upticks, new_buyers) =
+                                    features::continuation_strength(&confirm.points, baseline_buyers);
+                                let strong = upticks >= parab_cfg.strong_upticks
+                                    && new_buyers >= parab_cfg.strong_new_buyers;
+                                if !strong {
+                                    eprintln!(
+                                        "[BUY] {} skipped (parabolic_peak_entry): score={} smart={} \
+                                         mcap_now={:.1} mcap_peak={:.1} upticks={} new_buyers={}",
+                                        general_create.mint,
+                                        breakdown.total,
+                                        smart_count,
+                                        current_mcap_sol,
+                                        peak_mcap_sol,
+                                        upticks,
+                                        new_buyers,
+                                    );
+                                    bot_metrics_create.note_parabolic_skip();
+                                    if let Some(ref log) = learning_log_create {
+                                        let log = log.clone();
+                                        let mint_s = general_create.mint.to_string();
+                                        let dev_s = general_create.user.to_string();
+                                        let snap = LearningTradeSnapshot::from_scoring(
+                                            &token_features,
+                                            &breakdown,
+                                        );
+                                        let payload = serde_json::to_value(&snap)
+                                            .unwrap_or_else(|_| serde_json::json!({}));
+                                        let ts = unix_now();
+                                        tokio::spawn(async move {
+                                            let _ = log
+                                                .log_skipped(
+                                                    &mint_s,
+                                                    Some(dev_s.as_str()),
+                                                    "parabolic_peak_entry",
+                                                    "weak_peak_no_demand",
+                                                    payload,
+                                                    ts,
+                                                )
+                                                .await;
+                                        });
+                                    }
+                                    return;
+                                }
                             }
                         }
 

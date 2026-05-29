@@ -11,7 +11,7 @@ use crate::launchpads::{
 };
 use crate::persistence::creators::CreatorStatistics;
 use crate::scoring::anti_bundle::{compute_bundle_stats, BundleStats};
-use crate::scoring::config::{ContinuationConfig, FeatureThresholds};
+use crate::scoring::config::{AntiParabolicConfig, ContinuationConfig, FeatureThresholds};
 use crate::scoring::dev_ranker::{DevCategory, DevRecord};
 use crate::trading::trader::TraderType;
 
@@ -374,6 +374,51 @@ pub fn evaluate_continuation(
     Ok(())
 }
 
+/// Strength of the confirmation poll: `(upticks, new_unique_buyers)`.
+/// `upticks` = number of confirm slices where mcap rose vs the previous slice;
+/// `new_buyers` = unique buyers gained from the scoring baseline to window end.
+pub fn continuation_strength(confirm: &[EarlyTapePoint], baseline_buyer_count: u64) -> (u32, u64) {
+    if confirm.len() < 2 {
+        return (0, 0);
+    }
+    let mut upticks: u32 = 0;
+    for w in confirm.windows(2) {
+        if w[1].mcap_sol > w[0].mcap_sol {
+            upticks += 1;
+        }
+    }
+    let new_buyers = confirm
+        .last()
+        .map(|p| p.buyer_count.saturating_sub(baseline_buyer_count))
+        .unwrap_or(0);
+    (upticks, new_buyers)
+}
+
+/// Anti-parabolic "bought the local top" suspect (doc: entry-on-peak fix).
+/// True only for weak A-tier entries with no smart money entered while mcap is
+/// at/near the local peak. A+ tier, any smart money, or a score above
+/// `weak_score_max` are never flagged (returns false). Caller still gives the
+/// entry a reprieve if the continuation poll shows strong fresh demand.
+pub fn parabolic_peak_suspect(
+    cfg: &AntiParabolicConfig,
+    is_a_plus: bool,
+    score: i32,
+    smart_count: u32,
+    current_mcap: f64,
+    peak_mcap: f64,
+) -> bool {
+    if !cfg.enabled {
+        return false;
+    }
+    if is_a_plus || smart_count > 0 || score > cfg.weak_score_max {
+        return false;
+    }
+    if peak_mcap <= 0.0 {
+        return false;
+    }
+    current_mcap >= peak_mcap * cfg.near_peak_ratio
+}
+
 /// `slices` evenly spaced samples across `window_ms` (last point refreshed at window end).
 pub async fn observe_early_tape_points(
     bucket: &TokenBucket,
@@ -727,5 +772,55 @@ mod continuation_tests {
             evaluate_continuation(&cfg(), 3.0, 20, &confirm, 1500),
             Err("cont_no_data")
         );
+    }
+
+    fn parab_cfg() -> AntiParabolicConfig {
+        AntiParabolicConfig {
+            enabled: true,
+            ..AntiParabolicConfig::default()
+        }
+    }
+
+    #[test]
+    fn parabolic_weak_peak_no_smart_is_suspect() {
+        // weak A score, no smart, mcap_now == mcap_peak -> flagged.
+        assert!(parabolic_peak_suspect(&parab_cfg(), false, 8, 0, 65.2, 65.2));
+    }
+
+    #[test]
+    fn parabolic_exempts_a_plus_smart_and_strong_score() {
+        let c = parab_cfg();
+        // A+ never flagged
+        assert!(!parabolic_peak_suspect(&c, true, 8, 0, 65.2, 65.2));
+        // smart money present never flagged
+        assert!(!parabolic_peak_suspect(&c, false, 8, 1, 65.2, 65.2));
+        // strong score (> weak_score_max) never flagged
+        assert!(!parabolic_peak_suspect(&c, false, 12, 0, 65.2, 65.2));
+    }
+
+    #[test]
+    fn parabolic_not_at_peak_is_safe() {
+        // mcap_now well below peak -> not a peak entry.
+        assert!(!parabolic_peak_suspect(&parab_cfg(), false, 8, 0, 50.0, 65.2));
+    }
+
+    #[test]
+    fn parabolic_disabled_never_flags() {
+        let c = AntiParabolicConfig::default(); // enabled = false
+        assert!(!parabolic_peak_suspect(&c, false, 8, 0, 65.2, 65.2));
+    }
+
+    #[test]
+    fn continuation_strength_counts_upticks_and_buyers() {
+        let confirm = vec![pt(20, 10.0, 0, 60.0), pt(25, 13.0, 0, 66.0)];
+        let (upticks, new_buyers) = continuation_strength(&confirm, 20);
+        assert_eq!(upticks, 1);
+        assert_eq!(new_buyers, 5);
+    }
+
+    #[test]
+    fn continuation_strength_empty_is_zero() {
+        let (upticks, new_buyers) = continuation_strength(&[], 20);
+        assert_eq!((upticks, new_buyers), (0, 0));
     }
 }
