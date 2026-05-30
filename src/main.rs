@@ -1498,8 +1498,19 @@ async fn main() {
                             // such tokens reach the continuation layer instead of
                             // being cut here for a missing `momentum_good` item.
                             let smart_bypass = filter_config.scoring.momentum_good_smart_bypass;
+                            // A+ specific, stricter-scoped bypass: a top-tier (A+)
+                            // smart setup with >= configured smart wallets is given
+                            // a chance at the continuation/parabolic layer rather
+                            // than being cut here. Weak A (score 6-7, smart=0, dev
+                            // Bad) is intentionally NOT loosened.
+                            let aplus_smart_bypass =
+                                filter_config.scoring.momentum_good_aplus_smart_bypass;
+                            let aplus_smart_ok = aplus_smart_bypass > 0
+                                && breakdown.tier == Tier::APlus
+                                && smart_count >= aplus_smart_bypass;
                             let momentum_good_satisfied = has_momentum_good
-                                || (smart_bypass > 0 && smart_count >= smart_bypass);
+                                || (smart_bypass > 0 && smart_count >= smart_bypass)
+                                || aplus_smart_ok;
 
                             if filter_config.scoring.require_momentum_good && !momentum_good_satisfied {
                                 eprintln!(

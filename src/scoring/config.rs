@@ -45,6 +45,16 @@ pub struct ScoringConfig {
     #[serde(default = "default_momentum_good_smart_bypass")]
     pub momentum_good_smart_bypass: u32,
 
+    /// Tier-A+ specific bypass for the `require_momentum_good` live gate. A top
+    /// tier (A+) token with at least this many smart wallets is allowed past the
+    /// momentum gate even without a `momentum_good` item, so strong A+ smart
+    /// setups reach the continuation/parabolic layer instead of being cut early.
+    /// This is stricter-scoped than `momentum_good_smart_bypass` (which applies
+    /// to all tiers): it only loosens the gate for confirmed A+ smart entries.
+    /// `0` disables. Only relevant when `require_momentum_good` is `true`.
+    #[serde(default = "default_momentum_good_aplus_smart_bypass")]
+    pub momentum_good_aplus_smart_bypass: u32,
+
     /// When `execution.mode` is **live**, only this tier or higher may open a
     /// position. `A` = both A and A+ (after other gates); `APlus` = stricter,
     /// top-tier only. Pair with `require_momentum_good` so A entries still
@@ -107,6 +117,7 @@ impl Default for ScoringConfig {
             a_threshold: default_a(),
             require_momentum_good: true,
             momentum_good_smart_bypass: default_momentum_good_smart_bypass(),
+            momentum_good_aplus_smart_bypass: default_momentum_good_aplus_smart_bypass(),
             minimum_tier_for_buy: MinBuyTier::A,
             spam_dev_penalty: default_spam_dev_penalty(),
             spam_dev_require_a_plus: default_spam_dev_require_a_plus(),
@@ -124,6 +135,12 @@ impl Default for ScoringConfig {
 /// Strong smart-money count that bypasses the `require_momentum_good` live gate.
 fn default_momentum_good_smart_bypass() -> u32 {
     2
+}
+
+/// Default A+ smart bypass: a top-tier (A+) token with >=1 smart wallet skips
+/// the `require_momentum_good` gate (see `momentum_good_aplus_smart_bypass`).
+fn default_momentum_good_aplus_smart_bypass() -> u32 {
+    1
 }
 
 /// Default scoring penalty for prolific spam devs (see `spam_dev_penalty`).

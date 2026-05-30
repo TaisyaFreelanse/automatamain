@@ -186,6 +186,11 @@ scoring:
   # Strong smart-money count that bypasses require_momentum_good (smart money is
   # itself a momentum signal; let such tokens reach the continuation layer). 0 = off.
   momentum_good_smart_bypass: 2
+  # A+ ONLY: a top-tier (A+) token with >= this many smart wallets bypasses
+  # require_momentum_good and proceeds to continuation/parabolic. Stricter-scoped
+  # than momentum_good_smart_bypass: weak A (score 6-7, smart=0) is NOT loosened.
+  # 0 = off. Gives strong A+ smart setups a chance instead of an early cut.
+  momentum_good_aplus_smart_bypass: 1
   # Live: tier must be at least this. Use `A` so both A and A+ can buy when
   # `require_momentum_good` passes; set `APlus` only if you want top-tier-only.
   minimum_tier_for_buy: A
