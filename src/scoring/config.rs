@@ -55,6 +55,12 @@ pub struct ScoringConfig {
     #[serde(default = "default_momentum_good_aplus_smart_bypass")]
     pub momentum_good_aplus_smart_bypass: u32,
 
+    /// Tier-A bypass for `require_momentum_good`: strong tape (buyers, volume,
+    /// absorb, buyer-velocity persistence) without requiring smart wallets.
+    /// Weak A (score 6–7, thin tape) is intentionally excluded via `min_score`.
+    #[serde(default)]
+    pub momentum_good_strong_a: MomentumGoodStrongABypassConfig,
+
     /// When `execution.mode` is **live**, only this tier or higher may open a
     /// position. `A` = both A and A+ (after other gates); `APlus` = stricter,
     /// top-tier only. Pair with `require_momentum_good` so A entries still
@@ -118,6 +124,7 @@ impl Default for ScoringConfig {
             require_momentum_good: true,
             momentum_good_smart_bypass: default_momentum_good_smart_bypass(),
             momentum_good_aplus_smart_bypass: default_momentum_good_aplus_smart_bypass(),
+            momentum_good_strong_a: MomentumGoodStrongABypassConfig::default(),
             minimum_tier_for_buy: MinBuyTier::A,
             spam_dev_penalty: default_spam_dev_penalty(),
             spam_dev_require_a_plus: default_spam_dev_require_a_plus(),
@@ -141,6 +148,80 @@ fn default_momentum_good_smart_bypass() -> u32 {
 /// the `require_momentum_good` gate (see `momentum_good_aplus_smart_bypass`).
 fn default_momentum_good_aplus_smart_bypass() -> u32 {
     1
+}
+
+/// Live gate: tier **A** with score >= `min_score` and strong early tape may skip
+/// `require_momentum_good` without smart wallets (see `momentum_good_strong_a`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MomentumGoodStrongABypassConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Minimum total score (8 or 9 recommended). Score 6–7 weak A stays blocked.
+    #[serde(default = "default_strong_a_min_score")]
+    pub min_score: i32,
+    /// Minimum regular+sniper buyers in the scoring window.
+    #[serde(default = "default_strong_a_min_buyers")]
+    pub min_buyers: u64,
+    /// Minimum buy volume (SOL) in the scoring window.
+    #[serde(default = "default_strong_a_min_buy_volume_sol")]
+    pub min_buy_volume_sol: f64,
+    /// Minimum buy-to-sell ratio (continuation / demand proxy).
+    #[serde(default = "default_strong_a_min_buy_to_sell_ratio")]
+    pub min_buy_to_sell_ratio: f64,
+    /// Require `absorb_strong` score item or `absorb_quality_score` at/above this.
+    #[serde(default = "default_true")]
+    pub require_absorb_strong: bool,
+    #[serde(default = "default_strong_a_min_absorb_quality")]
+    pub min_absorb_quality: f64,
+    /// Require `buyer_velocity_persistent` item or persistence at/above this.
+    #[serde(default = "default_true")]
+    pub require_buyer_velocity_persistent: bool,
+    #[serde(default = "default_strong_a_min_buyer_velocity_persistence")]
+    pub min_buyer_velocity_persistence: f64,
+}
+
+impl Default for MomentumGoodStrongABypassConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_score: default_strong_a_min_score(),
+            min_buyers: default_strong_a_min_buyers(),
+            min_buy_volume_sol: default_strong_a_min_buy_volume_sol(),
+            min_buy_to_sell_ratio: default_strong_a_min_buy_to_sell_ratio(),
+            require_absorb_strong: true,
+            min_absorb_quality: default_strong_a_min_absorb_quality(),
+            require_buyer_velocity_persistent: true,
+            min_buyer_velocity_persistence: default_strong_a_min_buyer_velocity_persistence(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_strong_a_min_score() -> i32 {
+    8
+}
+
+fn default_strong_a_min_buyers() -> u64 {
+    10
+}
+
+fn default_strong_a_min_buy_volume_sol() -> f64 {
+    12.0
+}
+
+fn default_strong_a_min_buy_to_sell_ratio() -> f64 {
+    1.7
+}
+
+fn default_strong_a_min_absorb_quality() -> f64 {
+    0.58
+}
+
+fn default_strong_a_min_buyer_velocity_persistence() -> f64 {
+    0.62
 }
 
 /// Default scoring penalty for prolific spam devs (see `spam_dev_penalty`).

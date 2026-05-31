@@ -716,6 +716,55 @@ pub fn assemble(
     }
 }
 
+/// Strong tier-A bypass for the live `require_momentum_good` gate: score >= configured
+/// minimum with strong early tape (buyers, volume, absorb, buyer-velocity persistence)
+/// but **without** requiring smart wallets. Weak A (score 6–7, fading tape) stays out.
+pub fn strong_a_momentum_bypass_ok(
+    cfg: &crate::scoring::config::MomentumGoodStrongABypassConfig,
+    tier: crate::scoring::score_engine::Tier,
+    score: i32,
+    f: &TokenFeatures,
+    items: &[(&'static str, i32)],
+) -> bool {
+    use crate::scoring::score_engine::Tier;
+
+    if !cfg.enabled || tier != Tier::A || score < cfg.min_score {
+        return false;
+    }
+
+    let has = |name: &str| items.iter().any(|(n, _)| *n == name);
+
+    // Tape red flags: do not loosen weak / distribution setups.
+    if has("buyer_velocity_fading")
+        || has("momentum_overheated")
+        || has("repeat_dump_cluster")
+        || has("sell_pressure_high")
+        || has("bundle_identical")
+        || has("bundle_similar")
+    {
+        return false;
+    }
+
+    if f.buyer_count() < cfg.min_buyers {
+        return false;
+    }
+    if f.buy_volume_sol < cfg.min_buy_volume_sol {
+        return false;
+    }
+    if f.buy_to_sell_ratio < cfg.min_buy_to_sell_ratio {
+        return false;
+    }
+
+    let absorb_ok = !cfg.require_absorb_strong
+        || has("absorb_strong")
+        || f.absorb_quality_score >= cfg.min_absorb_quality;
+    let velocity_ok = !cfg.require_buyer_velocity_persistent
+        || has("buyer_velocity_persistent")
+        || f.buyer_velocity_persistence >= cfg.min_buyer_velocity_persistence;
+
+    absorb_ok && velocity_ok
+}
+
 #[cfg(test)]
 mod continuation_tests {
     use super::*;
@@ -876,5 +925,85 @@ mod continuation_tests {
     fn continuation_strength_empty_is_zero() {
         let (upticks, new_buyers) = continuation_strength(&[], 20);
         assert_eq!((upticks, new_buyers), (0, 0));
+    }
+}
+
+#[cfg(test)]
+mod strong_a_bypass_tests {
+    use super::*;
+    use crate::scoring::config::MomentumGoodStrongABypassConfig;
+    use crate::scoring::score_engine::Tier;
+
+    fn cfg() -> MomentumGoodStrongABypassConfig {
+        MomentumGoodStrongABypassConfig::default()
+    }
+
+    fn strong_f() -> TokenFeatures {
+        let mut f = TokenFeatures {
+            mint: Address::default(),
+            dev: Address::default(),
+            dev_has_history: false,
+            dev_total_coins: 0,
+            dev_pnl_avg: 0.0,
+            dev_holders_avg: 0,
+            dev_volume_avg: 0.0,
+            dev_trades_avg: 0,
+            dev_buy_to_sell_ratio: 0.0,
+            dev_category: DevCategory::Neutral,
+            dev_rank_score: 0.0,
+            dev_rank_record: DevRecord::default(),
+            is_spam_dev: false,
+            current_mcap_sol: 50.0,
+            initial_mcap_sol: 40.0,
+            peak_mcap_sol: 55.0,
+            buyers: EarlyBuyersSnapshot::default(),
+            regular_buyer_count: 12,
+            sniper_count: 0,
+            buy_volume_sol: 20.0,
+            still_long_count: 12,
+            already_sold_count: 0,
+            buy_to_sell_ratio: 2.0,
+            bundle: BundleStats::empty(),
+            smart_wallet_count: 0,
+            buyer_velocity_new_per_slice: vec![3, 4, 5],
+            buyer_velocity_persistence: 0.8,
+            sell_pressure_score: 0.1,
+            absorb_quality_score: 0.7,
+            sell_events_window: 2,
+            sell_volume_window_sol: 1.0,
+            repeat_dump_slices: 0,
+            smart_wallet_early_exits: 0,
+        };
+        f
+    }
+
+    #[test]
+    fn strong_a_score_8_passes_without_smart() {
+        let f = strong_f();
+        let items = [
+            ("buyers_10plus", 2),
+            ("volume_ok", 1),
+            ("absorb_strong", 2),
+            ("buyer_velocity_persistent", 1),
+        ];
+        assert!(strong_a_momentum_bypass_ok(&cfg(), Tier::A, 8, &f, &items));
+    }
+
+    #[test]
+    fn weak_a_score_6_rejected() {
+        let f = strong_f();
+        let items = [("buyers_10plus", 2), ("absorb_strong", 2)];
+        assert!(!strong_a_momentum_bypass_ok(&cfg(), Tier::A, 6, &f, &items));
+    }
+
+    #[test]
+    fn strong_a_fading_tape_rejected() {
+        let f = strong_f();
+        let items = [
+            ("buyers_10plus", 2),
+            ("absorb_strong", 2),
+            ("buyer_velocity_fading", -2),
+        ];
+        assert!(!strong_a_momentum_bypass_ok(&cfg(), Tier::A, 9, &f, &items));
     }
 }

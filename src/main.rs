@@ -1508,9 +1508,31 @@ async fn main() {
                             let aplus_smart_ok = aplus_smart_bypass > 0
                                 && breakdown.tier == Tier::APlus
                                 && smart_count >= aplus_smart_bypass;
+                            let strong_a_ok = features::strong_a_momentum_bypass_ok(
+                                &filter_config.scoring.momentum_good_strong_a,
+                                breakdown.tier,
+                                breakdown.total,
+                                &token_features,
+                                &breakdown.items,
+                            );
                             let momentum_good_satisfied = has_momentum_good
                                 || (smart_bypass > 0 && smart_count >= smart_bypass)
-                                || aplus_smart_ok;
+                                || aplus_smart_ok
+                                || strong_a_ok;
+
+                            if strong_a_ok && !has_momentum_good {
+                                eprintln!(
+                                    "[BUY] {} strong_A bypass momentum_good: score={} \
+                                     buyers={} vol={:.1} b2s={:.2} absorb={:.2} bv_persist={:.2}",
+                                    general_create.mint,
+                                    breakdown.total,
+                                    token_features.buyer_count(),
+                                    token_features.buy_volume_sol,
+                                    token_features.buy_to_sell_ratio,
+                                    token_features.absorb_quality_score,
+                                    token_features.buyer_velocity_persistence,
+                                );
+                            }
 
                             if filter_config.scoring.require_momentum_good && !momentum_good_satisfied {
                                 eprintln!(

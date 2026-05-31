@@ -191,6 +191,18 @@ scoring:
   # than momentum_good_smart_bypass: weak A (score 6-7, smart=0) is NOT loosened.
   # 0 = off. Gives strong A+ smart setups a chance instead of an early cut.
   momentum_good_aplus_smart_bypass: 1
+  # Strong tier-A without smart: score>=8, strong buyers/volume/absorb/velocity.
+  # Weak A (score 6-7) still requires momentum_good. Continuation gate unchanged.
+  momentum_good_strong_a:
+    enabled: true
+    min_score: 8
+    min_buyers: 10
+    min_buy_volume_sol: 12.0
+    min_buy_to_sell_ratio: 1.7
+    require_absorb_strong: true
+    min_absorb_quality: 0.58
+    require_buyer_velocity_persistent: true
+    min_buyer_velocity_persistence: 0.62
   # Live: tier must be at least this. Use `A` so both A and A+ can buy when
   # `require_momentum_good` passes; set `APlus` only if you want top-tier-only.
   minimum_tier_for_buy: A
