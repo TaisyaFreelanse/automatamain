@@ -234,6 +234,98 @@ fn default_spam_dev_require_a_plus() -> bool {
     true
 }
 
+/// For strong setups (A+ or score ≥ `min_score`), defer an immediate skip on
+/// `cont_b2s_worsening` / `cont_sell_absorption`, wait, then re-poll for recovery.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContinuationSecondLookConfig {
+    #[serde(default = "default_cont_second_look_enabled")]
+    pub enabled: bool,
+    /// Idle wait after the first confirm fails (ms).
+    #[serde(default = "default_cont_second_look_wait_ms")]
+    pub wait_ms: u64,
+    /// Second confirm poll duration after `wait_ms` (ms).
+    #[serde(default = "default_cont_second_look_recheck_window_ms")]
+    pub recheck_window_ms: u64,
+    #[serde(default = "default_cont_second_look_recheck_slices")]
+    pub recheck_slices: usize,
+    /// Strong A-tier entries need at least this score; A+ always qualifies.
+    #[serde(default = "default_cont_second_look_min_score")]
+    pub min_score: i32,
+}
+
+impl Default for ContinuationSecondLookConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_cont_second_look_enabled(),
+            wait_ms: default_cont_second_look_wait_ms(),
+            recheck_window_ms: default_cont_second_look_recheck_window_ms(),
+            recheck_slices: default_cont_second_look_recheck_slices(),
+            min_score: default_cont_second_look_min_score(),
+        }
+    }
+}
+
+fn default_cont_second_look_enabled() -> bool {
+    true
+}
+fn default_cont_second_look_wait_ms() -> u64 {
+    1250
+}
+fn default_cont_second_look_recheck_window_ms() -> u64 {
+    1200
+}
+fn default_cont_second_look_recheck_slices() -> usize {
+    3
+}
+fn default_cont_second_look_min_score() -> i32 {
+    10
+}
+
+/// A+ with no smart money bought at a high local peak: require a deferred
+/// continuation re-check before buy (cuts rug-top entries; smart-money A+ exempt).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContinuationAplusPeakGuardConfig {
+    #[serde(default = "default_aplus_peak_guard_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_aplus_peak_near_peak_ratio")]
+    pub near_peak_ratio: f64,
+    #[serde(default = "default_aplus_peak_min_mcap_sol")]
+    pub min_mcap_sol: f64,
+    /// First confirm must show at least this many upticks to buy without deferral.
+    #[serde(default = "default_aplus_peak_strong_upticks")]
+    pub strong_upticks: u32,
+    #[serde(default = "default_aplus_peak_strong_new_buyers")]
+    pub strong_new_buyers: u64,
+}
+
+impl Default for ContinuationAplusPeakGuardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_aplus_peak_guard_enabled(),
+            near_peak_ratio: default_aplus_peak_near_peak_ratio(),
+            min_mcap_sol: default_aplus_peak_min_mcap_sol(),
+            strong_upticks: default_aplus_peak_strong_upticks(),
+            strong_new_buyers: default_aplus_peak_strong_new_buyers(),
+        }
+    }
+}
+
+fn default_aplus_peak_guard_enabled() -> bool {
+    true
+}
+fn default_aplus_peak_near_peak_ratio() -> f64 {
+    0.97
+}
+fn default_aplus_peak_min_mcap_sol() -> f64 {
+    90.0
+}
+fn default_aplus_peak_strong_upticks() -> u32 {
+    2
+}
+fn default_aplus_peak_strong_new_buyers() -> u64 {
+    2
+}
+
 /// Continuation Validation Layer (doc 2.1 / 2.2 / 2.3). After a token passes
 /// scoring + the existing gates, observe the tape for one short confirmation
 /// window and abort the buy if continuation is breaking down: no price upticks,
@@ -243,6 +335,10 @@ fn default_spam_dev_require_a_plus() -> bool {
 pub struct ContinuationConfig {
     #[serde(default = "default_continuation_enabled")]
     pub enabled: bool,
+    #[serde(default)]
+    pub second_look: ContinuationSecondLookConfig,
+    #[serde(default)]
+    pub aplus_peak_guard: ContinuationAplusPeakGuardConfig,
     /// Confirmation poll duration after the score passes (ms).
     #[serde(default = "default_continuation_confirm_window_ms")]
     pub confirm_window_ms: u64,
@@ -270,6 +366,8 @@ impl Default for ContinuationConfig {
     fn default() -> Self {
         Self {
             enabled: default_continuation_enabled(),
+            second_look: ContinuationSecondLookConfig::default(),
+            aplus_peak_guard: ContinuationAplusPeakGuardConfig::default(),
             confirm_window_ms: default_continuation_confirm_window_ms(),
             confirm_slices: default_continuation_confirm_slices(),
             min_upticks: default_continuation_min_upticks(),

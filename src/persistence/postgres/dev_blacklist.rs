@@ -50,7 +50,7 @@ impl DevBlacklistRepository for DevBlacklistRepositoryPostgres {
             r#"
             SELECT reason, mint, pnl_sol, close_reason, created_at, expires_at
             FROM dev_blacklist
-            WHERE dev_wallet = $1 AND expires_at > $2
+            WHERE dev_wallet = $1 AND (expires_at = 0 OR expires_at > $2)
             ORDER BY created_at DESC
             LIMIT 1
             "#,

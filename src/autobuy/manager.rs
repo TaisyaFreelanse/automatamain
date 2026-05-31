@@ -1292,18 +1292,42 @@ impl PositionManagerActor {
                             }
 
                             if let Some(dev) = close_dev_address {
-                                if dev_blacklist::should_blacklist_dev(
+                                if let Some(tier) = dev_blacklist::classify_dev_blacklist(
                                     &reason,
                                     pnl_pct_sol,
                                     &self.dev_blacklist_cfg,
                                 ) {
-                                    let tag = dev_blacklist::cliff_reason_tag(&reason);
-                                    let summary_reason =
-                                        format!("{tag} {:.0}%", pnl_pct_sol.round());
+                                    let summary_reason = dev_blacklist::build_blacklist_reason(
+                                        tier,
+                                        &reason,
+                                        pnl_pct_sol,
+                                    );
                                     let closed_at_ts = SystemTime::now()
                                         .duration_since(UNIX_EPOCH)
                                         .unwrap()
                                         .as_secs() as i64;
+                                    let expires_at = match tier {
+                                        dev_blacklist::DevBlacklistTier::PermanentRug => {
+                                            dev_blacklist::DEV_BLACKLIST_NEVER_EXPIRES
+                                        }
+                                        dev_blacklist::DevBlacklistTier::Timed => {
+                                            closed_at_ts + self.dev_blacklist_cfg.cooldown_secs
+                                        }
+                                    };
+                                    let mint_log = mint.to_string();
+                                    let dev_log = dev.to_string();
+                                    if tier == dev_blacklist::DevBlacklistTier::PermanentRug {
+                                        eprintln!(
+                                            "[DEV BLACKLIST PERMANENT] {mint_log} dev={dev_log} \
+                                             {summary_reason}"
+                                        );
+                                    } else {
+                                        eprintln!(
+                                            "[DEV BLACKLIST] {mint_log} dev={dev_log} \
+                                             {summary_reason} expires_in={}s",
+                                            self.dev_blacklist_cfg.cooldown_secs
+                                        );
+                                    }
                                     let entry = DevBlacklistEntry {
                                         dev_wallet: dev.to_string(),
                                         reason: summary_reason,
@@ -1311,8 +1335,7 @@ impl PositionManagerActor {
                                         pnl_sol,
                                         close_reason: reason.clone(),
                                         created_at: closed_at_ts,
-                                        expires_at: closed_at_ts
-                                            + self.dev_blacklist_cfg.cooldown_secs,
+                                        expires_at,
                                     };
                                     let repo = self.dev_blacklist.clone();
                                     tokio::spawn(async move {

@@ -9,6 +9,7 @@ if [[ -f "$HOME/.cargo/env" ]]; then
 fi
 export PATH="${HOME}/.cargo/bin:${PATH}"
 cargo build --release
+bash "$(dirname "$0")/deploy_preflight.sh"
 systemctl stop loggaper
 install -m 755 /root/automata-build/target/release/loggaper /home/automata/loggaper
 systemctl start loggaper

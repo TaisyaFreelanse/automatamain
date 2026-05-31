@@ -396,6 +396,84 @@ pub fn evaluate_continuation(
     Ok(())
 }
 
+/// A+ at high mcap, no smart wallets, mcap at/near local peak (7XptJK-style top-buy risk).
+pub fn aplus_peak_no_smart_guard(
+    cfg: &crate::scoring::config::ContinuationAplusPeakGuardConfig,
+    is_a_plus: bool,
+    smart_count: u32,
+    current_mcap: f64,
+    peak_mcap: f64,
+) -> bool {
+    if !cfg.enabled || !is_a_plus || smart_count > 0 {
+        return false;
+    }
+    if peak_mcap < cfg.min_mcap_sol || current_mcap < cfg.min_mcap_sol {
+        return false;
+    }
+    peak_mcap > 0.0 && current_mcap >= peak_mcap * cfg.near_peak_ratio
+}
+
+/// Strong enough first confirm to skip the deferred A+ peak re-check.
+pub fn continuation_confirm_strong(
+    cfg: &crate::scoring::config::ContinuationAplusPeakGuardConfig,
+    confirm: &[EarlyTapePoint],
+    baseline_buyer_count: u64,
+) -> bool {
+    if confirm.len() < 2 {
+        return false;
+    }
+    let first = &confirm[0];
+    let last = confirm.last().unwrap();
+    if last.mcap_sol < first.mcap_sol {
+        return false;
+    }
+    let (upticks, new_buyers) = continuation_strength(confirm, baseline_buyer_count);
+    upticks >= cfg.strong_upticks && new_buyers >= cfg.strong_new_buyers
+}
+
+/// Whether a failed first confirm may defer skip for a second-look poll.
+pub fn continuation_second_look_eligible(
+    cfg: &crate::scoring::config::ContinuationSecondLookConfig,
+    is_a_plus: bool,
+    score: i32,
+    first_fail_reason: &str,
+) -> bool {
+    cfg.enabled
+        && (is_a_plus || score >= cfg.min_score)
+        && matches!(
+            first_fail_reason,
+            "cont_b2s_worsening" | "cont_sell_absorption"
+        )
+}
+
+/// After `wait_ms`, re-poll the tape. Skip if mcap keeps falling with no demand;
+/// pass if mcap recovers, an uptick appears, or new unique buyers show up.
+pub fn evaluate_continuation_second_look(
+    ref_mcap_sol: f64,
+    baseline_buyer_count: u64,
+    recheck: &[EarlyTapePoint],
+) -> Result<(), &'static str> {
+    if recheck.len() < 2 {
+        return Err("cont_second_look_no_data");
+    }
+    let first = &recheck[0];
+    let last = recheck.last().unwrap();
+    let (upticks, new_buyers) = continuation_strength(recheck, baseline_buyer_count);
+
+    let mcap_below_ref = last.mcap_sol < ref_mcap_sol;
+    let mcap_falling_in_window = last.mcap_sol < first.mcap_sol;
+    if mcap_below_ref && mcap_falling_in_window && upticks == 0 && new_buyers == 0 {
+        return Err("cont_second_look_mcap_fall");
+    }
+
+    let recovery = last.mcap_sol > ref_mcap_sol || upticks >= 1 || new_buyers >= 1;
+    if recovery {
+        Ok(())
+    } else {
+        Err("cont_second_look_no_recovery")
+    }
+}
+
 /// Strength of the confirmation poll: `(upticks, new_unique_buyers)`.
 /// `upticks` = number of confirm slices where mcap rose vs the previous slice;
 /// `new_buyers` = unique buyers gained from the scoring baseline to window end.
@@ -926,6 +1004,90 @@ mod continuation_tests {
         let (upticks, new_buyers) = continuation_strength(&[], 20);
         assert_eq!((upticks, new_buyers), (0, 0));
     }
+
+    #[test]
+    fn second_look_eligible_only_strong_and_retry_reasons() {
+        use crate::scoring::config::ContinuationSecondLookConfig;
+        let cfg = ContinuationSecondLookConfig::default();
+        assert!(continuation_second_look_eligible(
+            &cfg,
+            true,
+            8,
+            "cont_b2s_worsening"
+        ));
+        assert!(continuation_second_look_eligible(
+            &cfg,
+            false,
+            10,
+            "cont_sell_absorption"
+        ));
+        assert!(!continuation_second_look_eligible(
+            &cfg,
+            false,
+            9,
+            "cont_b2s_worsening"
+        ));
+        assert!(!continuation_second_look_eligible(
+            &cfg,
+            true,
+            10,
+            "cont_no_uptick"
+        ));
+    }
+
+    #[test]
+    fn second_look_passes_on_recovery_uptick() {
+        let ref_mcap = 90.0;
+        let recheck = vec![pt(30, 20.0, 0, 88.0), pt(33, 22.0, 0, 92.0)];
+        assert_eq!(
+            evaluate_continuation_second_look(ref_mcap, 30, &recheck),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn second_look_fails_when_mcap_keeps_falling() {
+        let ref_mcap = 90.0;
+        let recheck = vec![pt(30, 20.0, 0, 88.0), pt(30, 20.1, 0, 85.0)];
+        assert_eq!(
+            evaluate_continuation_second_look(ref_mcap, 30, &recheck),
+            Err("cont_second_look_mcap_fall")
+        );
+    }
+
+    #[test]
+    fn second_look_passes_on_new_buyers_despite_dip() {
+        let ref_mcap = 90.0;
+        let recheck = vec![pt(30, 20.0, 0, 88.0), pt(35, 21.0, 0, 87.0)];
+        assert_eq!(
+            evaluate_continuation_second_look(ref_mcap, 30, &recheck),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn aplus_peak_guard_flags_high_peak_no_smart() {
+        use crate::scoring::config::ContinuationAplusPeakGuardConfig;
+        let cfg = ContinuationAplusPeakGuardConfig::default();
+        assert!(aplus_peak_no_smart_guard(&cfg, true, 0, 120.0, 120.0));
+        assert!(!aplus_peak_no_smart_guard(&cfg, true, 1, 120.0, 120.0));
+        assert!(!aplus_peak_no_smart_guard(&cfg, false, 0, 120.0, 120.0));
+        assert!(!aplus_peak_no_smart_guard(&cfg, true, 0, 80.0, 120.0));
+    }
+
+    #[test]
+    fn continuation_confirm_strong_requires_upticks_and_buyers() {
+        use crate::scoring::config::ContinuationAplusPeakGuardConfig;
+        let cfg = ContinuationAplusPeakGuardConfig::default();
+        let weak = vec![pt(20, 10.0, 0, 100.0), pt(22, 11.0, 0, 101.0)];
+        assert!(!continuation_confirm_strong(&cfg, &weak, 20));
+        let strong = vec![
+            pt(20, 10.0, 0, 100.0),
+            pt(23, 12.0, 0, 103.0),
+            pt(26, 14.0, 0, 106.0),
+        ];
+        assert!(continuation_confirm_strong(&cfg, &strong, 20));
+    }
 }
 
 #[cfg(test)]
@@ -939,7 +1101,7 @@ mod strong_a_bypass_tests {
     }
 
     fn strong_f() -> TokenFeatures {
-        let mut f = TokenFeatures {
+        let f = TokenFeatures {
             mint: Address::default(),
             dev: Address::default(),
             dev_has_history: false,

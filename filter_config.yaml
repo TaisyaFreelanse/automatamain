@@ -240,6 +240,21 @@ scoring:
     max_b2s_drop_ratio: 0.6
     max_sell_absorption_ratio: 1.5
     min_buys_per_sec: 0.0
+    # Strong setups (A+ or score>=10): on cont_b2s_worsening / cont_sell_absorption only,
+    # wait and re-poll before final skip. Weak tiers / other cont reasons unchanged.
+    second_look:
+      enabled: true
+      wait_ms: 1250
+      recheck_window_ms: 1200
+      recheck_slices: 3
+      min_score: 10
+    # A+ without smart at high local peak: never buy on one weak confirm pass alone.
+    aplus_peak_guard:
+      enabled: true
+      near_peak_ratio: 0.97
+      min_mcap_sol: 90.0
+      strong_upticks: 2
+      strong_new_buyers: 2
   # Anti-parabolic peak gate: skip weak A-tier entries with no smart money bought
   # at the local peak unless the confirm window shows strong fresh demand. A+ /
   # smart-money / runner setups are exempt. Ships dark (enabled: false).
@@ -307,6 +322,9 @@ dev_blacklist:
   cooldown_secs: 604800
   min_pnl_pct_for_sl: -30.0
   min_tick_drop_pct: 40.0
+  # Rug spikes → permanent ban (expires_at=0). Plain SL uses cooldown_secs only.
+  permanent_min_tick_drop_pct: 55.0
+  permanent_min_mcap_drop_pct: 60.0
 
 # Strategy controller — risk caps applied at the InitiateBuy gate inside the
 # position manager. None of these touch open positions.

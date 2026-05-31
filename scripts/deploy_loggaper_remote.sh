@@ -10,6 +10,7 @@ git fetch origin
 git reset --hard origin/main
 git log -1 --oneline
 cargo build --release --bin loggaper
+bash "$(dirname "$0")/deploy_preflight.sh"
 systemctl stop loggaper || true
 sleep 2
 cp target/release/loggaper "$INSTALL_BIN"

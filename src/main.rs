@@ -1138,12 +1138,14 @@ async fn main() {
                             let now = unix_now();
                             match dev_blacklist_create.active_for_dev(&dev_s, now).await {
                                 Ok(Some(active)) => {
-                                    let detail = loggaper::autobuy::dev_blacklist::format_skip_detail(
-                                        &active.reason,
-                                        &active.mint,
-                                    );
+                                    let (bl_label, detail) =
+                                        loggaper::autobuy::dev_blacklist::format_filter_skip(
+                                            &active.reason,
+                                            &active.mint,
+                                            active.expires_at,
+                                        );
                                     eprintln!(
-                                        "[FILTER] {} skipped: dev_blacklist ({detail})",
+                                        "[FILTER] {} skipped: {bl_label} ({detail})",
                                         general_create.mint
                                     );
                                     bot_metrics_create.note_filter_rejected();
@@ -1159,13 +1161,14 @@ async fn main() {
                                             "trigger_close_reason": active.close_reason,
                                             "expires_at": active.expires_at,
                                         });
+                                        let learning_reason = bl_label.clone();
                                         tokio::spawn(async move {
                                             let _ = log
                                                 .log_skipped(
                                                     &mint_s,
                                                     Some(dev_s.as_str()),
                                                     "filter_dev_blacklist",
-                                                    "dev_blacklist",
+                                                    &learning_reason,
                                                     payload,
                                                     ts,
                                                 )
@@ -1759,14 +1762,170 @@ async fn main() {
 
                             // Continuation gate (transient / fake momentum).
                             if cont_enabled {
-                                if let Err(reason) = features::evaluate_continuation(
+                                let is_a_plus = breakdown.tier == Tier::APlus;
+                                let sl_cfg = &cont_cfg.second_look;
+                                let peak_cfg = &cont_cfg.aplus_peak_guard;
+                                let peak_guard = features::aplus_peak_no_smart_guard(
+                                    peak_cfg,
+                                    is_a_plus,
+                                    smart_count,
+                                    current_mcap_sol,
+                                    peak_mcap_sol,
+                                );
+                                let first_cont = features::evaluate_continuation(
                                     cont_cfg,
                                     token_features.buy_to_sell_ratio,
                                     baseline_buyers,
                                     &confirm.points,
                                     cont_cfg.confirm_window_ms,
-                                    breakdown.tier == Tier::APlus,
-                                ) {
+                                    is_a_plus,
+                                );
+                                let mut continuation_skip_reason: Option<&'static str> = None;
+                                let needs_peak_defer = peak_guard
+                                    && (first_cont.is_err()
+                                        || !features::continuation_confirm_strong(
+                                            peak_cfg,
+                                            &confirm.points,
+                                            baseline_buyers,
+                                        ));
+
+                                if needs_peak_defer {
+                                    let first_note = match &first_cont {
+                                        Ok(()) => "first_pass_weak",
+                                        Err(r) => r,
+                                    };
+                                    eprintln!(
+                                        "[BUY] {} A+ peak no-smart guard: deferring ({}) \
+                                         smart={} mcap_now={:.1} mcap_peak={:.1} wait_ms={}",
+                                        general_create.mint,
+                                        first_note,
+                                        smart_count,
+                                        current_mcap_sol,
+                                        peak_mcap_sol,
+                                        sl_cfg.wait_ms,
+                                    );
+                                    tokio::time::sleep(std::time::Duration::from_millis(
+                                        sl_cfg.wait_ms.max(1),
+                                    ))
+                                    .await;
+                                    let recheck = features::observe_early_tape_points_live(
+                                        &launchpad_for_score,
+                                        mint_address,
+                                        sl_cfg.recheck_window_ms,
+                                        sl_cfg.recheck_slices,
+                                        None,
+                                    )
+                                    .await;
+                                    let second_cont = features::evaluate_continuation(
+                                        cont_cfg,
+                                        token_features.buy_to_sell_ratio,
+                                        baseline_buyers,
+                                        &recheck.points,
+                                        cont_cfg.confirm_window_ms,
+                                        is_a_plus,
+                                    );
+                                    match second_cont {
+                                        Ok(()) => {
+                                            eprintln!(
+                                                "[BUY] {} A+ peak guard recheck passed: \
+                                                 mcap_now={:.1}",
+                                                general_create.mint,
+                                                recheck.current_mcap_sol,
+                                            );
+                                        }
+                                        Err(reason) => {
+                                            if features::continuation_second_look_eligible(
+                                                sl_cfg,
+                                                is_a_plus,
+                                                breakdown.total,
+                                                reason,
+                                            ) {
+                                                match features::evaluate_continuation_second_look(
+                                                    recheck.current_mcap_sol,
+                                                    baseline_buyers,
+                                                    &recheck.points,
+                                                ) {
+                                                    Ok(()) => {
+                                                        eprintln!(
+                                                            "[BUY] {} A+ peak guard recovery \
+                                                             passed (was {}): mcap_now={:.1}",
+                                                            general_create.mint,
+                                                            reason,
+                                                            recheck.current_mcap_sol,
+                                                        );
+                                                    }
+                                                    Err(sl_reason) => {
+                                                        continuation_skip_reason =
+                                                            Some(sl_reason);
+                                                    }
+                                                }
+                                            } else {
+                                                continuation_skip_reason = Some(reason);
+                                            }
+                                        }
+                                    }
+                                } else if let Err(reason) = first_cont {
+                                    if features::continuation_second_look_eligible(
+                                        sl_cfg,
+                                        is_a_plus,
+                                        breakdown.total,
+                                        reason,
+                                    ) {
+                                        eprintln!(
+                                            "[BUY] {} continuation second-look: deferring {} \
+                                             (tier={:?} score={}) wait_ms={}",
+                                            general_create.mint,
+                                            reason,
+                                            breakdown.tier,
+                                            breakdown.total,
+                                            sl_cfg.wait_ms,
+                                        );
+                                        tokio::time::sleep(std::time::Duration::from_millis(
+                                            sl_cfg.wait_ms.max(1),
+                                        ))
+                                        .await;
+                                        let ref_mcap = confirm.current_mcap_sol;
+                                        let recheck = features::observe_early_tape_points_live(
+                                            &launchpad_for_score,
+                                            mint_address,
+                                            sl_cfg.recheck_window_ms,
+                                            sl_cfg.recheck_slices,
+                                            None,
+                                        )
+                                        .await;
+                                        match features::evaluate_continuation_second_look(
+                                            ref_mcap,
+                                            baseline_buyers,
+                                            &recheck.points,
+                                        ) {
+                                            Ok(()) => {
+                                                let (upticks, new_buyers) =
+                                                    features::continuation_strength(
+                                                        &recheck.points,
+                                                        baseline_buyers,
+                                                    );
+                                                eprintln!(
+                                                    "[BUY] {} continuation second-look passed \
+                                                     (was {}): ref_mcap={:.1} mcap_now={:.1} \
+                                                     upticks={} new_buyers={}",
+                                                    general_create.mint,
+                                                    reason,
+                                                    ref_mcap,
+                                                    recheck.current_mcap_sol,
+                                                    upticks,
+                                                    new_buyers,
+                                                );
+                                            }
+                                            Err(sl_reason) => {
+                                                continuation_skip_reason =
+                                                    Some(sl_reason);
+                                            }
+                                        }
+                                    } else {
+                                        continuation_skip_reason = Some(reason);
+                                    }
+                                }
+                                if let Some(reason) = continuation_skip_reason {
                                     eprintln!(
                                         "[BUY] {} skipped (continuation): {} | mcap_init={:.1} \
                                          mcap_now={:.1} baseline_buyers={} b2s={:.2}",

@@ -113,6 +113,12 @@ pub struct DevBlacklistConfig {
     /// Plain `SL` also blacklists when `tick_drop=` in close reason is at or above this %.
     #[serde(default = "dev_blacklist_default_min_tick_drop")]
     pub min_tick_drop_pct: f64,
+    /// Rug spike: `tick_drop=` at or above → permanent ban (not cooldown).
+    #[serde(default = "dev_blacklist_default_permanent_min_tick_drop")]
+    pub permanent_min_tick_drop_pct: f64,
+    /// Rug spike: `filt_mcap` vs `raw_mcap` drop % in close reason → permanent ban.
+    #[serde(default = "dev_blacklist_default_permanent_min_mcap_drop")]
+    pub permanent_min_mcap_drop_pct: f64,
 }
 
 impl Default for DevBlacklistConfig {
@@ -122,6 +128,8 @@ impl Default for DevBlacklistConfig {
             cooldown_secs: dev_blacklist_default_cooldown_secs(),
             min_pnl_pct_for_sl: dev_blacklist_default_min_pnl_pct(),
             min_tick_drop_pct: dev_blacklist_default_min_tick_drop(),
+            permanent_min_tick_drop_pct: dev_blacklist_default_permanent_min_tick_drop(),
+            permanent_min_mcap_drop_pct: dev_blacklist_default_permanent_min_mcap_drop(),
         }
     }
 }
@@ -137,6 +145,12 @@ fn dev_blacklist_default_min_pnl_pct() -> f64 {
 }
 fn dev_blacklist_default_min_tick_drop() -> f64 {
     40.0
+}
+fn dev_blacklist_default_permanent_min_tick_drop() -> f64 {
+    55.0
+}
+fn dev_blacklist_default_permanent_min_mcap_drop() -> f64 {
+    60.0
 }
 
 /// Knobs for the optional learning loop (see `crate::learning`).
