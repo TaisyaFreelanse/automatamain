@@ -280,3 +280,31 @@ impl Position {
         (dm / enter_mcap) * 100.0 / dt
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn position_key_same_mint_different_wallets() {
+        let mint: Address = "11111111111111111111111111111112"
+            .parse()
+            .unwrap();
+        let a = PositionKey {
+            mint,
+            wallet_id: "wallet_1".to_string(),
+        };
+        let b = PositionKey {
+            mint,
+            wallet_id: "wallet_2".to_string(),
+        };
+        assert_ne!(a, b);
+        let mut m = HashMap::new();
+        m.insert(a.clone(), 1);
+        m.insert(b.clone(), 2);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[&a], 1);
+        assert_eq!(m[&b], 2);
+    }
+}

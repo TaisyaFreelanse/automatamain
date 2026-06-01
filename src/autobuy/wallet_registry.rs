@@ -321,3 +321,36 @@ pub async fn build_wallet_registry(
         mode_label,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn amount_for_signal_uses_wallet_override() {
+        let h = WalletHandle {
+            id: "wallet_2".to_string(),
+            label: "Copy".to_string(),
+            enabled: AtomicBool::new(true),
+            size_sol: RwLock::new(Some(0.05)),
+            private_key_env: "PRIVATE_KEY_WALLET_2".to_string(),
+            pubkey: "pub".to_string(),
+            wallet_address: "11111111111111111111111111111111"
+                .parse()
+                .unwrap(),
+            broker: Arc::new(MockBroker::new(1.0)),
+            balance: AtomicU64::new(1.0f64.to_bits()),
+        };
+        assert!((h.amount_for_signal(0.4) - 0.05).abs() < f64::EPSILON);
+        h.set_size_sol(None);
+        assert!((h.amount_for_signal(0.4) - 0.4).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn default_wallet_entries_single_main() {
+        let e = default_wallet_entries();
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].id, "wallet_1");
+        assert_eq!(e[0].private_key_env, "PRIVATE_KEY");
+    }
+}
