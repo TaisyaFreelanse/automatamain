@@ -38,6 +38,9 @@ pub struct WalletEntryConfig {
     /// Demo mode starting balance for this wallet (defaults to global `start_balance_sol`).
     #[serde(default)]
     pub demo_balance_sol: Option<f64>,
+    /// Optional env var for a dedicated RPC URL (falls back to `SOLANA_RPC_URL` / `SOLANA_HTTP`).
+    #[serde(default)]
+    pub rpc_url_env: Option<String>,
 }
 
 fn default_wallet_enabled() -> bool {
@@ -200,6 +203,7 @@ pub fn default_wallet_entries() -> Vec<WalletEntryConfig> {
         private_key_env: "PRIVATE_KEY".to_string(),
         size_sol: None,
         demo_balance_sol: None,
+        rpc_url_env: None,
     }]
 }
 
@@ -255,12 +259,21 @@ pub async fn build_wallet_registry(
                         ));
                     }
                 };
-                let rpc_url = std::env::var("SOLANA_RPC_URL")
-                    .or_else(|_| std::env::var("SOLANA_HTTP"))
-                    .map_err(|_| {
-                        "SOLANA_RPC_URL (or SOLANA_HTTP) env var must be set for live mode"
-                            .to_string()
-                    })?;
+                let rpc_url = if let Some(ref env_key) = cfg.rpc_url_env {
+                    std::env::var(env_key).map_err(|_| {
+                        format!(
+                            "env {env_key} must be set for wallet {} (rpc_url_env)",
+                            cfg.id
+                        )
+                    })?
+                } else {
+                    std::env::var("SOLANA_RPC_URL")
+                        .or_else(|_| std::env::var("SOLANA_HTTP"))
+                        .map_err(|_| {
+                            "SOLANA_RPC_URL (or SOLANA_HTTP) env var must be set for live mode"
+                                .to_string()
+                        })?
+                };
                 let keypair = Arc::new(Keypair::from_base58_string(&private_key));
                 let pubkey = keypair.pubkey().to_string();
                 let wallet_address: Address = pubkey

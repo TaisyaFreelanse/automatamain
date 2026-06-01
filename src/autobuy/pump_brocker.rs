@@ -173,7 +173,8 @@ impl SolanaBroker {
         label: &str,
     ) -> Result<(), BrokerError> {
         const TIMEOUT: Duration = Duration::from_secs(90);
-        const POLL: Duration = Duration::from_millis(400);
+        const POLL_FAST: Duration = Duration::from_millis(150);
+        const POLL_SLOW: Duration = Duration::from_millis(400);
         let started = std::time::Instant::now();
 
         loop {
@@ -203,6 +204,12 @@ impl SolanaBroker {
                     );
                     return Ok(());
                 }
+                if status.satisfies_commitment(CommitmentConfig::processed()) {
+                    eprintln!(
+                        "[BROKER TX] {label}: {signature} processed (accepting early)"
+                    );
+                    return Ok(());
+                }
             }
 
             if started.elapsed() >= TIMEOUT {
@@ -211,7 +218,12 @@ impl SolanaBroker {
                      (sig={signature})"
                 )));
             }
-            tokio::time::sleep(POLL).await;
+            let poll = if started.elapsed() < Duration::from_secs(3) {
+                POLL_FAST
+            } else {
+                POLL_SLOW
+            };
+            tokio::time::sleep(poll).await;
         }
     }
 

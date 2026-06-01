@@ -21,7 +21,9 @@ use loggaper::{
         postgres::creators::CreatorsRepositoryPostgres,
         tokens::TokenRepository,
         traders::{TraderEntry, TraderRepository},
+        write_queue::PersistenceWriteQueue,
     },
+    telemetry::buy_latency::BuyLatencyRegistry,
     pipelines::pump::PumpPipeline,
     scoring::{
         anti_rug::entry_skip_reason,
@@ -193,16 +195,17 @@ async fn main() {
     setup_logging();
     let config = Arc::new(load_config().unwrap());
     let pool = setup_postgres_pool(30).await;
-    let (creators, tokens, trades, bot_trades_pg, dev_blacklist_pg) =
+    let analytics_pool = setup_postgres_pool(8).await;
+    let buy_latency = Arc::new(BuyLatencyRegistry::default());
+    let (_creators_main, tokens, trades, bot_trades_pg, dev_blacklist_pg) =
         setup_repositories(pool.clone()).await;
+    let creators = Arc::new(CreatorsRepositoryPostgres::new(analytics_pool));
     let bot_trades_pg = Arc::new(bot_trades_pg);
     let dev_blacklist: Arc<dyn loggaper::persistence::dev_blacklist::DevBlacklistRepository + Send + Sync> =
         Arc::new(dev_blacklist_pg);
-    let (creators, tokens, trades) = (
-        Arc::new(creators),
-        Arc::new(tokens),
-        Arc::new(trades),
-    );
+    let tokens = Arc::new(tokens);
+    let trades: Arc<dyn TraderRepository + Send + Sync> = Arc::new(trades);
+    let write_queue = PersistenceWriteQueue::spawn(pool.clone(), trades.clone());
     let bot_trades: Arc<dyn loggaper::persistence::bot_trades::BotTradeRepository + Send + Sync> =
         bot_trades_pg.clone();
     let post_exit_repo: Arc<
@@ -297,6 +300,7 @@ async fn main() {
             Some(dev_ranker_handle.clone()),
             Some(smart_money_handle.clone()),
             learning_log.clone(),
+            Some(buy_latency.clone()),
         );
 
     if config.learning.enabled {
@@ -905,6 +909,7 @@ async fn main() {
                         private_key_env: w.private_key_env.clone(),
                         size_sol: w.size_sol(),
                         demo_balance_sol: None,
+                        rpc_url_env: None,
                     });
                 }
             }
@@ -1261,7 +1266,9 @@ async fn main() {
 
                 tokio::spawn({
                     let creators = creators.clone();
+                    let buy_latency_create = buy_latency.clone();
                     async move {
+                        buy_latency_create.on_created(mint_address);
                         let unix_now = || {
                             SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -1484,12 +1491,10 @@ async fn main() {
                         .await;
                         let tape_points = tape_observe.points;
 
-                        let scoring_bucket = features::fetch_live_bucket(
-                            &launchpad_for_score,
-                            mint_address,
-                        )
-                        .await
-                        .unwrap_or(bucket_for_score.clone());
+                        let scoring_bucket = tape_observe
+                            .last_bucket
+                            .clone()
+                            .unwrap_or(bucket_for_score.clone());
 
                         let pool_mcap = |b: &loggaper::launchpads::token_bucket::TokenBucket| {
                             b.pool().market_cap().amount().to_float()
@@ -2207,6 +2212,8 @@ async fn main() {
                         let learning_snapshot =
                             LearningTradeSnapshot::from_scoring(&token_features, &breakdown);
 
+                        buy_latency_create.on_score_done(mint_address);
+
                         if tx
                             .send(PositionMessage::InitiateBuy {
                                 pool: scoring_bucket.pool().clone_box(),
@@ -2290,15 +2297,13 @@ async fn main() {
                     }
                 });
 
-                tokio::spawn({
+                {
                     let trade_action = trade_action.clone();
-                    let trades = trades.clone();
+                    let write_queue = write_queue.clone();
                     let waiter = waiter_handle.clone();
                     let bucket = bucket.clone();
-                    let tape_pool = pool.clone();
-                    let _tx = manager_tx.clone();
 
-                    async move {
+                    tokio::spawn(async move {
                         waiter.wait_for(trade_action.mint()).await;
 
                         let trader = match bucket.swarm().get_trader(trade_action.trader()).await {
@@ -2308,13 +2313,7 @@ async fn main() {
 
                         let mint_s = trade_action.mint().to_string();
                         let mcap_sol = bucket.pool().market_cap().amount().to_float();
-                        let _ = loggaper::persistence::coin_mcap_tape::record(
-                            &tape_pool,
-                            &mint_s,
-                            mcap_sol,
-                            "trade",
-                        )
-                        .await;
+                        write_queue.try_enqueue_tape(mint_s.clone(), mcap_sol, "trade");
 
                         let entry = TraderEntry {
                             trader_address: trade_action.trader().to_string(),
@@ -2327,11 +2326,9 @@ async fn main() {
                             role: trader.trader_type(),
                         };
 
-                        if let Err(_err) = trades.save_trade(entry).await {
-                            println!("error while saving {}", bucket.pool().mint());
-                        }
-                    }
-                });
+                        write_queue.try_enqueue_trade(entry);
+                    });
+                }
             }
         }
     }

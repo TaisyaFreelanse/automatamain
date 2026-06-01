@@ -96,6 +96,15 @@ fn default_wallet_id() -> String {
     "wallet_1".to_string()
 }
 
+/// TX LOG shows main wallet only; copy wallet trades appear in HISTORY / OPEN.
+fn primary_tx_log_wallet() -> &'static str {
+    "wallet_1"
+}
+
+fn show_in_tx_log(wallet_id: &str) -> bool {
+    wallet_id == primary_tx_log_wallet()
+}
+
 fn pos_map_key(mint: &str, wallet_id: &str) -> String {
     format!("{mint}:{wallet_id}")
 }
@@ -648,8 +657,8 @@ struct Dashboard {
     /// Sticky alert when live bot cannot Jupiter-sell; operator must sell manually.
     manual_sell_alert: Option<ManualSellAlert>,
     wallets: Vec<WalletWire>,
-    /// "all" or a wallet id — filters HISTORY rows.
-    history_wallet_filter: String,
+    /// Global wallet context: `"all"` | `wallet_1` | `wallet_2` — stats, OPEN, HISTORY.
+    wallet_view: String,
     wallet_save_status: Option<String>,
 }
 
@@ -707,24 +716,97 @@ impl Dashboard {
             mint_copy_flash_until: None,
             manual_sell_alert: None,
             wallets: Vec::new(),
-            history_wallet_filter: "all".to_string(),
+            wallet_view: "all".to_string(),
             wallet_save_status: None,
         }
     }
 
+    fn wallet_view_label(&self) -> String {
+        if self.wallet_view == "all" {
+            "All".to_string()
+        } else {
+            self.wallet_view.clone()
+        }
+    }
+
+    fn wallet_matches_view(&self, wallet_id: &str) -> bool {
+        self.wallet_view == "all" || self.wallet_view == wallet_id
+    }
+
     fn filtered_history(&self) -> Vec<&BotTradeRow> {
-        if self.history_wallet_filter == "all" {
+        if self.wallet_view == "all" {
             self.history.iter().collect()
         } else {
             self.history
                 .iter()
-                .filter(|t| t.wallet_id == self.history_wallet_filter)
+                .filter(|t| t.wallet_id == self.wallet_view)
                 .collect()
         }
     }
 
-    fn combined_open_pnl(&self) -> f64 {
-        self.open.values().map(|p| p.pnl).sum()
+    fn filtered_open_positions(&self) -> Vec<&Position> {
+        self.open
+            .values()
+            .filter(|p| self.wallet_matches_view(&p.wallet_id))
+            .collect()
+    }
+
+    /// Balance for the active wallet view (sum for All, single wallet otherwise).
+    fn context_balance_sol(&self) -> Option<f64> {
+        if !self.wallets.is_empty() {
+            if self.wallet_view == "all" {
+                return Some(self.wallets.iter().map(|w| w.balance_sol).sum());
+            }
+            return self
+                .wallets
+                .iter()
+                .find(|w| w.id == self.wallet_view)
+                .map(|w| w.balance_sol);
+        }
+        self.balance
+    }
+
+    fn context_pubkey_display(&self) -> String {
+        if self.wallet_view == "all" {
+            if self.wallets.is_empty() {
+                return self.pubkey.clone().unwrap_or_else(|| "…".to_string());
+            }
+            let n = self.wallets.len();
+            return format!("All ({n} wallets)");
+        }
+        self.wallets
+            .iter()
+            .find(|w| w.id == self.wallet_view)
+            .map(|w| w.pubkey.clone())
+            .or_else(|| self.pubkey.clone())
+            .unwrap_or_else(|| "…".to_string())
+    }
+
+    fn context_open_pnl(&self) -> f64 {
+        self.filtered_open_positions()
+            .iter()
+            .map(|p| p.pnl)
+            .sum()
+    }
+
+    /// Estimated realized SOL from closed trades in the current view.
+    fn context_realized_pnl_sol(&self) -> f64 {
+        self.filtered_history()
+            .iter()
+            .map(|t| t.invested_sol * t.realized_pnl_pct / 100.0)
+            .sum()
+    }
+
+    /// Buy size shown in the header: per-wallet override or operator cap.
+    fn display_buy_size_sol(&self) -> Option<f64> {
+        if self.wallet_view != "all" {
+            if let Some(w) = self.wallets.iter().find(|w| w.id == self.wallet_view) {
+                if let Some(sz) = w.size_sol {
+                    return Some(sz);
+                }
+            }
+        }
+        self.config_panel.buy_size_remote
     }
 
     fn wire_to_position(w: OpenPositionWire) -> Position {
@@ -919,7 +1001,7 @@ impl Dashboard {
                     }
                     WsMsg::TxEvent {
                         kind,
-                        wallet_id: _,
+                        wallet_id,
                         mint,
                         signature,
                         amount_sol,
@@ -940,24 +1022,26 @@ impl Dashboard {
                         }
                         let refresh_history =
                             kind == TxEventKind::Sell && status == "confirmed";
-                        if self.tx_log.len() >= 256 {
-                            self.tx_log.pop_front();
+                        if show_in_tx_log(&wallet_id) {
+                            if self.tx_log.len() >= 256 {
+                                self.tx_log.pop_front();
+                            }
+                            self.tx_log.push_back(TxLogRow {
+                                kind,
+                                mint,
+                                signature,
+                                amount_sol,
+                                amount_sol_estimated,
+                                status,
+                                reason,
+                                mode,
+                                ts,
+                                v3_tape,
+                                time_kill_detail,
+                                pnl_mcap_pct,
+                                pnl_sol_pct,
+                            });
                         }
-                        self.tx_log.push_back(TxLogRow {
-                            kind,
-                            mint,
-                            signature,
-                            amount_sol,
-                            amount_sol_estimated,
-                            status,
-                            reason,
-                            mode,
-                            ts,
-                            v3_tape,
-                            time_kill_detail,
-                            pnl_mcap_pct,
-                            pnl_sol_pct,
-                        });
                         if refresh_history {
                             send_dash_cmd(&self.cmd_tx, DashCmd::RefreshBotTradesAfterClose);
                         }
@@ -1700,11 +1784,11 @@ impl eframe::App for Dashboard {
 
         // ── Periodic HTTP poll for mode + tx log ──────────────────────────────
         // /mode and /tx-log are not pushed through WS (HTTP is the source of
-        // truth). Re-poll every 5s while the dashboard is alive so a switch
+        // truth). Re-poll every 15s while the dashboard is alive so a switch
         // performed from another client is reflected here too.
         let should_poll = self
             .last_http_poll
-            .map(|t| t.elapsed() >= Duration::from_secs(5))
+            .map(|t| t.elapsed() >= Duration::from_secs(15))
             .unwrap_or(true);
         if should_poll {
             send_dash_cmd(&self.cmd_tx, DashCmd::FetchMode);
@@ -1792,6 +1876,23 @@ impl eframe::App for Dashboard {
                 }
                 ui.separator();
 
+                ui.label("Wallet:");
+                egui::ComboBox::from_id_salt("wallet_view_top")
+                    .selected_text(self.wallet_view_label())
+                    .width(110.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.wallet_view, "all".to_string(), "All");
+                        for w in self.wallets.clone() {
+                            let label = if w.label.is_empty() {
+                                w.id.clone()
+                            } else {
+                                format!("{} ({})", w.id, w.label)
+                            };
+                            ui.selectable_value(&mut self.wallet_view, w.id.clone(), label);
+                        }
+                    });
+                ui.separator();
+
                 let (lbl, col) = if self.paused {
                     ("▶ RESUME", egui::Color32::from_rgb(100, 220, 100))
                 } else {
@@ -1829,13 +1930,24 @@ impl eframe::App for Dashboard {
                 }
                 ui.separator();
 
-                match self.balance {
+                match self.context_balance_sol() {
                     Some(b) => {
-                        ui.label("Balance:");
+                        let bal_lbl = if self.wallet_view == "all" {
+                            "Balance (combined):"
+                        } else {
+                            "Balance:"
+                        };
+                        ui.label(bal_lbl);
                         ui.colored_label(egui::Color32::from_rgb(255, 215, 0), self.usd_val(b, 2));
+                        ui.label(
+                            egui::RichText::new(format!("{b:.4} SOL"))
+                                .small()
+                                .color(egui::Color32::GRAY),
+                        );
                         if let Some(p) = self.sol_price {
                             ui.label(
-                                egui::RichText::new(format!("(SOL: ${:.2})", p))
+                                egui::RichText::new(format!("(@ ${:.2}/SOL)", p))
+                                    .small()
                                     .color(egui::Color32::GRAY),
                             );
                         }
@@ -1846,39 +1958,51 @@ impl eframe::App for Dashboard {
                 }
 
                 ui.separator();
-                match &self.pubkey.clone() {
-                    Some(pk) => {
-                        ui.label("Wallet:");
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new(format!("📋 {}", short_addr(pk)))
-                                        .monospace()
-                                        .color(egui::Color32::from_rgb(180, 180, 255)),
-                                )
-                                .frame(false),
+                let pk_disp = self.context_pubkey_display();
+                ui.label("Address:");
+                if self.wallet_view != "all" && pk_disp != "…" {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(format!("📋 {}", short_addr(&pk_disp)))
+                                    .monospace()
+                                    .color(egui::Color32::from_rgb(180, 180, 255)),
                             )
-                            .on_hover_text(format!("Click to copy: {}", pk))
-                            .clicked()
-                        {
-                            ctx.copy_text(pk.clone());
-                        }
+                            .frame(false),
+                        )
+                        .on_hover_text(format!("Click to copy: {pk_disp}"))
+                        .clicked()
+                    {
+                        ctx.copy_text(pk_disp.clone());
                     }
-                    None => {
-                        ui.colored_label(egui::Color32::GRAY, "Wallet: …");
-                    }
+                } else {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(180, 180, 255),
+                        egui::RichText::new(&pk_disp).small(),
+                    );
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(format!("open: {}", self.open.len()));
-                    // Quick buy-size readout on the right
-                    if let Some(bs) = self.config_panel.buy_size_remote {
+                    if let Some(bs) = self.display_buy_size_sol() {
                         ui.separator();
+                        let buy_lbl = if self.wallet_view == "all" {
+                            format!("buy cap: {bs:.4} SOL")
+                        } else {
+                            format!("buy: {bs:.4} SOL")
+                        };
                         ui.colored_label(
                             egui::Color32::from_rgb(180, 220, 255),
-                            format!("buy: {:.4} SOL", bs),
+                            buy_lbl,
                         );
                     }
+                    ui.separator();
+                    let open_n = self.filtered_open_positions().len();
+                    let open_lbl = if self.wallet_view == "all" {
+                        format!("open: {open_n}")
+                    } else {
+                        format!("open ({}) : {open_n}", self.wallet_view)
+                    };
+                    ui.label(open_lbl);
                 });
             });
         });
@@ -1886,7 +2010,8 @@ impl eframe::App for Dashboard {
         // ── Stats bar ─────────────────────────────────────────────────────────
         {
             let hist = self.filtered_history();
-            if !hist.is_empty() || !self.open.is_empty() {
+            let open_positions = self.filtered_open_positions();
+            if !hist.is_empty() || !open_positions.is_empty() {
                 egui::TopBottomPanel::top("stats_bar").show(ctx, |ui| {
                     let wins = hist.iter().filter(|t| t.realized_pnl_pct > 0.0).count();
                     let winrate = if hist.is_empty() {
@@ -1899,8 +2024,15 @@ impl eframe::App for Dashboard {
                     } else {
                         hist.iter().map(|t| t.realized_pnl_pct).sum::<f64>() / hist.len() as f64
                     };
-                    let open_pnl = self.combined_open_pnl();
+                    let open_pnl = self.context_open_pnl();
+                    let realized_sol = self.context_realized_pnl_sol();
                     ui.horizontal(|ui| {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(200, 210, 255),
+                            egui::RichText::new(format!("Stats · {}", self.wallet_view_label()))
+                                .strong(),
+                        );
+                        ui.separator();
                         ui.label(format!("Trades: {}", hist.len()));
                         ui.separator();
                         ui.label("Winrate:");
@@ -1909,12 +2041,30 @@ impl eframe::App for Dashboard {
                         ui.label("Avg PnL (hist):");
                         ui.colored_label(pnl_color(avg_pnl), format!("{avg_pnl:+.2}%"));
                         ui.separator();
+                        ui.label("Realized (est):");
+                        ui.colored_label(
+                            pnl_color(realized_sol.signum() * 10.0),
+                            format!("{realized_sol:+.4} SOL"),
+                        );
+                        ui.separator();
                         ui.label("Open PnL (sum):");
                         ui.colored_label(pnl_color(open_pnl), format!("{open_pnl:+.2}%"));
-                        for w in &self.wallets {
-                            ui.separator();
-                            ui.label(format!("{}:", w.id));
-                            ui.label(format!("{:.3} SOL", w.balance_sol));
+                        ui.separator();
+                        if self.wallet_view == "all" {
+                            for w in &self.wallets {
+                                ui.label(format!("{}:", w.id));
+                                ui.label(format!("{:.3} SOL", w.balance_sol));
+                                ui.separator();
+                            }
+                        } else if let Some(w) =
+                            self.wallets.iter().find(|w| w.id == self.wallet_view)
+                        {
+                            ui.label(format!("{} bal:", w.id));
+                            ui.label(format!("{:.4} SOL", w.balance_sol));
+                            if let Some(sz) = w.size_sol {
+                                ui.separator();
+                                ui.label(format!("size: {sz:.4} SOL"));
+                            }
                         }
                     });
                 });
@@ -1940,9 +2090,20 @@ impl eframe::App for Dashboard {
             let third = (ui.available_height() / 3.0).max(80.0);
 
             // ── Open positions ────────────────────────────────────────────────
-            ui.label(egui::RichText::new("OPEN").strong().size(14.0));
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("OPEN").strong().size(14.0));
+                ui.label(
+                    egui::RichText::new(format!("· {}", self.wallet_view_label()))
+                        .color(egui::Color32::GRAY),
+                );
+            });
             ui.separator();
-            let mut open_addresses: Vec<String> = self.open.keys().cloned().collect();
+            let mut open_addresses: Vec<String> = self
+                .open
+                .iter()
+                .filter(|(_, p)| self.wallet_matches_view(&p.wallet_id))
+                .map(|(k, _)| k.clone())
+                .collect();
             open_addresses.sort();
             egui::ScrollArea::vertical()
                 .id_salt("open_scroll")
@@ -2246,26 +2407,10 @@ impl eframe::App for Dashboard {
             // ── History ───────────────────────────────────────────────────────
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("HISTORY").strong().size(14.0));
-                ui.separator();
-                egui::ComboBox::from_id_salt("hist_wallet_filter")
-                    .selected_text(&self.history_wallet_filter)
-                    .show_ui(ui, |ui| {
-                        if ui.selectable_value(&mut self.history_wallet_filter, "all".to_string(), "All wallets").changed() {
-                            let _ = self.cmd_tx.try_send(DashCmd::FetchBotTrades);
-                        }
-                        for w in &self.wallets.clone() {
-                            if ui
-                                .selectable_value(
-                                    &mut self.history_wallet_filter,
-                                    w.id.clone(),
-                                    &w.id,
-                                )
-                                .changed()
-                            {
-                                let _ = self.cmd_tx.try_send(DashCmd::FetchBotTrades);
-                            }
-                        }
-                    });
+                ui.label(
+                    egui::RichText::new(format!("· {}", self.wallet_view_label()))
+                        .color(egui::Color32::GRAY),
+                );
             });
             ui.separator();
 
@@ -2597,7 +2742,7 @@ async fn ws_loop(
                                                     .filter_map(|m| match m {
                                                         WsMsg::TxEvent {
                                                             kind,
-                                                            wallet_id: _,
+                                                            wallet_id,
                                                             mint,
                                                             signature,
                                                             amount_sol,
@@ -2610,7 +2755,7 @@ async fn ws_loop(
                                                             time_kill_detail,
                                                             pnl_mcap_pct,
                                                             pnl_sol_pct,
-                                                        } => Some(TxLogRow {
+                                                        } if show_in_tx_log(&wallet_id) => Some(TxLogRow {
                                                             kind,
                                                             mint,
                                                             signature,

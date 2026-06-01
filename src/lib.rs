@@ -12,3 +12,4 @@ pub mod scoring;
 pub mod trading;
 
 pub mod setup;
+pub mod telemetry;

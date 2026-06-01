@@ -181,13 +181,15 @@ pub fn momentum_peak_pct(initial_mcap_sol: f64, peak_mcap_sol: f64) -> f64 {
 }
 
 /// Result of the live early-tape observer (may end before full `window_ms`).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct EarlyTapeObserveResult {
     pub points: Vec<EarlyTapePoint>,
     pub initial_mcap_sol: f64,
     pub peak_mcap_sol: f64,
     pub current_mcap_sol: f64,
     pub exited_early: bool,
+    /// Last launchpad bucket fetched during the observe window (avoids a duplicate fetch).
+    pub last_bucket: Option<TokenBucket>,
 }
 
 /// Live bucket from launchpad storage (pool state includes trades since create).
@@ -209,6 +211,7 @@ pub async fn fetch_live_bucket(
 fn finalize_tape_observe(
     points: Vec<EarlyTapePoint>,
     exited_early: bool,
+    last_bucket: Option<TokenBucket>,
 ) -> EarlyTapeObserveResult {
     let initial_mcap_sol = points.first().map(|p| p.mcap_sol).unwrap_or(0.0);
     let peak_mcap_sol = points
@@ -222,6 +225,7 @@ fn finalize_tape_observe(
         peak_mcap_sol,
         current_mcap_sol,
         exited_early,
+        last_bucket,
     }
 }
 
@@ -245,18 +249,19 @@ pub async fn observe_early_tape_points_live(
     let window_ms = window_ms.max(1);
     if s <= 1 {
         tokio::time::sleep(std::time::Duration::from_millis(window_ms)).await;
-        let points = if let Some(bucket) = fetch_live_bucket(launchpad, mint).await {
-            vec![snapshot_early_tape(&bucket).await]
+        let (points, last_bucket) = if let Some(bucket) = fetch_live_bucket(launchpad, mint).await {
+            (vec![snapshot_early_tape(&bucket).await], Some(bucket))
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
-        return finalize_tape_observe(points, false);
+        return finalize_tape_observe(points, false, last_bucket);
     }
 
     let slice_ms = (window_ms / s).max(1);
     let mut out: Vec<EarlyTapePoint> = Vec::with_capacity(s as usize);
     let mut initial_mcap_sol = 0.0_f64;
     let mut peak_mcap_sol = 0.0_f64;
+    let mut last_bucket: Option<TokenBucket> = None;
 
     for i in 0..s {
         if i > 0 {
@@ -265,6 +270,7 @@ pub async fn observe_early_tape_points_live(
         let Some(bucket) = fetch_live_bucket(launchpad, mint).await else {
             continue;
         };
+        last_bucket = Some(bucket.clone());
         let point = snapshot_early_tape(&bucket).await;
         if out.is_empty() {
             initial_mcap_sol = point.mcap_sol;
@@ -276,7 +282,7 @@ pub async fn observe_early_tape_points_live(
 
         if let Some(low) = early_exit_momentum_low_pct {
             if tape_hit_momentum_low(initial_mcap_sol, peak_mcap_sol, low) {
-                return finalize_tape_observe(out, true);
+                return finalize_tape_observe(out, true, last_bucket);
             }
         }
     }
@@ -285,9 +291,10 @@ pub async fn observe_early_tape_points_live(
     if window_ms > used {
         tokio::time::sleep(std::time::Duration::from_millis(window_ms - used)).await;
         if let Some(bucket) = fetch_live_bucket(launchpad, mint).await {
+            last_bucket = Some(bucket.clone());
             let point = snapshot_early_tape(&bucket).await;
             if out.is_empty() {
-                return finalize_tape_observe(vec![point], false);
+                return finalize_tape_observe(vec![point], false, last_bucket);
             }
             if let Some(last) = out.last_mut() {
                 *last = point;
@@ -295,7 +302,7 @@ pub async fn observe_early_tape_points_live(
         }
     }
 
-    let mut result = finalize_tape_observe(out, false);
+    let mut result = finalize_tape_observe(out, false, last_bucket);
     if let Some(low) = early_exit_momentum_low_pct {
         if tape_hit_momentum_low(result.initial_mcap_sol, result.peak_mcap_sol, low) {
             result.exited_early = true;

@@ -79,6 +79,10 @@ buy_config:
   # fill/score gap (hard spike during our buy) this keeps the SL baseline from
   # dropping so low it disables the stop. 1.0 = no honest adjustment.
   honest_entry_baseline_min_ratio: 0.85
+  # Delay after BUY GATE before fan-out ExecuteBuy per wallet (ms). 0–300 for tighter copy.
+  buy_fanout_delay_ms: 800
+  # exit_v4 live tape refresh: min interval per open mint (ms); Tick is every 100ms.
+  exit_v4_live_snapshot_interval_ms: 500
 
 curve_quarantine:
   enabled: true
@@ -242,6 +246,7 @@ scoring:
     min_buys_per_sec: 0.0
     # Strong setups (A+ or score>=10): second-look on cont_b2s_worsening / cont_sell_absorption;
     # A+ also on cont_no_uptick (dip-then-rip). Other cont reasons unchanged.
+    # NOTE: second_look and aplus_peak_guard below run only when continuation.enabled is true.
     second_look:
       enabled: true
       wait_ms: 1250

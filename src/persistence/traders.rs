@@ -3,6 +3,7 @@ use crate::{
     persistence::error::Error, trading::trader::TraderType,
 };
 
+#[derive(Debug)]
 pub struct TraderEntry {
     pub trader_address: String,
     pub coin_address: String,

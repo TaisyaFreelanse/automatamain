@@ -195,6 +195,18 @@ else
   warn "JUPITER_API_KEY not in systemd drop-in"
 fi
 
+if journalctl -u loggaper --since '7 days ago' -g '\[LATENCY\]' -n 1 --no-pager 2>/dev/null | grep -q '\[LATENCY\]'; then
+  ok "[LATENCY] buy-path timing in journal (7d)"
+  LAT=$(journalctl -u loggaper --since '7 days ago' -g '\[LATENCY\]' -n 1 --no-pager 2>/dev/null | tail -1)
+  if echo "$LAT" | grep -q 'wallet_1:.*wallet_2:'; then
+    ok "[LATENCY] multi-wallet line (w1+w2)"
+  else
+    warn "[LATENCY] latest line may be single-wallet only"
+  fi
+else
+  warn "no [LATENCY] in journal yet (expected after first A/A+ BUY post P0 deploy)"
+fi
+
 echo ""
 echo "========== SUMMARY =========="
 echo "PASS=$PASS  FAIL=$FAIL  WARN=$WARN"

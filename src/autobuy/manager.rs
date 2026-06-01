@@ -44,8 +44,9 @@ use std::{
         Arc as StdArc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use crate::telemetry::buy_latency::BuyLatencyRegistry;
 use tokio::{
     sync::{mpsc, oneshot},
     time::sleep,
@@ -288,6 +289,20 @@ pub struct SmartBuyConfig {
     /// Adaptive Exit Engine V4 (profiles, live score, hold/runner, adaptive trailing).
     #[serde(default)]
     pub exit_v4: ExitEngineV4Config,
+    /// Delay after `InitiateBuy` before fan-out `ExecuteBuy` per wallet (milliseconds).
+    #[serde(default = "default_buy_fanout_delay_ms")]
+    pub buy_fanout_delay_ms: u64,
+    /// Minimum interval between exit_v4 live snapshot RPC refreshes per mint (milliseconds).
+    #[serde(default = "default_exit_v4_live_snapshot_interval_ms")]
+    pub exit_v4_live_snapshot_interval_ms: u64,
+}
+
+fn default_buy_fanout_delay_ms() -> u64 {
+    800
+}
+
+fn default_exit_v4_live_snapshot_interval_ms() -> u64 {
+    500
 }
 
 fn default_sl_confirm_ticks() -> u32 {
@@ -401,6 +416,8 @@ impl Default for SmartBuyConfig {
             mcap_ceiling_sol: default_mcap_ceiling_sol(),
             mcap_ceiling_partial_sell_pct: default_mcap_ceiling_partial_sell_pct(),
             exit_v4: ExitEngineV4Config::default(),
+            buy_fanout_delay_ms: default_buy_fanout_delay_ms(),
+            exit_v4_live_snapshot_interval_ms: default_exit_v4_live_snapshot_interval_ms(),
         }
     }
 }
@@ -464,6 +481,20 @@ pub enum PositionMessage {
         dev_address: Option<Address>,
         early_buyers: Vec<Address>,
         learning_snapshot: Option<LearningTradeSnapshot>,
+    },
+    /// Async buy finished (RPC off the actor thread).
+    BuyCompleted {
+        mint: solana_address::Address,
+        wallet_id: String,
+        amount_sol: f64,
+        open_reason: OpenReason,
+        dev_address: Option<Address>,
+        early_buyers: Vec<Address>,
+        learning_snapshot: Option<LearningTradeSnapshot>,
+        latest_pool: Box<dyn Pool>,
+        mode_label: String,
+        v3_wire: Option<V3TapeWire>,
+        result: Result<BuyReceipt, BrokerError>,
     },
     /// Snapshot the current strategy state (caps, loss-streak, regime).
     /// Used by the HTTP /metrics endpoint.
@@ -554,6 +585,8 @@ pub struct PositionManagerActor {
     dev_ranker: Option<DevRankerHandle>,
     smart_money: Option<SmartMoneyHandle>,
     learning: Option<LearningLogPg>,
+    buy_latency: Option<Arc<BuyLatencyRegistry>>,
+    last_live_snapshot_at: HashMap<solana_address::Address, Instant>,
 }
 
 impl PositionManagerActor {
@@ -571,6 +604,7 @@ impl PositionManagerActor {
         dev_ranker: Option<DevRankerHandle>,
         smart_money: Option<SmartMoneyHandle>,
         learning: Option<LearningLogPg>,
+        buy_latency: Option<Arc<BuyLatencyRegistry>>,
     ) -> (
         Self,
         mpsc::Sender<PositionMessage>,
@@ -609,6 +643,8 @@ impl PositionManagerActor {
             dev_ranker,
             smart_money,
             learning,
+            buy_latency,
+            last_live_snapshot_at: HashMap::new(),
         };
         (actor, tx, event_rx, paused_state, balance_state)
     }
@@ -890,9 +926,13 @@ impl PositionManagerActor {
                         continue;
                     }
                     self.strategy.note_position_opened();
+                    if let Some(ref lat) = self.buy_latency {
+                        lat.on_gate(mint);
+                    }
+                    let delay_ms = self.config.buy_fanout_delay_ms;
                     let tx_clone = self.tx.clone();
                     tokio::spawn(async move {
-                        sleep(Duration::from_millis(800)).await;
+                        sleep(Duration::from_millis(delay_ms)).await;
                         for (wallet_id, wallet_amount_sol) in enabled {
                             let _ = tx_clone
                                 .send(PositionMessage::ExecuteBuy {
@@ -970,7 +1010,7 @@ impl PositionManagerActor {
                         continue;
                     }
 
-                    let Some(wallet) = self.wallets.get(&wallet_id) else {
+                    let Some(_wallet) = self.wallets.get(&wallet_id) else {
                         eprintln!("[BUY] Skipped {mint} — unknown wallet_id={wallet_id}");
                         self.pending_wallet_buys.remove(&pos_key);
                         continue;
@@ -991,12 +1031,17 @@ impl PositionManagerActor {
                     };
 
                     let v3_wire = learning_snapshot.as_ref().map(V3TapeWire::from_learning);
-                    let broker = wallet.broker.clone();
+                    let broker = _wallet.broker.clone();
                     let mode_label = broker.mode_label().to_string();
-
-                    let receipt = match broker.buy(mint, amount_sol, latest_pool.as_ref()).await {
-                        Ok(r) => {
-                            let _ = self.event_tx.try_send(WsFeedMessage::TxEvent {
+                    if let Some(ref lat) = self.buy_latency {
+                        lat.on_sent(mint, &wallet_id);
+                    }
+                    let tx = self.tx.clone();
+                    let event_tx = self.event_tx.clone();
+                    tokio::spawn(async move {
+                        let result = broker.buy(mint, amount_sol, latest_pool.as_ref()).await;
+                        if let Ok(ref r) = result {
+                            let _ = event_tx.try_send(WsFeedMessage::TxEvent {
                                 kind: TxEventKind::Buy,
                                 wallet_id: wallet_id.clone(),
                                 mint: mint.to_string(),
@@ -1012,219 +1057,52 @@ impl PositionManagerActor {
                                 pnl_mcap_pct: None,
                                 pnl_sol_pct: None,
                             });
-                            r
                         }
-                        Err(e) if is_buy_mint_unavailable(&e) => {
-                            eprintln!(
-                                "[BUY] wallet_id={wallet_id} Skipped {mint} — mint not on RPC: {e}"
-                            );
-                            self.pending_wallet_buys.remove(&pos_key);
-                            if !self.any_position_for_mint(mint) {
-                                self.closed_mints.insert(mint);
-                            }
-                            if let Some(ref log) = self.learning {
-                                let log = log.clone();
-                                let mint_s = mint.to_string();
-                                let dev_s = dev_address.map(|d| d.to_string());
-                                let detail = e.to_string();
-                                tokio::spawn(async move {
-                                    let _ = log
-                                        .log_skipped(
-                                            &mint_s,
-                                            dev_s.as_deref(),
-                                            "buy_rpc",
-                                            "mint_not_on_chain",
-                                            json!({ "detail": detail }),
-                                            now_secs(),
-                                        )
-                                        .await;
-                                });
-                            }
-                            continue;
-                        }
-                        Err(e) => {
-                            eprintln!("[BUY] wallet_id={wallet_id} Failed {mint}: {e}");
-                            self.pending_wallet_buys.remove(&pos_key);
-                            let _ = self.event_tx.try_send(WsFeedMessage::TxEvent {
-                                kind: TxEventKind::Buy,
-                                wallet_id: wallet_id.clone(),
-                                mint: mint.to_string(),
-                                signature: None,
-                                amount_sol,
-                                amount_sol_estimated: None,
-                                status: "failed".into(),
-                                reason: Some(e.to_string()),
-                                mode: mode_label,
-                                ts: now_secs(),
-                                v3_tape: v3_wire.clone(),
-                                time_kill_detail: None,
-                                pnl_mcap_pct: None,
-                                pnl_sol_pct: None,
-                            });
-                            continue;
-                        }
-                    };
-
-                    self.pending_wallet_buys.remove(&pos_key);
-
-                    let current_time = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
-
-                    if let Some(spike) = Self::detect_fill_mcap_spike(
-                        &self.config,
-                        learning_snapshot.as_ref(),
-                        &receipt,
-                    ) {
-                        if self
-                            .abort_buy_after_fill_mcap_spike(
-                                &wallet_id,
+                        let _ = tx
+                            .send(PositionMessage::BuyCompleted {
                                 mint,
+                                wallet_id,
                                 amount_sol,
-                                &receipt,
-                                latest_pool.as_ref(),
-                                &spike,
-                                learning_snapshot.as_ref(),
+                                open_reason,
                                 dev_address,
-                                current_time,
-                            )
-                            .await
-                        {
-                            continue;
-                        }
-                        eprintln!(
-                            "[BUY ABORT] {mint}: fill mcap spike detected but emergency \
-                             sell failed — opening position anyway (manual review advised)"
-                        );
-                    }
-
-                    let tokens = Amount::from_float_native(receipt.tokens_received);
-                    // Honest entry baseline: the raw post-fill bonding-curve mcap
-                    // is inflated by our own buy's price impact, so using it as the
-                    // SL reference makes the stop fire on our own slippage. Prefer
-                    // `min(post-fill, score-time)` — the score-time mcap is a clean
-                    // pre-impact reference and tracks our true cost basis.
-                    let entry_baseline_mcap =
-                        receipt.entry_mcap_fill_sol.filter(|m| *m > 0.0).map(|fill| {
-                            if self.config.honest_entry_baseline {
-                                match learning_snapshot
-                                    .as_ref()
-                                    .map(|s| s.entry_mcap_sol)
-                                    .filter(|m| *m > 0.0)
-                                {
-                                    // Strip our own price impact (use score-time
-                                    // mcap), but never let the baseline drop below
-                                    // `fill * min_ratio`: on a big fill/score gap a
-                                    // too-low baseline would disable the SL while we
-                                    // are deep underwater in SOL.
-                                    Some(score) => {
-                                        let floor = fill
-                                            * self
-                                                .config
-                                                .honest_entry_baseline_min_ratio
-                                                .clamp(0.0, 1.0);
-                                        fill.min(score).max(floor)
-                                    }
-                                    None => fill,
-                                }
-                            } else {
-                                fill
-                            }
-                        });
-                    let mut position = Position::new(
-                        wallet_id.clone(),
-                        latest_pool,
-                        tokens,
-                        current_time,
-                        entry_baseline_mcap,
-                    );
-                    if let Some(entry_mcap) = entry_baseline_mcap.filter(|m| *m > 0.0) {
-                        position.exit_mcap_ticks.clear();
-                        position.push_exit_mcap_tick(
-                            entry_mcap,
-                            self.config.exit_mcap_median_ticks,
-                        );
-                        position.sl_prev_raw_mcap = Some(entry_mcap);
-                    }
-                    position.exit_profit_floor = self.config.exit_profit_floor;
-                    position.spent_sol = amount_sol;
-                    position.dev_address = dev_address;
-                    position.early_buyers = early_buyers;
-                    let (tk_b, tk_s, tk_b2s) = learning_snapshot
-                        .as_ref()
-                        .map(|s| (s.buyer_count, s.smart_wallet_count, s.buy_to_sell_ratio))
-                        .unwrap_or_else(|| {
-                            let eb = position.early_buyers.len() as u64;
-                            (eb, 0u32, 0.0f64)
-                        });
-                    position.tk_entry_buyers = tk_b;
-                    position.tk_entry_smart = tk_s;
-                    position.tk_entry_b2s = tk_b2s;
-                    let snap_ref = learning_snapshot.as_ref();
-                    if self.config.exit_v4.enabled {
-                        let tk = TkEntryThresholds {
-                            strong_min_buyers: self.config.time_kill_strong_min_buyers,
-                            strong_min_b2s: self.config.time_kill_strong_min_b2s,
-                            weak_max_buyers: self.config.time_kill_weak_max_buyers,
-                            weak_max_b2s: self.config.time_kill_weak_max_b2s,
-                        };
-                        let (profile, hold) = resolve_entry_profile(
-                            tk,
-                            &self.config.exit_v4,
-                            &position,
-                            snap_ref,
-                        );
-                        position.exit_profile = profile;
-                        position.hold_mode = hold;
-                        position.exit_phase = PositionPhase::Exploration;
-                        position.live_score_entry_floor =
-                            entry_live_score_floor(learning_snapshot.as_ref());
-                        position.live_score = position.live_score_entry_floor;
-                        position.last_live_score_at = current_time;
-                        eprintln!(
-                            "[EXIT V4] {mint} profile={} phase=exploration hold={hold} \
-                             live_floor={}",
-                            profile.as_str(),
-                            position.live_score_entry_floor
-                        );
-                    }
-                    if self.bucket_cache.contains_key(&mint) {
-                        self.spawn_live_snapshot_refresh(mint);
-                    }
-                    position.learning_snapshot = learning_snapshot;
-                    position.open_reason = Some(open_reason.clone());
-                    let enter_mcap = position.enter_mcap.to_float();
-                    position.push_exit_mcap_tick(enter_mcap, self.config.exit_mcap_median_ticks);
-                    let impact_adjusted = matches!(
-                        (receipt.entry_mcap_fill_sol.filter(|m| *m > 0.0), entry_baseline_mcap),
-                        (Some(fill), Some(base)) if base < fill
-                    );
-                    let mcap_src = if receipt.entry_mcap_fill_sol.is_some() {
-                        if impact_adjusted {
-                            "on-chain fill, impact-adj"
-                        } else {
-                            "on-chain fill"
-                        }
-                    } else {
-                        "WS pool cache"
-                    };
-                    eprintln!(
-                        "[BUY] wallet_id={wallet_id} Opened {mint} | mcap={enter_mcap:.1} SOL ({mcap_src}) | spent={amount_sol:.4} SOL"
-                    );
-                    self.positions.insert(pos_key, position);
-
-                    if let Ok(bal) = broker.balance_sol().await {
-                        wallet.set_balance_sol(bal);
-                    }
-                    self.broadcast_wallet_balances();
-                    let _ = self.event_tx.try_send(WsFeedMessage::PositionOpen {
-                        address: mint.to_string(),
-                        wallet_id: wallet_id.clone(),
-                        open_reason,
-                        enter_mcap,
-                        v3_tape: v3_wire,
+                                early_buyers,
+                                learning_snapshot,
+                                latest_pool,
+                                mode_label,
+                                v3_wire,
+                                result,
+                            })
+                            .await;
                     });
+                }
+
+                PositionMessage::BuyCompleted {
+                    mint,
+                    wallet_id,
+                    amount_sol,
+                    open_reason,
+                    dev_address,
+                    early_buyers,
+                    learning_snapshot,
+                    latest_pool,
+                    mode_label,
+                    v3_wire,
+                    result,
+                } => {
+                    self.apply_buy_result(
+                        mint,
+                        wallet_id,
+                        amount_sol,
+                        open_reason,
+                        dev_address,
+                        early_buyers,
+                        learning_snapshot,
+                        latest_pool,
+                        mode_label,
+                        v3_wire,
+                        result,
+                    )
+                    .await;
                 }
 
                 // ----------------------------------------------------------------
@@ -1612,8 +1490,20 @@ impl PositionManagerActor {
                 PositionMessage::Tick => {
                     if self.config.exit_v4.enabled {
                         let mints: HashSet<_> = self.positions.keys().map(|k| k.mint).collect();
+                        let interval_ms = self.config.exit_v4_live_snapshot_interval_ms.max(100);
+                        let interval = Duration::from_millis(interval_ms);
+                        let now = Instant::now();
                         for mint in mints {
-                            if self.bucket_cache.contains_key(&mint) {
+                            if !self.bucket_cache.contains_key(&mint) {
+                                continue;
+                            }
+                            let due = self
+                                .last_live_snapshot_at
+                                .get(&mint)
+                                .map(|t| now.duration_since(*t) >= interval)
+                                .unwrap_or(true);
+                            if due {
+                                self.last_live_snapshot_at.insert(mint, now);
                                 self.spawn_live_snapshot_refresh(mint);
                             }
                         }
@@ -1668,6 +1558,232 @@ impl PositionManagerActor {
                 }
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_buy_result(
+        &mut self,
+        mint: solana_address::Address,
+        wallet_id: String,
+        amount_sol: f64,
+        open_reason: OpenReason,
+        dev_address: Option<Address>,
+        early_buyers: Vec<Address>,
+        learning_snapshot: Option<LearningTradeSnapshot>,
+        latest_pool: Box<dyn Pool>,
+        mode_label: String,
+        v3_wire: Option<V3TapeWire>,
+        result: Result<BuyReceipt, BrokerError>,
+    ) {
+        let pos_key = Self::pos_key(mint, &wallet_id);
+
+        let receipt = match result {
+            Ok(r) => {
+                if let Some(ref lat) = self.buy_latency {
+                    lat.on_confirmed(mint, &wallet_id);
+                }
+                r
+            }
+            Err(e) if is_buy_mint_unavailable(&e) => {
+                if let Some(ref lat) = self.buy_latency {
+                    lat.on_buy_failed(mint, &wallet_id);
+                }
+                eprintln!(
+                    "[BUY] wallet_id={wallet_id} Skipped {mint} — mint not on RPC: {e}"
+                );
+                self.pending_wallet_buys.remove(&pos_key);
+                if !self.any_position_for_mint(mint) {
+                    self.closed_mints.insert(mint);
+                }
+                if let Some(ref log) = self.learning {
+                    let log = log.clone();
+                    let mint_s = mint.to_string();
+                    let dev_s = dev_address.map(|d| d.to_string());
+                    let detail = e.to_string();
+                    tokio::spawn(async move {
+                        let _ = log
+                            .log_skipped(
+                                &mint_s,
+                                dev_s.as_deref(),
+                                "buy_rpc",
+                                "mint_not_on_chain",
+                                json!({ "detail": detail }),
+                                now_secs(),
+                            )
+                            .await;
+                    });
+                }
+                return;
+            }
+            Err(e) => {
+                if let Some(ref lat) = self.buy_latency {
+                    lat.on_buy_failed(mint, &wallet_id);
+                }
+                eprintln!("[BUY] wallet_id={wallet_id} Failed {mint}: {e}");
+                self.pending_wallet_buys.remove(&pos_key);
+                let _ = self.event_tx.try_send(WsFeedMessage::TxEvent {
+                    kind: TxEventKind::Buy,
+                    wallet_id: wallet_id.clone(),
+                    mint: mint.to_string(),
+                    signature: None,
+                    amount_sol,
+                    amount_sol_estimated: None,
+                    status: "failed".into(),
+                    reason: Some(e.to_string()),
+                    mode: mode_label,
+                    ts: now_secs(),
+                    v3_tape: v3_wire.clone(),
+                    time_kill_detail: None,
+                    pnl_mcap_pct: None,
+                    pnl_sol_pct: None,
+                });
+                return;
+            }
+        };
+
+        self.pending_wallet_buys.remove(&pos_key);
+
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        if let Some(spike) = Self::detect_fill_mcap_spike(
+            &self.config,
+            learning_snapshot.as_ref(),
+            &receipt,
+        ) {
+            if self
+                .abort_buy_after_fill_mcap_spike(
+                    &wallet_id,
+                    mint,
+                    amount_sol,
+                    &receipt,
+                    latest_pool.as_ref(),
+                    &spike,
+                    learning_snapshot.as_ref(),
+                    dev_address,
+                    current_time,
+                )
+                .await
+            {
+                return;
+            }
+            eprintln!(
+                "[BUY ABORT] {mint}: fill mcap spike detected but emergency \
+                 sell failed — opening position anyway (manual review advised)"
+            );
+        }
+
+        let tokens = Amount::from_float_native(receipt.tokens_received);
+        let entry_baseline_mcap =
+            receipt.entry_mcap_fill_sol.filter(|m| *m > 0.0).map(|fill| {
+                if self.config.honest_entry_baseline {
+                    match learning_snapshot
+                        .as_ref()
+                        .map(|s| s.entry_mcap_sol)
+                        .filter(|m| *m > 0.0)
+                    {
+                        Some(score) => {
+                            let floor = fill
+                                * self
+                                    .config
+                                    .honest_entry_baseline_min_ratio
+                                    .clamp(0.0, 1.0);
+                            fill.min(score).max(floor)
+                        }
+                        None => fill,
+                    }
+                } else {
+                    fill
+                }
+            });
+        let mut position = Position::new(
+            wallet_id.clone(),
+            latest_pool,
+            tokens,
+            current_time,
+            entry_baseline_mcap,
+        );
+        if let Some(entry_mcap) = entry_baseline_mcap.filter(|m| *m > 0.0) {
+            position.exit_mcap_ticks.clear();
+            position.push_exit_mcap_tick(entry_mcap, self.config.exit_mcap_median_ticks);
+            position.sl_prev_raw_mcap = Some(entry_mcap);
+        }
+        position.exit_profit_floor = self.config.exit_profit_floor;
+        position.spent_sol = amount_sol;
+        position.dev_address = dev_address;
+        position.early_buyers = early_buyers;
+        let (tk_b, tk_s, tk_b2s) = learning_snapshot
+            .as_ref()
+            .map(|s| (s.buyer_count, s.smart_wallet_count, s.buy_to_sell_ratio))
+            .unwrap_or_else(|| {
+                let eb = position.early_buyers.len() as u64;
+                (eb, 0u32, 0.0f64)
+            });
+        position.tk_entry_buyers = tk_b;
+        position.tk_entry_smart = tk_s;
+        position.tk_entry_b2s = tk_b2s;
+        let snap_ref = learning_snapshot.as_ref();
+        if self.config.exit_v4.enabled {
+            let tk = TkEntryThresholds {
+                strong_min_buyers: self.config.time_kill_strong_min_buyers,
+                strong_min_b2s: self.config.time_kill_strong_min_b2s,
+                weak_max_buyers: self.config.time_kill_weak_max_buyers,
+                weak_max_b2s: self.config.time_kill_weak_max_b2s,
+            };
+            let (profile, hold) =
+                resolve_entry_profile(tk, &self.config.exit_v4, &position, snap_ref);
+            position.exit_profile = profile;
+            position.hold_mode = hold;
+            position.exit_phase = PositionPhase::Exploration;
+            position.live_score_entry_floor = entry_live_score_floor(learning_snapshot.as_ref());
+            position.live_score = position.live_score_entry_floor;
+            position.last_live_score_at = current_time;
+            eprintln!(
+                "[EXIT V4] {mint} profile={} phase=exploration hold={hold} live_floor={}",
+                profile.as_str(),
+                position.live_score_entry_floor
+            );
+        }
+        if self.bucket_cache.contains_key(&mint) {
+            self.spawn_live_snapshot_refresh(mint);
+        }
+        position.learning_snapshot = learning_snapshot;
+        position.open_reason = Some(open_reason.clone());
+        let enter_mcap = position.enter_mcap.to_float();
+        position.push_exit_mcap_tick(enter_mcap, self.config.exit_mcap_median_ticks);
+        let impact_adjusted = matches!(
+            (receipt.entry_mcap_fill_sol.filter(|m| *m > 0.0), entry_baseline_mcap),
+            (Some(fill), Some(base)) if base < fill
+        );
+        let mcap_src = if receipt.entry_mcap_fill_sol.is_some() {
+            if impact_adjusted {
+                "on-chain fill, impact-adj"
+            } else {
+                "on-chain fill"
+            }
+        } else {
+            "WS pool cache"
+        };
+        eprintln!(
+            "[BUY] wallet_id={wallet_id} Opened {mint} | mcap={enter_mcap:.1} SOL ({mcap_src}) | spent={amount_sol:.4} SOL"
+        );
+        self.positions.insert(pos_key, position);
+
+        if let Some(wallet) = self.wallets.get(&wallet_id) {
+            if let Ok(bal) = wallet.broker.balance_sol().await {
+                wallet.set_balance_sol(bal);
+            }
+        }
+        self.broadcast_wallet_balances();
+        let _ = self.event_tx.try_send(WsFeedMessage::PositionOpen {
+            address: mint.to_string(),
+            wallet_id: wallet_id.clone(),
+            open_reason,
+            enter_mcap,
+            v3_tape: v3_wire,
+        });
     }
 
     /// Post-fill bonding-curve mcap vs score-time mcap (`LearningTradeSnapshot::entry_mcap_sol`).
