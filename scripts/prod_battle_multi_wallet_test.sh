@@ -149,12 +149,12 @@ if [[ -x "$SOLANA_BIN" && -n "$RPC" && -n "$W2PUB" ]]; then
   fi
 fi
 
-if journalctl -u loggaper --since '6 hours ago' --no-pager 2>/dev/null | grep -q 'wallet=wallet_2 label=Copy mode=live'; then
+if journalctl -u loggaper -g 'wallet=wallet_2 label=Copy mode=live' --no-pager -n 1 2>/dev/null | grep -q 'wallet=wallet_2'; then
   ok "log wallet_2 broker initialized"
 else
   bad "no wallet_2 EXEC in recent logs"
 fi
-if journalctl -u loggaper --since '6 hours ago' --no-pager 2>/dev/null | grep -q 'wallet=wallet_1 label=Main mode=live'; then
+if journalctl -u loggaper -g 'wallet=wallet_1 label=Main mode=live' --no-pager -n 1 2>/dev/null | grep -q 'wallet=wallet_1'; then
   ok "log wallet_1 broker initialized"
 else
   bad "no wallet_1 EXEC in recent logs"
