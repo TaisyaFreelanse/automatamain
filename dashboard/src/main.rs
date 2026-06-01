@@ -92,9 +92,29 @@ pub struct V3TapeWire {
     pub sm_exits: u32,
 }
 
+fn default_wallet_id() -> String {
+    "wallet_1".to_string()
+}
+
+fn pos_map_key(mint: &str, wallet_id: &str) -> String {
+    format!("{mint}:{wallet_id}")
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct WalletWire {
+    pub id: String,
+    pub label: String,
+    pub enabled: bool,
+    pub pubkey: String,
+    pub balance_sol: f64,
+    pub size_sol: Option<f64>,
+}
+
 /// Mirrors backend `OpenPositionWire` (`GET /positions`).
 #[derive(Deserialize, Clone, Debug)]
 pub struct OpenPositionWire {
+    #[serde(default = "default_wallet_id")]
+    pub wallet_id: String,
     pub address: String,
     pub open_reason: OpenReason,
     pub enter_mcap: f64,
@@ -114,6 +134,8 @@ pub struct OpenPositionWire {
 pub enum WsMsg {
     PositionOpen {
         address: String,
+        #[serde(default = "default_wallet_id")]
+        wallet_id: String,
         open_reason: OpenReason,
         enter_mcap: f64,
         #[serde(default)]
@@ -121,6 +143,8 @@ pub enum WsMsg {
     },
     PositionUpdate {
         address: String,
+        #[serde(default = "default_wallet_id")]
+        wallet_id: String,
         pnl: f64,
         holdings: f64,
         market_cap: f64,
@@ -131,9 +155,15 @@ pub enum WsMsg {
     },
     PositionClose {
         address: String,
+        #[serde(default = "default_wallet_id")]
+        wallet_id: String,
         reason: String,
     },
     BalanceUpdate {
+        balance: f64,
+    },
+    WalletBalanceUpdate {
+        wallet_id: String,
         balance: f64,
     },
     PausedState {
@@ -141,6 +171,8 @@ pub enum WsMsg {
     },
     TxEvent {
         kind: TxEventKind,
+        #[serde(default = "default_wallet_id")]
+        wallet_id: String,
         mint: String,
         signature: Option<String>,
         amount_sol: f64,
@@ -160,6 +192,8 @@ pub enum WsMsg {
         pnl_sol_pct: Option<f64>,
     },
     ManualSellRequired {
+        #[serde(default = "default_wallet_id")]
+        wallet_id: String,
         mint: String,
         exit_reason: String,
         detail: String,
@@ -195,6 +229,8 @@ pub struct TxLogRow {
 #[derive(Deserialize, Clone, Debug)]
 pub struct BotTradeRow {
     pub id: i64,
+    #[serde(default = "default_wallet_id")]
+    pub wallet_id: String,
     pub mint: String,
     pub entry_mcap_sol: f64,
     pub invested_sol: f64,
@@ -466,6 +502,7 @@ enum DashCmd {
     /// Switch broker mode. `confirm_live` must be true to switch to live;
     /// the dashboard enforces this via a two-step typed confirmation.
     SetMode { mode: String, confirm_live: bool },
+    PutWallets(Vec<WalletWire>),
 }
 
 // ── App events ────────────────────────────────────────────────────────────────
@@ -500,11 +537,15 @@ enum AppEvent {
     },
     ModeSetErr(String),
     OpenPositions(Vec<OpenPositionWire>),
+    Wallets(Vec<WalletWire>),
+    WalletsSaveOk,
+    WalletsSaveErr(String),
 }
 
 // ── Positions ─────────────────────────────────────────────────────────────────
 
 struct Position {
+    wallet_id: String,
     address: String,
     open_reason: OpenReason,
     pnl: f64,
@@ -606,6 +647,10 @@ struct Dashboard {
     mint_copy_flash_until: Option<Instant>,
     /// Sticky alert when live bot cannot Jupiter-sell; operator must sell manually.
     manual_sell_alert: Option<ManualSellAlert>,
+    wallets: Vec<WalletWire>,
+    /// "all" or a wallet id — filters HISTORY rows.
+    history_wallet_filter: String,
+    wallet_save_status: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -661,11 +706,30 @@ impl Dashboard {
             config_panel: ConfigPanel::new(),
             mint_copy_flash_until: None,
             manual_sell_alert: None,
+            wallets: Vec::new(),
+            history_wallet_filter: "all".to_string(),
+            wallet_save_status: None,
         }
+    }
+
+    fn filtered_history(&self) -> Vec<&BotTradeRow> {
+        if self.history_wallet_filter == "all" {
+            self.history.iter().collect()
+        } else {
+            self.history
+                .iter()
+                .filter(|t| t.wallet_id == self.history_wallet_filter)
+                .collect()
+        }
+    }
+
+    fn combined_open_pnl(&self) -> f64 {
+        self.open.values().map(|p| p.pnl).sum()
     }
 
     fn wire_to_position(w: OpenPositionWire) -> Position {
         Position {
+            wallet_id: w.wallet_id.clone(),
             address: w.address,
             open_reason: w.open_reason,
             pnl: w.pnl,
@@ -680,17 +744,20 @@ impl Dashboard {
 
     /// Authoritative restore from `GET /positions` (survives GUI restart / WS gaps).
     fn apply_open_positions(&mut self, rows: Vec<OpenPositionWire>) {
-        let live: std::collections::HashSet<String> =
-            rows.iter().map(|w| w.address.clone()).collect();
+        let live: std::collections::HashSet<String> = rows
+            .iter()
+            .map(|w| pos_map_key(&w.address, &w.wallet_id))
+            .collect();
         if let Some(alert) = &self.manual_sell_alert {
-            if !live.contains(&alert.mint) {
+            let still_open = rows.iter().any(|w| w.address == alert.mint);
+            if !still_open {
                 self.manual_sell_alert = None;
             }
         }
         self.open.retain(|k, _| live.contains(k));
         for w in rows {
-            self.open
-                .insert(w.address.clone(), Self::wire_to_position(w));
+            let key = pos_map_key(&w.address, &w.wallet_id);
+            self.open.insert(key, Self::wire_to_position(w));
         }
     }
 
@@ -764,17 +831,27 @@ impl Dashboard {
                         self.chart_window = Some((mint, sanitize_chart(d)));
                     }
                 }
+                AppEvent::Wallets(w) => self.wallets = w,
+                AppEvent::WalletsSaveOk => {
+                    self.wallet_save_status = Some("✓ Wallets saved".to_string());
+                }
+                AppEvent::WalletsSaveErr(msg) => {
+                    self.wallet_save_status = Some(format!("✗ {msg}"));
+                }
                 AppEvent::OpenPositions(rows) => self.apply_open_positions(rows),
                 AppEvent::Msg(msg) => match msg {
                     WsMsg::PositionOpen {
                         address,
+                        wallet_id,
                         open_reason,
                         enter_mcap,
                         v3_tape,
                     } => {
+                        let key = pos_map_key(&address, &wallet_id);
                         self.open.insert(
-                            address.clone(),
+                            key,
                             Position {
+                                wallet_id,
                                 address,
                                 open_reason,
                                 pnl: 0.0,
@@ -789,13 +866,15 @@ impl Dashboard {
                     }
                     WsMsg::PositionUpdate {
                         address,
+                        wallet_id,
                         pnl,
                         holdings,
                         market_cap,
                         time_kill_tier,
                         time_kill_after_secs,
                     } => {
-                        if let Some(pos) = self.open.get_mut(&address) {
+                        let key = pos_map_key(&address, &wallet_id);
+                        if let Some(pos) = self.open.get_mut(&key) {
                             pos.pnl = pnl;
                             pos.holdings = holdings;
                             pos.market_cap = market_cap;
@@ -807,14 +886,23 @@ impl Dashboard {
                             }
                         }
                     }
-                    WsMsg::PositionClose { address, .. } => {
+                    WsMsg::PositionClose { address, wallet_id, .. } => {
                         self.clear_manual_sell_for_mint(&address);
-                        self.open.remove(&address);
+                        self.open.remove(&pos_map_key(&address, &wallet_id));
                         send_dash_cmd(&self.cmd_tx, DashCmd::RefreshBotTradesAfterClose);
                     }
                     WsMsg::BalanceUpdate { balance } => self.balance = Some(balance),
+                    WsMsg::WalletBalanceUpdate { wallet_id, balance } => {
+                        if let Some(w) = self.wallets.iter_mut().find(|w| w.id == wallet_id) {
+                            w.balance_sol = balance;
+                        }
+                        self.balance = Some(
+                            self.wallets.iter().map(|w| w.balance_sol).sum(),
+                        );
+                    }
                     WsMsg::PausedState { paused } => self.paused = paused,
                     WsMsg::ManualSellRequired {
+                        wallet_id: _,
                         mint,
                         exit_reason,
                         detail,
@@ -831,6 +919,7 @@ impl Dashboard {
                     }
                     WsMsg::TxEvent {
                         kind,
+                        wallet_id: _,
                         mint,
                         signature,
                         amount_sol,
@@ -1016,6 +1105,73 @@ impl Dashboard {
                     egui::Color32::from_rgb(220, 90, 90)
                 };
                 ui.colored_label(color, status);
+            }
+        });
+    }
+
+    fn render_wallets_block(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(egui::RichText::new("Copy-trade wallets").strong());
+            ui.label(
+                egui::RichText::new("Keys stay on server (env). Toggle enabled and optional fixed buy size (SOL).")
+                    .small()
+                    .color(egui::Color32::GRAY),
+            );
+            if self.wallets.is_empty() {
+                ui.label("No wallet data yet — waiting for /status …");
+                return;
+            }
+            egui::Grid::new("wallets_cfg_grid")
+                .num_columns(5)
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.label("ID");
+                    ui.label("Enabled");
+                    ui.label("Size SOL");
+                    ui.label("Balance");
+                    ui.label("Pubkey");
+                    ui.end_row();
+                    let mut changed = false;
+                    for w in &mut self.wallets {
+                        ui.label(format!("{} ({})", w.id, w.label));
+                        let mut en = w.enabled;
+                        if ui.checkbox(&mut en, "").changed() {
+                            w.enabled = en;
+                            changed = true;
+                        }
+                        let mut size_s = w
+                            .size_sol
+                            .map(|v| format!("{v:.4}"))
+                            .unwrap_or_default();
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut size_s)
+                                    .desired_width(64.0)
+                                    .hint_text("tier"),
+                            )
+                            .changed()
+                        {
+                            w.size_sol = if size_s.trim().is_empty() {
+                                None
+                            } else {
+                                size_s.trim().parse().ok()
+                            };
+                            changed = true;
+                        }
+                        ui.label(format!("{:.4} SOL", w.balance_sol));
+                        ui.label(short_addr(&w.pubkey));
+                        ui.end_row();
+                    }
+                    if changed {
+                        let snap = self.wallets.clone();
+                        let _ = self.cmd_tx.try_send(DashCmd::PutWallets(snap));
+                    }
+                });
+            if ui.button("Refresh wallets from server").clicked() {
+                let _ = self.cmd_tx.try_send(DashCmd::FetchStatus);
+            }
+            if let Some(s) = &self.wallet_save_status {
+                ui.colored_label(egui::Color32::from_rgb(160, 200, 255), s);
             }
         });
     }
@@ -1534,6 +1690,8 @@ impl eframe::App for Dashboard {
                     ui.heading("Execution Mode");
                     ui.add_space(6.0);
                     self.render_mode_block(ui);
+                    ui.add_space(8.0);
+                    self.render_wallets_block(ui);
                 });
             if !open {
                 self.config_panel.open = false;
@@ -1726,27 +1884,41 @@ impl eframe::App for Dashboard {
         });
 
         // ── Stats bar ─────────────────────────────────────────────────────────
-        if !self.history.is_empty() {
-            egui::TopBottomPanel::top("stats_bar").show(ctx, |ui| {
-                let total = self.history.len();
-                let wins = self
-                    .history
-                    .iter()
-                    .filter(|t| t.realized_pnl_pct > 0.0)
-                    .count();
-                let winrate = wins as f64 / total as f64 * 100.0;
-                let avg_pnl =
-                    self.history.iter().map(|t| t.realized_pnl_pct).sum::<f64>() / total as f64;
-                ui.horizontal(|ui| {
-                    ui.label(format!("Trades: {total}"));
-                    ui.separator();
-                    ui.label("Winrate:");
-                    ui.colored_label(pnl_color(winrate - 50.0), format!("{winrate:.1}%"));
-                    ui.separator();
-                    ui.label("Avg PnL:");
-                    ui.colored_label(pnl_color(avg_pnl), format!("{avg_pnl:+.2}%"));
+        {
+            let hist = self.filtered_history();
+            if !hist.is_empty() || !self.open.is_empty() {
+                egui::TopBottomPanel::top("stats_bar").show(ctx, |ui| {
+                    let wins = hist.iter().filter(|t| t.realized_pnl_pct > 0.0).count();
+                    let winrate = if hist.is_empty() {
+                        0.0
+                    } else {
+                        wins as f64 / hist.len() as f64 * 100.0
+                    };
+                    let avg_pnl = if hist.is_empty() {
+                        0.0
+                    } else {
+                        hist.iter().map(|t| t.realized_pnl_pct).sum::<f64>() / hist.len() as f64
+                    };
+                    let open_pnl = self.combined_open_pnl();
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Trades: {}", hist.len()));
+                        ui.separator();
+                        ui.label("Winrate:");
+                        ui.colored_label(pnl_color(winrate - 50.0), format!("{winrate:.1}%"));
+                        ui.separator();
+                        ui.label("Avg PnL (hist):");
+                        ui.colored_label(pnl_color(avg_pnl), format!("{avg_pnl:+.2}%"));
+                        ui.separator();
+                        ui.label("Open PnL (sum):");
+                        ui.colored_label(pnl_color(open_pnl), format!("{open_pnl:+.2}%"));
+                        for w in &self.wallets {
+                            ui.separator();
+                            ui.label(format!("{}:", w.id));
+                            ui.label(format!("{:.3} SOL", w.balance_sol));
+                        }
+                    });
                 });
-            });
+            }
         }
 
         // ── Central panel ─────────────────────────────────────────────────────
@@ -1777,10 +1949,11 @@ impl eframe::App for Dashboard {
                 .max_height(third)
                 .show(ui, |ui| {
                     egui::Grid::new("open_grid")
-                        .num_columns(8)
+                        .num_columns(9)
                         .striped(true)
                         .min_col_width(72.0)
                         .show(ui, |ui| {
+                            ui.label(egui::RichText::new("Wallet").strong());
                             ui.label(egui::RichText::new("Address").strong());
                             ui.label(egui::RichText::new("PnL % (mcap)").strong());
                             ui.label(egui::RichText::new("Holdings").strong());
@@ -1792,6 +1965,11 @@ impl eframe::App for Dashboard {
                             ui.end_row();
                             for addr in &open_addresses {
                                 if let Some(pos) = self.open.get(addr) {
+                                    ui.label(
+                                        egui::RichText::new(&pos.wallet_id)
+                                            .small()
+                                            .color(egui::Color32::from_rgb(180, 200, 255)),
+                                    );
                                     render_mint_with_copy(
                                         ui,
                                         ctx,
@@ -2066,19 +2244,47 @@ impl eframe::App for Dashboard {
             ui.add_space(6.0);
 
             // ── History ───────────────────────────────────────────────────────
-            ui.label(egui::RichText::new("HISTORY").strong().size(14.0));
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("HISTORY").strong().size(14.0));
+                ui.separator();
+                egui::ComboBox::from_id_salt("hist_wallet_filter")
+                    .selected_text(&self.history_wallet_filter)
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_value(&mut self.history_wallet_filter, "all".to_string(), "All wallets").changed() {
+                            let _ = self.cmd_tx.try_send(DashCmd::FetchBotTrades);
+                        }
+                        for w in &self.wallets.clone() {
+                            if ui
+                                .selectable_value(
+                                    &mut self.history_wallet_filter,
+                                    w.id.clone(),
+                                    &w.id,
+                                )
+                                .changed()
+                            {
+                                let _ = self.cmd_tx.try_send(DashCmd::FetchBotTrades);
+                            }
+                        }
+                    });
+            });
             ui.separator();
 
             let cmd_tx = self.cmd_tx.clone();
+            let hist_rows: Vec<BotTradeRow> = self
+                .filtered_history()
+                .into_iter()
+                .cloned()
+                .collect();
             egui::ScrollArea::vertical()
                 .id_salt("history_scroll")
                 .show(ui, |ui| {
                     egui::Grid::new("history_grid")
-                        .num_columns(7)
+                        .num_columns(8)
                         .striped(true)
                         .min_col_width(72.0)
                         .show(ui, |ui| {
                             ui.label(egui::RichText::new("Time").strong());
+                            ui.label(egui::RichText::new("Wallet").strong());
                             ui.label(egui::RichText::new("Mint").strong());
                             ui.label(egui::RichText::new("PnL % (SOL)").strong());
                             ui.label(egui::RichText::new("Invested ($)").strong());
@@ -2087,11 +2293,12 @@ impl eframe::App for Dashboard {
                             ui.label(egui::RichText::new("Close Reason").strong());
                             ui.end_row();
 
-                            for row in &self.history {
+                            for row in &hist_rows {
                                 ui.label(
                                     egui::RichText::new(format_age(row.closed_at))
                                         .color(egui::Color32::GRAY),
                                 );
+                                ui.label(&row.wallet_id);
                                 ui.horizontal(|ui| {
                                     render_mint_with_copy(
                                         ui,
@@ -2390,6 +2597,7 @@ async fn ws_loop(
                                                     .filter_map(|m| match m {
                                                         WsMsg::TxEvent {
                                                             kind,
+                                                            wallet_id: _,
                                                             mint,
                                                             signature,
                                                             amount_sol,
@@ -2457,6 +2665,37 @@ async fn ws_loop(
                                         fetch_open_positions_http(&url, &tx2, &ctx2);
                                     });
                                 }
+                                Some(DashCmd::PutWallets(wallets)) => {
+                                    let url = format!("{}/wallets", http_url);
+                                    let tx2 = tx.clone();
+                                    let ctx2 = ctx.clone();
+                                    tokio::spawn(async move {
+                                        let client = reqwest::Client::new();
+                                        let body = serde_json::json!({ "wallets": wallets });
+                                        match client.put(&url).json(&body).send().await {
+                                            Ok(resp) => {
+                                                let status = resp.status();
+                                                if status.is_success() {
+                                                    if let Ok(updated) =
+                                                        resp.json::<Vec<WalletWire>>().await
+                                                    {
+                                                        let _ = tx2.send(AppEvent::Wallets(updated));
+                                                    }
+                                                    let _ = tx2.send(AppEvent::WalletsSaveOk);
+                                                } else {
+                                                    let text = resp.text().await.unwrap_or_default();
+                                                    let _ = tx2.send(AppEvent::WalletsSaveErr(
+                                                        format!("HTTP {status}: {text}"),
+                                                    ));
+                                                }
+                                            }
+                                            Err(e) => {
+                                                let _ = tx2.send(AppEvent::WalletsSaveErr(e.to_string()));
+                                            }
+                                        }
+                                        ctx2.request_repaint();
+                                    });
+                                }
                                 Some(DashCmd::SetMode { mode, confirm_live }) => {
                                     let url = format!("{}/mode", http_url);
                                     let tx2 = tx.clone(); let ctx2 = ctx.clone();
@@ -2511,9 +2750,13 @@ struct StatusResp {
     paused: bool,
     balance_sol: f64,
     #[serde(default)]
+    total_balance_sol: Option<f64>,
+    #[serde(default)]
     mode: Option<String>,
     #[serde(default)]
     wallet: Option<String>,
+    #[serde(default)]
+    wallets: Vec<WalletWire>,
 }
 
 async fn fetch_status_http(
@@ -2532,9 +2775,11 @@ async fn fetch_status_http(
                 if let Some(pk) = s.wallet {
                     let _ = tx.send(AppEvent::Pubkey(pk));
                 }
-                let _ = tx.send(AppEvent::Msg(WsMsg::BalanceUpdate {
-                    balance: s.balance_sol,
-                }));
+                let bal = s.total_balance_sol.unwrap_or(s.balance_sol);
+                if !s.wallets.is_empty() {
+                    let _ = tx.send(AppEvent::Wallets(s.wallets));
+                }
+                let _ = tx.send(AppEvent::Msg(WsMsg::BalanceUpdate { balance: bal }));
                 ctx.request_repaint();
             } else {
                 eprintln!("[dashboard] GET /status: JSON decode failed");

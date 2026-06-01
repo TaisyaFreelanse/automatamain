@@ -374,3 +374,17 @@ execution:
     # (-32602 "not supported"). Use true for that HTTP endpoint; standard
     # mainnet.helius can use false if you want RPC simulation before send.
     skip_preflight: true
+
+# Copy-trade wallets (private keys in env only — never put secrets here).
+wallets:
+  - id: wallet_1
+    label: Main
+    enabled: true
+    private_key_env: PRIVATE_KEY
+    size_sol: null
+  - id: wallet_2
+    label: Copy
+    # Prod: set enabled true only after PRIVATE_KEY_WALLET_2 is in server env; restart loggaper.
+    enabled: false
+    private_key_env: PRIVATE_KEY_WALLET_2
+    size_sol: 0.05

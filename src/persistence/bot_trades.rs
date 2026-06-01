@@ -1,6 +1,7 @@
 use crate::persistence::error::Error;
 
 pub struct BotTradeEntry {
+    pub wallet_id: String,
     pub mint: String,
     pub entry_mcap_sol: f64,
     pub invested_sol: f64,
@@ -16,6 +17,7 @@ pub struct BotTradeEntry {
 #[derive(serde::Serialize, sqlx::FromRow)]
 pub struct BotTradeRow {
     pub id: i64,
+    pub wallet_id: String,
     pub mint: String,
     pub entry_mcap_sol: f64,
     pub invested_sol: f64,

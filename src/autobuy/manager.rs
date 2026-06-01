@@ -1,6 +1,6 @@
 use crate::{
     autobuy::{
-        broker::{Broker, BrokerError, BuyReceipt},
+        broker::{BrokerError, BuyReceipt},
         exit_engine::{
             adaptive_moonbag_sell_pct, adaptive_trailing, apply_phase_to_tp,
             calculate_live_score, entry_live_score_floor, format_sl_close_reason,
@@ -11,7 +11,8 @@ use crate::{
             resolve_entry_profile, transition_position_phase, ExitEngineV4Config, ExitProfile,
             PositionPhase, TkEntryThresholds,
         },
-        positions::Position,
+        positions::{Position, PositionKey},
+        wallet_registry::WalletRegistry,
         curve_quarantine::{self, CurveQuarantineCache},
         dev_blacklist,
         filters::config::{CurveQuarantineConfig, DevBlacklistConfig},
@@ -409,6 +410,7 @@ pub use crate::autobuy::open_reason::OpenReason;
 /// HTTP/WS snapshot of one open position (dashboard restore on reconnect).
 #[derive(Serialize, Clone, Debug)]
 pub struct OpenPositionWire {
+    pub wallet_id: String,
     pub address: String,
     pub open_reason: OpenReason,
     pub enter_mcap: f64,
@@ -449,9 +451,14 @@ pub enum PositionMessage {
         /// Scoring-time snapshot for self-learning (optional).
         learning_snapshot: Option<LearningTradeSnapshot>,
     },
+    /// End of copy-trade fan-out delay window for a mint.
+    ClearPendingMint {
+        mint: solana_address::Address,
+    },
     /// Internal: actual buy after delay
     ExecuteBuy {
         mint: solana_address::Address,
+        wallet_id: String,
         amount_sol: f64,
         open_reason: OpenReason,
         dev_address: Option<Address>,
@@ -466,6 +473,7 @@ pub enum PositionMessage {
     /// Internal: actual sell after delay
     ExecuteSell {
         mint: solana_address::Address,
+        wallet_id: String,
         percent: f64,
         reason: String,
     },
@@ -482,6 +490,7 @@ pub enum PositionMessage {
     /// dashboards remove the row from OPEN.
     AbandonPosition {
         mint: solana_address::Address,
+        wallet_id: Option<String>,
     },
     /// Tick: evaluate all open positions and redraw dashboard
     Tick,
@@ -514,10 +523,12 @@ pub enum PositionMessage {
 
 pub struct PositionManagerActor {
     config: SmartBuyConfig,
-    broker: Arc<dyn Broker>,
-    positions: HashMap<solana_address::Address, Position>,
-    /// Tracks mints with an ExecuteBuy already in-flight (800ms delay window).
-    pending_buys: HashSet<solana_address::Address>,
+    wallets: Arc<WalletRegistry>,
+    positions: HashMap<PositionKey, Position>,
+    /// Mint has passed InitiateBuy and is in the 800ms delay before fan-out buys.
+    pending_mints: HashSet<solana_address::Address>,
+    /// Per-wallet buy currently executing.
+    pending_wallet_buys: HashSet<PositionKey>,
     /// Mints that have been fully closed — never re-enter.
     closed_mints: HashSet<solana_address::Address>,
     /// Stores the most recent pool state (used for slippage simulation)
@@ -547,7 +558,7 @@ pub struct PositionManagerActor {
 
 impl PositionManagerActor {
     pub fn new(
-        broker: Arc<dyn Broker>,
+        wallets: Arc<WalletRegistry>,
         initial_balance_sol: f64,
         config: SmartBuyConfig,
         bot_trades: Arc<dyn BotTradeRepository + Send + Sync>,
@@ -573,9 +584,10 @@ impl PositionManagerActor {
         let balance_state = StdArc::new(std::sync::atomic::AtomicU64::new(initial_balance_sol.to_bits()));
         let actor = Self {
             config,
-            broker,
+            wallets,
             positions: HashMap::new(),
-            pending_buys: HashSet::new(),
+            pending_mints: HashSet::new(),
+            pending_wallet_buys: HashSet::new(),
             closed_mints: HashSet::new(),
             pool_cache: HashMap::new(),
             bucket_cache: HashMap::new(),
@@ -601,6 +613,61 @@ impl PositionManagerActor {
         (actor, tx, event_rx, paused_state, balance_state)
     }
 
+    fn pos_key(mint: Address, wallet_id: &str) -> PositionKey {
+        PositionKey {
+            mint,
+            wallet_id: wallet_id.to_string(),
+        }
+    }
+
+    fn any_position_for_mint(&self, mint: Address) -> bool {
+        self.positions.keys().any(|k| k.mint == mint)
+    }
+
+    fn unique_open_mints(&self) -> u32 {
+        let mut s = HashSet::new();
+        for k in self.positions.keys() {
+            s.insert(k.mint);
+        }
+        for m in &self.pending_mints {
+            s.insert(*m);
+        }
+        s.len() as u32
+    }
+
+    fn maybe_finalize_closed_mint(&mut self, mint: Address) {
+        if !self.positions.keys().any(|k| k.mint == mint) {
+            self.closed_mints.insert(mint);
+            self.pool_cache.remove(&mint);
+        }
+    }
+
+    fn sync_combined_balance(&self) {
+        let total = self.wallets.total_balance_sol();
+        self.balance_state.store(total.to_bits(), Ordering::Relaxed);
+    }
+
+    fn broadcast_wallet_balances(&self) {
+        self.sync_combined_balance();
+        for w in self.wallets.all() {
+            let _ = self.event_tx.try_send(WsFeedMessage::WalletBalanceUpdate {
+                wallet_id: w.id.clone(),
+                balance: w.balance_sol(),
+            });
+        }
+        let _ = self.event_tx.try_send(WsFeedMessage::BalanceUpdate {
+            balance: self.wallets.total_balance_sol(),
+        });
+    }
+
+    fn update_positions_pool_for_mint(&mut self, mint: Address, pool: Box<dyn Pool>) {
+        for (key, pos) in self.positions.iter_mut() {
+            if key.mint == mint {
+                pos.pool = pool.clone_box();
+            }
+        }
+    }
+
     /// Main actor loop — single-threaded, no locking needed.
     pub async fn run(&mut self) {
         while let Some(msg) = self.rx.recv().await {
@@ -609,9 +676,7 @@ impl PositionManagerActor {
                 PositionMessage::UpdatePool(pool) => {
                     let mint = pool.mint();
                     self.pool_cache.insert(mint, pool.clone_box());
-                    if let Some(pos) = self.positions.get_mut(&mint) {
-                        pos.pool = pool;
-                    }
+                    self.update_positions_pool_for_mint(mint, pool);
                 }
 
                 PositionMessage::UpdateTokenBucket(bucket) => {
@@ -619,10 +684,8 @@ impl PositionManagerActor {
                     self.pool_cache
                         .insert(mint, bucket.pool().clone_box());
                     self.bucket_cache.insert(mint, bucket.clone());
-                    if let Some(pos) = self.positions.get_mut(&mint) {
-                        pos.pool = bucket.pool().clone_box();
-                    }
-                    if self.positions.contains_key(&mint) {
+                    self.update_positions_pool_for_mint(mint, bucket.pool().clone_box());
+                    if self.any_position_for_mint(mint) {
                         self.spawn_live_snapshot_refresh(mint);
                     }
                 }
@@ -632,7 +695,14 @@ impl PositionManagerActor {
                     mcap,
                     use_jupiter,
                 } => {
-                    if let Some(pos) = self.positions.get_mut(&mint) {
+                    let keys: Vec<_> = self
+                        .positions
+                        .keys()
+                        .filter(|k| k.mint == mint)
+                        .cloned()
+                        .collect();
+                    for key in keys {
+                    if let Some(pos) = self.positions.get_mut(&key) {
                         let prev_jupiter = pos.use_jupiter_exit_mcap;
                         if use_jupiter {
                             pos.use_jupiter_exit_mcap = true;
@@ -658,9 +728,17 @@ impl PositionManagerActor {
                             }
                         }
                     }
+                    }
                 }
                 PositionMessage::ApplyLiveSnapshot { mint, live } => {
-                    if let Some(pos) = self.positions.get_mut(&mint) {
+                    let keys: Vec<_> = self
+                        .positions
+                        .keys()
+                        .filter(|k| k.mint == mint)
+                        .cloned()
+                        .collect();
+                    for key in keys {
+                    if let Some(pos) = self.positions.get_mut(&key) {
                         let prev_tape = pos.live_tape_curr.clone();
                         pos.live_tape_prev = prev_tape;
                         pos.live_tape_curr = Some(live.tape.clone());
@@ -716,6 +794,7 @@ impl PositionManagerActor {
                         pos.hold_mode = hold;
                         let _ = held;
                     }
+                    }
                 }
 
                 PositionMessage::SetPaused(paused) => {
@@ -743,12 +822,10 @@ impl PositionManagerActor {
 
                     let mint = pool.mint();
 
-                    // Reject if a position is already open OR an ExecuteBuy is already
-                    // in-flight for this mint. Without the pending_buys check, multiple
-                    // InitiateBuy signals arriving within the 800ms window would all
-                    // pass the positions guard and spawn redundant ExecuteBuy tasks.
-                    if self.positions.contains_key(&mint)
-                        || self.pending_buys.contains(&mint)
+                    // Reject duplicate signals on this mint (copy-trade opens multiple wallets
+                    // inside one InitiateBuy fan-out, not via repeated InitiateBuy).
+                    if self.any_position_for_mint(mint)
+                        || self.pending_mints.contains(&mint)
                         || self.closed_mints.contains(&mint)
                     {
                         continue;
@@ -769,8 +846,8 @@ impl PositionManagerActor {
                         continue;
                     }
 
-                    // --- Strategy controller gate -----------------------------------
-                    let open_now = (self.positions.len() + self.pending_buys.len()) as u32;
+                    // --- Strategy controller gate (unique mints, not wallet rows) ---
+                    let open_now = self.unique_open_mints();
                     match self.strategy.can_open(open_now) {
                         BuyDecision::Allow => {}
                         block => {
@@ -799,20 +876,38 @@ impl PositionManagerActor {
                         }
                     }
 
-                    self.pending_buys.insert(mint);
+                    self.pending_mints.insert(mint);
                     self.pool_cache.insert(mint, pool);
+                    let enabled: Vec<(String, f64)> = self
+                        .wallets
+                        .enabled_wallets()
+                        .iter()
+                        .map(|w| (w.id.clone(), w.amount_for_signal(amount_sol)))
+                        .collect();
+                    if enabled.is_empty() {
+                        eprintln!("[BUY] {mint} skipped: no enabled wallets");
+                        self.pending_mints.remove(&mint);
+                        continue;
+                    }
+                    self.strategy.note_position_opened();
                     let tx_clone = self.tx.clone();
                     tokio::spawn(async move {
                         sleep(Duration::from_millis(800)).await;
+                        for (wallet_id, wallet_amount_sol) in enabled {
+                            let _ = tx_clone
+                                .send(PositionMessage::ExecuteBuy {
+                                    mint,
+                                    wallet_id,
+                                    amount_sol: wallet_amount_sol,
+                                    open_reason: open_reason.clone(),
+                                    dev_address,
+                                    early_buyers: early_buyers.clone(),
+                                    learning_snapshot: learning_snapshot.clone(),
+                                })
+                                .await;
+                        }
                         let _ = tx_clone
-                            .send(PositionMessage::ExecuteBuy {
-                                mint,
-                                amount_sol,
-                                open_reason,
-                                dev_address,
-                                early_buyers,
-                                learning_snapshot,
-                            })
+                            .send(PositionMessage::ClearPendingMint { mint })
                             .await;
                     });
                 }
@@ -823,58 +918,94 @@ impl PositionManagerActor {
                 }
 
                 // ----------------------------------------------------------------
-                PositionMessage::AbandonPosition { mint } => {
-                    let had = self.positions.remove(&mint).is_some();
-                    self.pool_cache.remove(&mint);
-                    self.broker.forget_position(mint);
-                    let _ = self.event_tx.try_send(WsFeedMessage::PositionClose {
-                        address: mint.to_string(),
-                        reason: "abandoned (operator removed from OPEN)".into(),
-                    });
+                PositionMessage::AbandonPosition { mint, wallet_id } => {
+                    let keys: Vec<_> = self
+                        .positions
+                        .keys()
+                        .filter(|k| {
+                            k.mint == mint
+                                && wallet_id.as_ref().is_none_or(|w| w == &k.wallet_id)
+                        })
+                        .cloned()
+                        .collect();
+                    let mut had = false;
+                    for key in keys {
+                        if self.positions.remove(&key).is_some() {
+                            had = true;
+                            if let Some(w) = self.wallets.get(&key.wallet_id) {
+                                w.broker.forget_position(mint);
+                            }
+                            let _ = self.event_tx.try_send(WsFeedMessage::PositionClose {
+                                address: mint.to_string(),
+                                wallet_id: key.wallet_id.clone(),
+                                reason: "abandoned (operator removed from OPEN)".into(),
+                            });
+                        }
+                    }
+                    self.maybe_finalize_closed_mint(mint);
                     eprintln!(
-                        "[MANAGER] AbandonPosition {mint}: had_open={had}, pool_cache cleared, \
-                         broker tracking cleared"
+                        "[MANAGER] AbandonPosition {mint} wallet_id={wallet_id:?}: removed={had}"
                     );
+                }
+
+                PositionMessage::ClearPendingMint { mint } => {
+                    self.pending_mints.remove(&mint);
                 }
 
                 // ----------------------------------------------------------------
                 PositionMessage::ExecuteBuy {
                     mint,
+                    wallet_id,
                     amount_sol,
                     open_reason,
                     dev_address,
                     early_buyers,
                     learning_snapshot,
                 } => {
-                    self.pending_buys.remove(&mint);
+                    let pos_key = Self::pos_key(mint, &wallet_id);
+                    self.pending_wallet_buys.insert(pos_key.clone());
 
                     if self.paused {
+                        self.pending_wallet_buys.remove(&pos_key);
                         continue;
                     }
 
-                    if self.positions.contains_key(&mint) {
-                        eprintln!("[BUY] Skipped {mint} — position already open (ExecuteBuy)");
+                    let Some(wallet) = self.wallets.get(&wallet_id) else {
+                        eprintln!("[BUY] Skipped {mint} — unknown wallet_id={wallet_id}");
+                        self.pending_wallet_buys.remove(&pos_key);
+                        continue;
+                    };
+
+                    if self.positions.contains_key(&pos_key) {
+                        eprintln!(
+                            "[BUY] Skipped {mint} wallet_id={wallet_id} — position already open"
+                        );
+                        self.pending_wallet_buys.remove(&pos_key);
                         continue;
                     }
 
                     let Some(latest_pool) = self.pool_cache.get(&mint).map(|p| p.clone_box()) else {
-                        eprintln!("[BUY] Skipped {mint} — no pool in cache");
+                        eprintln!("[BUY] Skipped {mint} wallet_id={wallet_id} — no pool in cache");
+                        self.pending_wallet_buys.remove(&pos_key);
                         continue;
                     };
 
                     let v3_wire = learning_snapshot.as_ref().map(V3TapeWire::from_learning);
+                    let broker = wallet.broker.clone();
+                    let mode_label = broker.mode_label().to_string();
 
-                    let receipt = match self.broker.buy(mint, amount_sol, latest_pool.as_ref()).await {
+                    let receipt = match broker.buy(mint, amount_sol, latest_pool.as_ref()).await {
                         Ok(r) => {
                             let _ = self.event_tx.try_send(WsFeedMessage::TxEvent {
                                 kind: TxEventKind::Buy,
+                                wallet_id: wallet_id.clone(),
                                 mint: mint.to_string(),
                                 signature: r.signature.clone(),
                                 amount_sol: r.sol_spent,
                                 amount_sol_estimated: None,
                                 status: "sent".into(),
                                 reason: None,
-                                mode: self.broker.mode_label().to_string(),
+                                mode: mode_label.clone(),
                                 ts: now_secs(),
                                 v3_tape: v3_wire.clone(),
                                 time_kill_detail: None,
@@ -885,9 +1016,12 @@ impl PositionManagerActor {
                         }
                         Err(e) if is_buy_mint_unavailable(&e) => {
                             eprintln!(
-                                "[BUY] Skipped {mint} — mint not on RPC (stale/dead feed, not a trade): {e}"
+                                "[BUY] wallet_id={wallet_id} Skipped {mint} — mint not on RPC: {e}"
                             );
-                            self.closed_mints.insert(mint);
+                            self.pending_wallet_buys.remove(&pos_key);
+                            if !self.any_position_for_mint(mint) {
+                                self.closed_mints.insert(mint);
+                            }
                             if let Some(ref log) = self.learning {
                                 let log = log.clone();
                                 let mint_s = mint.to_string();
@@ -909,16 +1043,18 @@ impl PositionManagerActor {
                             continue;
                         }
                         Err(e) => {
-                            eprintln!("[BUY] Failed {mint}: {e}");
+                            eprintln!("[BUY] wallet_id={wallet_id} Failed {mint}: {e}");
+                            self.pending_wallet_buys.remove(&pos_key);
                             let _ = self.event_tx.try_send(WsFeedMessage::TxEvent {
                                 kind: TxEventKind::Buy,
+                                wallet_id: wallet_id.clone(),
                                 mint: mint.to_string(),
                                 signature: None,
                                 amount_sol,
                                 amount_sol_estimated: None,
                                 status: "failed".into(),
                                 reason: Some(e.to_string()),
-                                mode: self.broker.mode_label().to_string(),
+                                mode: mode_label,
                                 ts: now_secs(),
                                 v3_tape: v3_wire.clone(),
                                 time_kill_detail: None,
@@ -928,6 +1064,8 @@ impl PositionManagerActor {
                             continue;
                         }
                     };
+
+                    self.pending_wallet_buys.remove(&pos_key);
 
                     let current_time = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -941,6 +1079,7 @@ impl PositionManagerActor {
                     ) {
                         if self
                             .abort_buy_after_fill_mcap_spike(
+                                &wallet_id,
                                 mint,
                                 amount_sol,
                                 &receipt,
@@ -994,6 +1133,7 @@ impl PositionManagerActor {
                             }
                         });
                     let mut position = Position::new(
+                        wallet_id.clone(),
                         latest_pool,
                         tokens,
                         current_time,
@@ -1070,17 +1210,17 @@ impl PositionManagerActor {
                         "WS pool cache"
                     };
                     eprintln!(
-                        "[BUY] Opened {mint} | mcap={enter_mcap:.1} SOL ({mcap_src}) | spent={amount_sol:.4} SOL"
+                        "[BUY] wallet_id={wallet_id} Opened {mint} | mcap={enter_mcap:.1} SOL ({mcap_src}) | spent={amount_sol:.4} SOL"
                     );
-                    self.positions.insert(mint, position);
-                    self.strategy.note_position_opened();
+                    self.positions.insert(pos_key, position);
 
-                    if let Ok(bal) = self.broker.balance_sol().await {
-                        self.balance_state.store(bal.to_bits(), Ordering::Relaxed);
-                        let _ = self.event_tx.try_send(WsFeedMessage::BalanceUpdate { balance: bal });
+                    if let Ok(bal) = broker.balance_sol().await {
+                        wallet.set_balance_sol(bal);
                     }
+                    self.broadcast_wallet_balances();
                     let _ = self.event_tx.try_send(WsFeedMessage::PositionOpen {
                         address: mint.to_string(),
+                        wallet_id: wallet_id.clone(),
                         open_reason,
                         enter_mcap,
                         v3_tape: v3_wire,
@@ -1090,10 +1230,18 @@ impl PositionManagerActor {
                 // ----------------------------------------------------------------
                 PositionMessage::ExecuteSell {
                     mint,
+                    wallet_id,
                     percent,
                     reason,
                 } => {
-                    if let Some(mut pos) = self.positions.remove(&mint) {
+                    let pos_key = Self::pos_key(mint, &wallet_id);
+                    let Some(wallet) = self.wallets.get(&wallet_id) else {
+                        eprintln!("[SELL] unknown wallet_id={wallet_id} for {mint}");
+                        continue;
+                    };
+                    let broker = wallet.broker.clone();
+                    let mode_label = broker.mode_label().to_string();
+                    if let Some(mut pos) = self.positions.remove(&pos_key) {
                         let band_lo = self.config.exit_mcap_band_low_ratio;
                         let band_hi = self.config.exit_mcap_band_high_ratio;
                         let filt_pnl_at_sell = pos.pnl_filtered(band_lo, band_hi);
@@ -1126,8 +1274,7 @@ impl PositionManagerActor {
                             None
                         };
 
-                        let (return_value, sell_estimated_for_log, sell_signature) = match self
-                            .broker
+                        let (return_value, sell_estimated_for_log, sell_signature) = match broker
                             .sell(mint, sell_qty, pos.pool.as_ref(), close_ata)
                             .await
                         {
@@ -1148,6 +1295,7 @@ impl PositionManagerActor {
                                     pos.pending_partial_sell = false;
                                     let _ = self.event_tx.try_send(
                                         WsFeedMessage::ManualSellRequired {
+                                            wallet_id: wallet_id.clone(),
                                             mint: mint.to_string(),
                                             exit_reason: reason.clone(),
                                             detail: e.to_string(),
@@ -1163,20 +1311,21 @@ impl PositionManagerActor {
                                 }
                                 let _ = self.event_tx.try_send(WsFeedMessage::TxEvent {
                                     kind: TxEventKind::Sell,
+                                    wallet_id: wallet_id.clone(),
                                     mint: mint.to_string(),
                                     signature: None,
                                     amount_sol: 0.0,
                                     amount_sol_estimated: None,
                                     status: "failed".into(),
                                     reason: Some(format!("{}: {}", reason, e)),
-                                    mode: self.broker.mode_label().to_string(),
+                                    mode: mode_label.clone(),
                                     ts: now_secs(),
                                     v3_tape: None,
                                     time_kill_detail,
                                     pnl_mcap_pct: Some(mcap_pnl_pct),
                                     pnl_sol_pct: None,
                                 });
-                                self.positions.insert(mint, pos);
+                                self.positions.insert(pos_key, pos);
                                 continue;
                             }
                         };
@@ -1189,13 +1338,14 @@ impl PositionManagerActor {
                         };
                         let _ = self.event_tx.try_send(WsFeedMessage::TxEvent {
                             kind: TxEventKind::Sell,
+                            wallet_id: wallet_id.clone(),
                             mint: mint.to_string(),
                             signature: sell_signature,
                             amount_sol: return_value,
                             amount_sol_estimated: Some(sell_estimated_for_log),
                             status: "confirmed".into(),
                             reason: Some(reason.clone()),
-                            mode: self.broker.mode_label().to_string(),
+                            mode: mode_label.clone(),
                             ts: now_secs(),
                             v3_tape: None,
                             time_kill_detail: time_kill_detail.clone(),
@@ -1236,17 +1386,16 @@ impl PositionManagerActor {
                         if percent < 100.0 {
                             pos.holdings = Amount::from_float_native(pos.holdings.to_float() - sell_qty);
                             pos.pending_partial_sell = false;
-                            self.positions.insert(mint, pos);
+                            self.positions.insert(pos_key, pos);
                         }
 
-                        if let Ok(bal) = self.broker.balance_sol().await {
-                            self.balance_state.store(bal.to_bits(), Ordering::Relaxed);
-                            let _ = self.event_tx.try_send(WsFeedMessage::BalanceUpdate { balance: bal });
+                        if let Ok(bal) = broker.balance_sol().await {
+                            wallet.set_balance_sol(bal);
                         }
+                        self.broadcast_wallet_balances();
 
                         if percent >= 100.0 {
-                            self.closed_mints.insert(mint);
-                            let _ = self.pool_cache.remove(&mint);
+                            self.maybe_finalize_closed_mint(mint);
 
                             let overall_pnl_pct = (total_returned / invested_sol - 1.0) * 100.0;
 
@@ -1389,6 +1538,7 @@ impl PositionManagerActor {
 
                             let _ = self.event_tx.try_send(WsFeedMessage::PositionClose {
                                 address: mint.to_string(),
+                                wallet_id: wallet_id.clone(),
                                 reason: reason.clone(),
                             });
 
@@ -1423,6 +1573,7 @@ impl PositionManagerActor {
                                 .unwrap()
                                 .as_secs() as i64;
                             let entry = BotTradeEntry {
+                                wallet_id: wallet_id.clone(),
                                 mint: mint.to_string(),
                                 entry_mcap_sol,
                                 invested_sol: invested_sol_row,
@@ -1460,7 +1611,7 @@ impl PositionManagerActor {
                 // ----------------------------------------------------------------
                 PositionMessage::Tick => {
                     if self.config.exit_v4.enabled {
-                        let mints: Vec<_> = self.positions.keys().copied().collect();
+                        let mints: HashSet<_> = self.positions.keys().map(|k| k.mint).collect();
                         for mint in mints {
                             if self.bucket_cache.contains_key(&mint) {
                                 self.spawn_live_snapshot_refresh(mint);
@@ -1470,8 +1621,11 @@ impl PositionManagerActor {
                     self.process_positions().await;
                 }
                 PositionMessage::GetPnl { mint, responder } => {
-                    // Check if the position exists, grab its PnL, and send it back
-                    let pnl = self.positions.get(&mint).map(|pos| pos.pnl());
+                    let pnl = self
+                        .positions
+                        .iter()
+                        .find(|(k, _)| k.mint == mint)
+                        .map(|(_, pos)| pos.pnl());
 
                     // The send fails if the receiver was dropped, which we can safely ignore
                     let _ = responder.send(pnl);
@@ -1481,12 +1635,13 @@ impl PositionManagerActor {
                     let snapshot: Vec<OpenPositionWire> = self
                         .positions
                         .iter()
-                        .filter_map(|(mint, pos)| {
+                        .filter_map(|(key, pos)| {
                             let open_reason = pos.open_reason.clone()?;
                             let enter_mcap = pos.enter_mcap.to_float();
                             let market_cap = pos.display_market_cap();
                             Some(OpenPositionWire {
-                                address: mint.to_string(),
+                                wallet_id: key.wallet_id.clone(),
+                                address: key.mint.to_string(),
                                 open_reason,
                                 enter_mcap,
                                 pnl: pos.pnl(),
@@ -1562,6 +1717,7 @@ impl PositionManagerActor {
     /// position was **not** opened (abort succeeded or we gave up after sell).
     async fn abort_buy_after_fill_mcap_spike(
         &mut self,
+        wallet_id: &str,
         mint: Address,
         amount_sol: f64,
         receipt: &BuyReceipt,
@@ -1571,6 +1727,11 @@ impl PositionManagerActor {
         dev_address: Option<Address>,
         now: u64,
     ) -> bool {
+        let Some(wallet) = self.wallets.get(wallet_id) else {
+            return false;
+        };
+        let broker = wallet.broker.clone();
+        let mode_label = broker.mode_label().to_string();
         let reason = if spike.adverse {
             format!(
                 "FILL MCAP ADVERSE ABORT ({:.2}x < {:.2}x: score {:.1}→fill {:.1} SOL)",
@@ -1615,11 +1776,7 @@ impl PositionManagerActor {
         }
 
         let sell_qty = receipt.tokens_received;
-        match self
-            .broker
-            .sell(mint, sell_qty, pool, true)
-            .await
-        {
+        match broker.sell(mint, sell_qty, pool, true).await {
             Ok(r) => {
                 let pnl_pct = if amount_sol > 0.0 {
                     (r.sol_received_actual / amount_sol - 1.0) * 100.0
@@ -1635,13 +1792,14 @@ impl PositionManagerActor {
                 };
                 let _ = self.event_tx.try_send(WsFeedMessage::TxEvent {
                     kind: TxEventKind::Sell,
+                    wallet_id: wallet_id.to_string(),
                     mint: mint.to_string(),
                     signature: r.signature.clone(),
                     amount_sol: r.sol_received_actual,
                     amount_sol_estimated: Some(r.sol_received_estimated),
                     status: "confirmed".into(),
                     reason: Some(reason.clone()),
-                    mode: self.broker.mode_label().to_string(),
+                    mode: mode_label,
                     ts: now_secs(),
                     v3_tape: None,
                     time_kill_detail: None,
@@ -1650,16 +1808,16 @@ impl PositionManagerActor {
                 });
 
                 let pnl_sol = r.sol_received_actual - amount_sol;
-                self.strategy.note_position_opened();
                 self.strategy.note_position_closed(pnl_sol);
 
-                if let Ok(bal) = self.broker.balance_sol().await {
-                    self.balance_state.store(bal.to_bits(), Ordering::Relaxed);
-                    let _ = self.event_tx.try_send(WsFeedMessage::BalanceUpdate { balance: bal });
+                if let Ok(bal) = broker.balance_sol().await {
+                    wallet.set_balance_sol(bal);
                 }
+                self.broadcast_wallet_balances();
 
                 let exit_mcap_sol = pool.market_cap().amount().to_float();
                 let entry = BotTradeEntry {
+                    wallet_id: wallet_id.to_string(),
                     mint: mint.to_string(),
                     entry_mcap_sol: spike.fill_mcap_sol,
                     invested_sol: amount_sol,
@@ -1690,7 +1848,7 @@ impl PositionManagerActor {
         let Some(bucket) = self.bucket_cache.get(&mint).cloned() else {
             return;
         };
-        let Some(pos) = self.positions.get(&mint) else {
+        let Some((_, pos)) = self.positions.iter().find(|(k, _)| k.mint == mint) else {
             return;
         };
         let entry_time = pos.entry_time;
@@ -1798,11 +1956,12 @@ impl PositionManagerActor {
         let v4_cfg = self.config.exit_v4.clone();
         let global_cfg = self.config.clone();
 
-        let mut actions: Vec<(solana_address::Address, f64, String, bool)> = Vec::new();
+        let mut actions: Vec<(PositionKey, f64, String, bool)> = Vec::new();
         let exit_mcap_rpc = self.post_exit_rpc.clone();
         let exit_mcap_tx = self.tx.clone();
 
-        for (mint, pos) in self.positions.iter_mut() {
+        for (key, pos) in self.positions.iter_mut() {
+            let mint = key.mint;
             // Skip positions that are already queued for a full close.
             if pos.is_closing {
                 continue;
@@ -1820,7 +1979,7 @@ impl PositionManagerActor {
                 let force_jupiter = pos.use_jupiter_exit_mcap || pos.mcap_ceiling_triggered;
                 pos.last_exit_mcap_poll_at = current_time;
                 let tx = exit_mcap_tx.clone();
-                let mint_poll = *mint;
+                let mint_poll = mint;
                 tokio::spawn(async move {
                     let mint_str = mint_poll.to_string();
                     let (mcap, use_jupiter) =
@@ -1938,6 +2097,7 @@ impl PositionManagerActor {
 
             let _ = self.event_tx.try_send(WsFeedMessage::PositionUpdate {
                 address: mint.to_string(),
+                wallet_id: key.wallet_id.clone(),
                 pnl: profit,
                 holdings: pos.holdings.to_float(),
                 market_cap: current_mcap,
@@ -2018,7 +2178,7 @@ impl PositionManagerActor {
                             pos.decay_streak, pos.recovery_score
                         )
                     };
-                    actions.push((*mint, 100.0, reason, false));
+                    actions.push((key.clone(), 100.0, reason, false));
                     continue;
                 }
             }
@@ -2038,7 +2198,7 @@ impl PositionManagerActor {
                 && profit < global_cfg.time_kill_min_profit_pct
             {
                 pos.is_closing = true;
-                actions.push((*mint, 100.0, "TIME KILL".to_string(), false));
+                actions.push((key.clone(), 100.0, "TIME KILL".to_string(), false));
                 continue;
             }
 
@@ -2068,7 +2228,7 @@ impl PositionManagerActor {
                     tick_drop,
                 );
                 eprintln!("[EXIT] {mint}: {reason}");
-                actions.push((*mint, 100.0, reason, true));
+                actions.push((key.clone(), 100.0, reason, true));
                 continue;
             }
             if in_sl_grace {
@@ -2095,7 +2255,7 @@ impl PositionManagerActor {
                     tick_drop,
                 );
                 eprintln!("[EXIT] {mint}: {reason}");
-                actions.push((*mint, 100.0, reason, false));
+                actions.push((key.clone(), 100.0, reason, false));
                 continue;
             }
 
@@ -2119,7 +2279,7 @@ impl PositionManagerActor {
                 }
                 pos.pending_partial_sell = true;
                 actions.push((
-                    *mint,
+                    key.clone(),
                     sell_pct,
                     format!("MCAP CEILING ({sell_pct:.0}% lock, moonbag)"),
                     false,
@@ -2142,7 +2302,7 @@ impl PositionManagerActor {
                     } else {
                         "TRAILING EXIT".to_string()
                     };
-                    actions.push((*mint, 100.0, reason, false));
+                    actions.push((key.clone(), 100.0, reason, false));
                     continue;
                 }
             }
@@ -2192,7 +2352,7 @@ impl PositionManagerActor {
                 pos.tp1_triggered = true;
                 pos.pending_partial_sell = true;
                 actions.push((
-                    *mint,
+                    key.clone(),
                     tp_cfg.tp1_sell_pct,
                     tp_label(1, tp_cfg.tp1_pct),
                     false,
@@ -2204,7 +2364,7 @@ impl PositionManagerActor {
                 pos.tp2_triggered = true;
                 pos.pending_partial_sell = true;
                 actions.push((
-                    *mint,
+                    key.clone(),
                     tp_cfg.tp2_sell_pct,
                     tp_label(2, tp_cfg.tp2_pct),
                     false,
@@ -2216,7 +2376,7 @@ impl PositionManagerActor {
                 pos.tp3_triggered = true;
                 pos.pending_partial_sell = true;
                 actions.push((
-                    *mint,
+                    key.clone(),
                     moonbag_sell(tp_cfg.tp3_sell_pct),
                     tp_label(3, tp_cfg.tp3_pct),
                     false,
@@ -2228,7 +2388,7 @@ impl PositionManagerActor {
                 pos.tp4_triggered = true;
                 pos.pending_partial_sell = true;
                 actions.push((
-                    *mint,
+                    key.clone(),
                     moonbag_sell(tp_cfg.tp4_sell_pct),
                     tp_label(4, tp_cfg.tp4_pct),
                     false,
@@ -2240,7 +2400,7 @@ impl PositionManagerActor {
                 pos.tp5_triggered = true;
                 pos.pending_partial_sell = true;
                 actions.push((
-                    *mint,
+                    key.clone(),
                     moonbag_sell(tp_cfg.tp5_sell_pct),
                     tp_label(5, tp_cfg.tp5_pct),
                     false,
@@ -2249,8 +2409,8 @@ impl PositionManagerActor {
         }
 
         // Execute collected actions after releasing the mutable borrow.
-        for (mint, percent, reason, urgent) in actions {
-            self.schedule_sell(mint, percent, reason, urgent);
+        for (key, percent, reason, urgent) in actions {
+            self.schedule_sell(key.mint, key.wallet_id, percent, reason, urgent);
         }
 
         if current_time > self.last_print_time {
@@ -2263,6 +2423,7 @@ impl PositionManagerActor {
     fn schedule_sell(
         &self,
         mint: solana_address::Address,
+        wallet_id: String,
         percent: f64,
         reason: String,
         urgent: bool,
@@ -2275,6 +2436,7 @@ impl PositionManagerActor {
             let _ = tx_clone
                 .send(PositionMessage::ExecuteSell {
                     mint,
+                    wallet_id,
                     percent,
                     reason,
                 })
@@ -2307,8 +2469,8 @@ impl PositionManagerActor {
         );
         println!("-------------------------------------------------------------------------");
 
-        for (mint, pos) in &self.positions {
-            let mint_str = mint.to_string();
+        for (key, pos) in &self.positions {
+            let mint_str = key.mint.to_string();
             let short_mint = if mint_str.len() > 8 {
                 format!("{}..{}", &mint_str[..4], &mint_str[mint_str.len() - 4..])
             } else {
@@ -2450,6 +2612,7 @@ pub enum WsCommand {
 pub enum WsFeedMessage {
     PositionOpen {
         address: String,
+        wallet_id: String,
         open_reason: OpenReason,
         enter_mcap: f64,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -2457,6 +2620,7 @@ pub enum WsFeedMessage {
     },
     PositionUpdate {
         address: String,
+        wallet_id: String,
         pnl: f64,
         holdings: f64,
         market_cap: f64,
@@ -2467,9 +2631,14 @@ pub enum WsFeedMessage {
     },
     PositionClose {
         address: String,
+        wallet_id: String,
         reason: String,
     },
     BalanceUpdate {
+        balance: f64,
+    },
+    WalletBalanceUpdate {
+        wallet_id: String,
         balance: f64,
     },
     PausedState {
@@ -2480,6 +2649,7 @@ pub enum WsFeedMessage {
     /// one of: "sent", "confirmed", "failed", "rejected".
     TxEvent {
         kind: TxEventKind,
+        wallet_id: String,
         mint: String,
         signature: Option<String>,
         /// For sells: on-chain wallet lamport delta / 1e9 (fees, rent refund included).
@@ -2504,6 +2674,7 @@ pub enum WsFeedMessage {
     },
     /// Bot could not auto-sell (Jupiter quote/route exhausted). Position stays OPEN.
     ManualSellRequired {
+        wallet_id: String,
         mint: String,
         exit_reason: String,
         detail: String,

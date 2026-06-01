@@ -22,11 +22,12 @@ impl BotTradeRepository for BotTradesRepositoryPostgres {
         let row: (i64,) = sqlx::query_as(
             r#"
             INSERT INTO bot_trades
-                (mint, entry_mcap_sol, invested_sol, realized_pnl_pct, close_reason, entry_at, closed_at, exit_mcap_sol, entry_meta)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                (wallet_id, mint, entry_mcap_sol, invested_sol, realized_pnl_pct, close_reason, entry_at, closed_at, exit_mcap_sol, entry_meta)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             RETURNING id
             "#,
         )
+        .bind(&entry.wallet_id)
         .bind(&entry.mint)
         .bind(entry.entry_mcap_sol)
         .bind(entry.invested_sol)

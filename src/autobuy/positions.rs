@@ -1,3 +1,5 @@
+use std::hash::{Hash, Hasher};
+
 use solana_address::Address;
 
 use crate::{
@@ -11,7 +13,28 @@ use crate::{
     scoring::features::EarlyTapePoint,
 };
 
+/// In-memory position key: same mint may have one row per wallet.
+#[derive(Clone, Debug, Eq)]
+pub struct PositionKey {
+    pub mint: Address,
+    pub wallet_id: String,
+}
+
+impl PartialEq for PositionKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.mint == other.mint && self.wallet_id == other.wallet_id
+    }
+}
+
+impl Hash for PositionKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.mint.hash(state);
+        self.wallet_id.hash(state);
+    }
+}
+
 pub struct Position {
+    pub wallet_id: String,
     pub pool: Box<dyn Pool>,
     pub initial_holdings: Amount,
     pub holdings: Amount,
@@ -98,6 +121,7 @@ impl Position {
     /// buy lands), use as `enter_mcap` instead of `pool.market_cap()` so entry
     /// matches the fill, not a possibly newer WS pool tick.
     pub fn new(
+        wallet_id: String,
         pool: Box<dyn Pool>,
         buy_amount: Amount,
         current_time: u64,
@@ -109,6 +133,7 @@ impl Position {
             pool.market_cap().amount()
         };
         Self {
+            wallet_id,
             highest_mcap: enter_mcap.to_float(),
             enter_mcap,
             pool,

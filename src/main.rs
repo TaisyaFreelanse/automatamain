@@ -2,8 +2,8 @@ use dotenvy::dotenv;
 use futures::{SinkExt, StreamExt};
 use loggaper::{
     autobuy::{
-        broker::Broker,
-        execution::{build_broker, ExecutionMode},
+        execution::ExecutionMode,
+        wallet_registry::{build_wallet_registry, WalletRegistry, WalletWire},
         manager::{
             OpenPositionWire, OpenReason, PositionManagerActor, PositionMessage, WsCommand,
             WsFeedMessage,
@@ -37,9 +37,9 @@ use loggaper::{
         setup_solana_rpc, waiter::DatabaseCreateWaiter,
     },
 };
-use solana_keypair::{Keypair, Signer};
 use std::sync::Arc;
 use std::{
+    collections::HashMap,
     sync::atomic::Ordering,
     time::{Instant, SystemTime},
 };
@@ -228,6 +228,7 @@ async fn main() {
         balance: std::sync::Arc<std::sync::atomic::AtomicU64>,
         buy_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
         pubkey: String,
+        wallet_registry: Arc<WalletRegistry>,
         mode: &'static str,
         feed_metrics: Arc<Vec<Arc<FeedMetrics>>>,
         bot_metrics: Arc<BotMetrics>,
@@ -250,26 +251,25 @@ async fn main() {
     let (general_tx, mut general_rx) = mpsc::channel(2048);
     let (broadcast_tx, _) = broadcast::channel::<WsFeedMessage>(4096);
 
-    // Wallet pubkey is only displayed by `/pubkey` — derived lazily so demo
-    // mode does not require a `PRIVATE_KEY` env to be set.
-    let pubkey_string = std::env::var("PRIVATE_KEY")
-        .ok()
-        .map(|sk| Keypair::from_base58_string(&sk).pubkey().to_string())
-        .unwrap_or_else(|| "demo-no-wallet".to_string());
-
-    // Broker is chosen based on `execution.mode` in `filter_config.yaml`:
-    //   demo -> MockBroker (start_balance_sol)
-    //   live -> SolanaBroker (real wallet + mainnet RPC, slippage/priority/retries)
-    // The rest of the bot uses the `Broker` trait, so PositionManagerActor
-    // and the scoring/strategy pipeline are unchanged.
-    let broker: Arc<dyn Broker> = match build_broker(&config.execution, config.start_balance_sol).await {
-        Ok(b) => b,
+    let wallet_registry = match build_wallet_registry(
+        &config.wallets,
+        &config.execution,
+        config.start_balance_sol,
+    )
+    .await
+    {
+        Ok(r) => Arc::new(r),
         Err(e) => {
-            eprintln!("[FATAL] Failed to build broker: {e}");
+            eprintln!("[FATAL] Failed to build wallet registry: {e}");
             std::process::exit(1);
         }
     };
-    println!("[BOOT] Broker active: {}", broker.mode_label());
+    let pubkey_string = wallet_registry.primary_pubkey();
+    println!(
+        "[BOOT] Wallets active: {} (mode={})",
+        wallet_registry.all().len(),
+        wallet_registry.mode_label()
+    );
     if config.scoring.legacy_scoring {
         eprintln!(
             "[BOOT] scoring=legacy_pre_v2 (YAML thresholds for snapshot+score; learning merge ignored)"
@@ -281,10 +281,11 @@ async fn main() {
     let dev_ranker_handle = dev_ranker::spawn(config.persistence.clone());
     let smart_money_handle = smart_money::spawn(config.persistence.clone());
 
+    let initial_balance = wallet_registry.total_balance_sol();
     let (mut manager_actor, manager_tx, mut event_rx, paused_state, balance_state) =
         PositionManagerActor::new(
-            broker.clone(),
-            config.start_balance_sol,
+            wallet_registry.clone(),
+            initial_balance,
             config.buy_config.clone(),
             bot_trades,
             dev_blacklist.clone(),
@@ -484,25 +485,18 @@ async fn main() {
 
     let balance_refresh_secs = config.execution.live.balance_refresh_secs.max(1);
     tokio::spawn({
-        let broker = broker.clone();
+        let wallets = wallet_registry.clone();
         let balance_state = balance_state.clone();
 
         async move {
             let mut tick_count: u64 = 0;
             loop {
                 tick_count = tick_count.wrapping_add(1);
-
-                // Pull a fresh value from RPC on the configured cadence; on
-                // the other ticks reuse the broker's cached value. For the
-                // mock broker `refresh_onchain_balance` is a no-op.
-                if tick_count.is_multiple_of(balance_refresh_secs)
-                    && let Err(e) = broker.refresh_onchain_balance().await {
-                    eprintln!("[BROKER] balance refresh failed: {e}");
-                }
-
-                if let Ok(bal) = broker.balance_sol().await {
-                    balance_state.store(f64::to_bits(bal), Ordering::Relaxed);
-                }
+                wallets
+                    .refresh_all_balances(balance_refresh_secs, tick_count)
+                    .await;
+                let total = wallets.total_balance_sol();
+                balance_state.store(total.to_bits(), Ordering::Relaxed);
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         }
@@ -515,7 +509,8 @@ async fn main() {
         balance: balance_state,
         buy_size: buy_size_state.clone(),
         pubkey: pubkey_string,
-        mode: broker.mode_label(),
+        wallet_registry: wallet_registry.clone(),
+        mode: wallet_registry.mode_label(),
         feed_metrics: feed_metrics_vec.clone(),
         bot_metrics: bot_metrics.clone(),
         manager_tx: manager_tx.clone(),
@@ -546,8 +541,12 @@ async fn main() {
             })
         }
 
-        async fn get_bot_trades(State(state): State<ApiState>) -> impl IntoResponse {
-            const Q: &str = "SELECT id, mint, entry_mcap_sol, invested_sol, realized_pnl_pct, close_reason, \
+        async fn get_bot_trades(
+            State(state): State<ApiState>,
+            axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+        ) -> impl IntoResponse {
+            let wallet_filter = params.get("wallet_id").cloned();
+            const Q_ALL: &str = "SELECT id, wallet_id, mint, entry_mcap_sol, invested_sol, realized_pnl_pct, close_reason, \
                  entry_at, closed_at, exit_mcap_sol, entry_meta, \
                  post_exit_mcap_10s, post_exit_mcap_30s, post_exit_mcap_50s, post_exit_mcap_70s, \
                  post_exit_mcap_100s, post_exit_mcap_180s, post_exit_mcap_240s, post_exit_mcap_300s, \
@@ -559,9 +558,31 @@ async fn main() {
                  post_exit_pct_5m, post_exit_pct_10m, post_exit_pct_15m, post_exit_pct_30m, \
                  post_exit_max_pct, post_exit_min_pct, post_exit_tracking_done \
                  FROM bot_trades ORDER BY closed_at DESC";
+            const Q_WALLET: &str = "SELECT id, wallet_id, mint, entry_mcap_sol, invested_sol, realized_pnl_pct, close_reason, \
+                 entry_at, closed_at, exit_mcap_sol, entry_meta, \
+                 post_exit_mcap_10s, post_exit_mcap_30s, post_exit_mcap_50s, post_exit_mcap_70s, \
+                 post_exit_mcap_100s, post_exit_mcap_180s, post_exit_mcap_240s, post_exit_mcap_300s, \
+                 post_exit_mcap_5m, post_exit_mcap_10m, post_exit_mcap_15m, post_exit_mcap_30m, \
+                 post_exit_max_mcap, post_exit_min_mcap, \
+                 post_exit_time_to_max_secs, post_exit_time_to_min_secs, \
+                 post_exit_pct_10s, post_exit_pct_30s, post_exit_pct_50s, post_exit_pct_70s, \
+                 post_exit_pct_100s, post_exit_pct_180s, post_exit_pct_240s, post_exit_pct_300s, \
+                 post_exit_pct_5m, post_exit_pct_10m, post_exit_pct_15m, post_exit_pct_30m, \
+                 post_exit_max_pct, post_exit_min_pct, post_exit_tracking_done \
+                 FROM bot_trades WHERE wallet_id = $1 ORDER BY closed_at DESC";
             let mut last_err = None;
             for attempt in 0..3u8 {
-                match sqlx::query_as::<_, BotTradeRow>(Q).fetch_all(&state.pool).await {
+                let q = if let Some(ref wid) = wallet_filter {
+                    sqlx::query_as::<_, BotTradeRow>(Q_WALLET)
+                        .bind(wid)
+                        .fetch_all(&state.pool)
+                        .await
+                } else {
+                    sqlx::query_as::<_, BotTradeRow>(Q_ALL)
+                        .fetch_all(&state.pool)
+                        .await
+                };
+                match q {
                     Ok(rows) => return Json(rows).into_response(),
                     Err(e) => {
                         let retryable = e.to_string().contains("timed out");
@@ -826,17 +847,123 @@ async fn main() {
             struct Status {
                 paused: bool,
                 balance_sol: f64,
+                total_balance_sol: f64,
                 mode: &'static str,
                 wallet: String,
+                wallets: Vec<WalletWire>,
             }
+            let total = state.wallet_registry.total_balance_sol();
             Json(Status {
                 paused: state.paused.load(std::sync::atomic::Ordering::Relaxed),
-                balance_sol: f64::from_bits(
-                    state.balance.load(std::sync::atomic::Ordering::Relaxed),
-                ),
+                balance_sol: total,
+                total_balance_sol: total,
                 mode: state.mode,
                 wallet: state.pubkey.clone(),
+                wallets: state.wallet_registry.wire_snapshots(),
             })
+        }
+
+        async fn get_wallets(State(state): State<ApiState>) -> impl IntoResponse {
+            Json(state.wallet_registry.wire_snapshots())
+        }
+
+        async fn put_wallets(
+            State(state): State<ApiState>,
+            Json(body): Json<serde_json::Value>,
+        ) -> impl IntoResponse {
+            let Some(arr) = body.get("wallets").and_then(|v| v.as_array()) else {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "body must include \"wallets\": [...]"})),
+                )
+                    .into_response();
+            };
+            let mut patches = Vec::new();
+            for v in arr {
+                let Some(id) = v.get("id").and_then(|x| x.as_str()) else {
+                    continue;
+                };
+                let enabled = v.get("enabled").and_then(|x| x.as_bool());
+                let size_sol = v.get("size_sol").and_then(|x| {
+                    if x.is_null() {
+                        Some(None)
+                    } else {
+                        x.as_f64().map(Some)
+                    }
+                });
+                if let Some(w) = state.wallet_registry.get(id) {
+                    if let Some(on) = enabled {
+                        w.set_enabled(on);
+                    }
+                    if let Some(sz) = size_sol {
+                        w.set_size_sol(sz);
+                    }
+                    patches.push(loggaper::autobuy::wallet_registry::WalletEntryConfig {
+                        id: id.to_string(),
+                        label: w.label.clone(),
+                        enabled: w.is_enabled(),
+                        private_key_env: w.private_key_env.clone(),
+                        size_sol: w.size_sol(),
+                        demo_balance_sol: None,
+                    });
+                }
+            }
+            let path = &state.config_path;
+            if let Err(e) = rewrite_yaml_wallets(path, &patches) {
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e})),
+                )
+                    .into_response();
+            }
+            Json(state.wallet_registry.wire_snapshots()).into_response()
+        }
+
+        async fn get_pnl(State(state): State<ApiState>) -> impl IntoResponse {
+            #[derive(serde::Serialize)]
+            struct WalletPnl {
+                wallet_id: String,
+                open_unrealized_sol: f64,
+            }
+            #[derive(serde::Serialize)]
+            struct PnlResponse {
+                combined_realized_sol: f64,
+                combined_open_unrealized_sol: f64,
+                per_wallet: Vec<WalletPnl>,
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if state
+                .manager_tx
+                .send(PositionMessage::GetOpenPositions { responder: tx })
+                .await
+                .is_err()
+            {
+                return Json(PnlResponse {
+                    combined_realized_sol: 0.0,
+                    combined_open_unrealized_sol: 0.0,
+                    per_wallet: vec![],
+                })
+                .into_response();
+            }
+            let open = rx.await.unwrap_or_default();
+            let mut per_wallet: HashMap<String, f64> = HashMap::new();
+            for p in &open {
+                *per_wallet.entry(p.wallet_id.clone()).or_insert(0.0) += p.pnl;
+            }
+            let combined_open: f64 = per_wallet.values().sum();
+            let per: Vec<WalletPnl> = per_wallet
+                .into_iter()
+                .map(|(wallet_id, open_unrealized_sol)| WalletPnl {
+                    wallet_id,
+                    open_unrealized_sol,
+                })
+                .collect();
+            Json(PnlResponse {
+                combined_realized_sol: 0.0,
+                combined_open_unrealized_sol: combined_open,
+                per_wallet: per,
+            })
+            .into_response()
         }
 
         async fn get_buy_size(State(state): State<ApiState>) -> impl IntoResponse {
@@ -1044,6 +1171,10 @@ async fn main() {
                 )
                     .into_response();
             };
+            let wallet_id = body
+                .get("wallet_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             let mut abandoned: Vec<String> = Vec::new();
             let mut invalid: Vec<String> = Vec::new();
             for v in arr {
@@ -1059,7 +1190,10 @@ async fn main() {
                 };
                 if state
                     .manager_tx
-                    .send(PositionMessage::AbandonPosition { mint })
+                    .send(PositionMessage::AbandonPosition {
+                        mint,
+                        wallet_id: wallet_id.clone(),
+                    })
                     .await
                     .is_err()
                 {
@@ -1093,6 +1227,8 @@ async fn main() {
             .route("/mode", get(get_mode).put(put_mode))
             .route("/positions", get(get_open_positions))
             .route("/positions/abandon", post(post_positions_abandon))
+            .route("/wallets", get(get_wallets).put(put_wallets))
+            .route("/pnl", get(get_pnl))
             .with_state(api_state);
 
         let listener = tokio::net::TcpListener::bind(&http_addr)
@@ -2113,7 +2249,7 @@ async fn main() {
                 // SolanaBroker this updates tracked token holdings and the
                 // cached SOL balance whenever our wallet appears in a trade.
                 // The MockBroker's default impl is a no-op.
-                broker.on_trade(trade_action.as_ref(), bucket.pool());
+                wallet_registry.on_trade(trade_action.as_ref(), bucket.pool());
 
                 tokio::spawn({
                     let trade_action = trade_action.clone();
@@ -2319,6 +2455,25 @@ fn rewrite_yaml_mode(content: &str, new_mode: &str) -> String {
     }
 
     out
+}
+
+fn rewrite_yaml_wallets(
+    path: &str,
+    wallets: &[loggaper::autobuy::wallet_registry::WalletEntryConfig],
+) -> Result<(), String> {
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
+    let mut doc: serde_yaml::Value =
+        serde_yaml::from_str(&content).map_err(|e| format!("parse yaml: {e}"))?;
+    let wv = serde_yaml::to_value(wallets).map_err(|e| format!("wallets value: {e}"))?;
+    if let Some(map) = doc.as_mapping_mut() {
+        map.insert(serde_yaml::Value::from("wallets"), wv);
+    } else {
+        return Err("root yaml is not a mapping".into());
+    }
+    let out = serde_yaml::to_string(&doc).map_err(|e| format!("serialize: {e}"))?;
+    std::fs::write(path, out).map_err(|e| format!("write {path}: {e}"))?;
+    Ok(())
 }
 
 #[cfg(test)]

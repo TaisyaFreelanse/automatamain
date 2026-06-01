@@ -2,8 +2,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     autobuy::{
-        execution::ExecutionConfig, filters::creator::CreatorStatisticsFilter,
+        execution::ExecutionConfig,
+        filters::creator::CreatorStatisticsFilter,
         manager::SmartBuyConfig,
+        wallet_registry::WalletEntryConfig,
     },
     scoring::config::{PersistenceConfig, ScoringConfig, StrategyConfig},
 };
@@ -97,6 +99,10 @@ pub struct Config {
     /// Block re-buy on mints that showed bonding WS vs SOL PnL divergence.
     #[serde(default)]
     pub curve_quarantine: CurveQuarantineConfig,
+
+    /// Copy-trade wallets (keys in env via `private_key_env`). Empty = single `PRIVATE_KEY` wallet_1.
+    #[serde(default)]
+    pub wallets: Vec<WalletEntryConfig>,
 }
 
 /// Cooldown on dev wallet after bot SL CRASH / deep SL on our trades.
