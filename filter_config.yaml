@@ -240,8 +240,8 @@ scoring:
     max_b2s_drop_ratio: 0.6
     max_sell_absorption_ratio: 1.5
     min_buys_per_sec: 0.0
-    # Strong setups (A+ or score>=10): on cont_b2s_worsening / cont_sell_absorption only,
-    # wait and re-poll before final skip. Weak tiers / other cont reasons unchanged.
+    # Strong setups (A+ or score>=10): second-look on cont_b2s_worsening / cont_sell_absorption;
+    # A+ also on cont_no_uptick (dip-then-rip). Other cont reasons unchanged.
     second_look:
       enabled: true
       wait_ms: 1250
@@ -255,6 +255,8 @@ scoring:
       min_mcap_sol: 90.0
       strong_upticks: 2
       strong_new_buyers: 2
+      # Block buy after recheck if mcap collapsed vs score peak (5LkxnE-style).
+      recheck_min_vs_peak_ratio: 0.78
   # Anti-parabolic peak gate: skip weak A-tier entries with no smart money bought
   # at the local peak unless the confirm window shows strong fresh demand. A+ /
   # smart-money / runner setups are exempt. Ships dark (enabled: false).

@@ -296,6 +296,10 @@ pub struct ContinuationAplusPeakGuardConfig {
     pub strong_upticks: u32,
     #[serde(default = "default_aplus_peak_strong_new_buyers")]
     pub strong_new_buyers: u64,
+    /// After deferred recheck, reject buy if `recheck_mcap` is below this fraction
+    /// of score-time peak/current (aligns with fill_mcap_abort_min_ratio).
+    #[serde(default = "default_aplus_peak_recheck_min_vs_peak_ratio")]
+    pub recheck_min_vs_peak_ratio: f64,
 }
 
 impl Default for ContinuationAplusPeakGuardConfig {
@@ -306,6 +310,7 @@ impl Default for ContinuationAplusPeakGuardConfig {
             min_mcap_sol: default_aplus_peak_min_mcap_sol(),
             strong_upticks: default_aplus_peak_strong_upticks(),
             strong_new_buyers: default_aplus_peak_strong_new_buyers(),
+            recheck_min_vs_peak_ratio: default_aplus_peak_recheck_min_vs_peak_ratio(),
         }
     }
 }
@@ -324,6 +329,9 @@ fn default_aplus_peak_strong_upticks() -> u32 {
 }
 fn default_aplus_peak_strong_new_buyers() -> u64 {
     2
+}
+fn default_aplus_peak_recheck_min_vs_peak_ratio() -> f64 {
+    0.78
 }
 
 /// Continuation Validation Layer (doc 2.1 / 2.2 / 2.3). After a token passes

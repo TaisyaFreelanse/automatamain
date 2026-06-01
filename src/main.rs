@@ -1826,12 +1826,32 @@ async fn main() {
                                     );
                                     match second_cont {
                                         Ok(()) => {
-                                            eprintln!(
-                                                "[BUY] {} A+ peak guard recheck passed: \
-                                                 mcap_now={:.1}",
-                                                general_create.mint,
+                                            if features::aplus_peak_recheck_mcap_acceptable(
+                                                peak_cfg,
+                                                peak_mcap_sol,
+                                                current_mcap_sol,
                                                 recheck.current_mcap_sol,
-                                            );
+                                            ) {
+                                                eprintln!(
+                                                    "[BUY] {} A+ peak guard recheck passed: \
+                                                     mcap_now={:.1}",
+                                                    general_create.mint,
+                                                    recheck.current_mcap_sol,
+                                                );
+                                            } else {
+                                                eprintln!(
+                                                    "[BUY] {} A+ peak guard recheck rejected: \
+                                                     mcap_now={:.1} < {:.0}% of score peak {:.1} \
+                                                     (score_now={:.1})",
+                                                    general_create.mint,
+                                                    recheck.current_mcap_sol,
+                                                    peak_cfg.recheck_min_vs_peak_ratio * 100.0,
+                                                    peak_mcap_sol,
+                                                    current_mcap_sol,
+                                                );
+                                                continuation_skip_reason =
+                                                    Some("aplus_peak_recheck_mcap_drop");
+                                            }
                                         }
                                         Err(reason) => {
                                             if features::continuation_second_look_eligible(
@@ -1846,13 +1866,32 @@ async fn main() {
                                                     &recheck.points,
                                                 ) {
                                                     Ok(()) => {
-                                                        eprintln!(
-                                                            "[BUY] {} A+ peak guard recovery \
-                                                             passed (was {}): mcap_now={:.1}",
-                                                            general_create.mint,
-                                                            reason,
+                                                        if features::aplus_peak_recheck_mcap_acceptable(
+                                                            peak_cfg,
+                                                            peak_mcap_sol,
+                                                            current_mcap_sol,
                                                             recheck.current_mcap_sol,
-                                                        );
+                                                        ) {
+                                                            eprintln!(
+                                                                "[BUY] {} A+ peak guard recovery \
+                                                                 passed (was {}): mcap_now={:.1}",
+                                                                general_create.mint,
+                                                                reason,
+                                                                recheck.current_mcap_sol,
+                                                            );
+                                                        } else {
+                                                            eprintln!(
+                                                                "[BUY] {} A+ peak guard recovery \
+                                                                 rejected (mcap collapse): \
+                                                                 mcap_now={:.1} score_peak={:.1}",
+                                                                general_create.mint,
+                                                                recheck.current_mcap_sol,
+                                                                peak_mcap_sol,
+                                                            );
+                                                            continuation_skip_reason = Some(
+                                                                "aplus_peak_recheck_mcap_drop",
+                                                            );
+                                                        }
                                                     }
                                                     Err(sl_reason) => {
                                                         continuation_skip_reason =

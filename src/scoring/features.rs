@@ -413,6 +413,23 @@ pub fn aplus_peak_no_smart_guard(
     peak_mcap > 0.0 && current_mcap >= peak_mcap * cfg.near_peak_ratio
 }
 
+/// After A+ peak-guard defer/recheck, block buy when tape collapsed vs score-time peak.
+pub fn aplus_peak_recheck_mcap_acceptable(
+    cfg: &crate::scoring::config::ContinuationAplusPeakGuardConfig,
+    score_peak_mcap: f64,
+    score_current_mcap: f64,
+    recheck_mcap: f64,
+) -> bool {
+    if !cfg.enabled || recheck_mcap <= 0.0 {
+        return recheck_mcap > 0.0;
+    }
+    let anchor = score_peak_mcap.max(score_current_mcap);
+    if anchor <= 0.0 {
+        return true;
+    }
+    recheck_mcap >= anchor * cfg.recheck_min_vs_peak_ratio
+}
+
 /// Strong enough first confirm to skip the deferred A+ peak re-check.
 pub fn continuation_confirm_strong(
     cfg: &crate::scoring::config::ContinuationAplusPeakGuardConfig,
@@ -438,12 +455,15 @@ pub fn continuation_second_look_eligible(
     score: i32,
     first_fail_reason: &str,
 ) -> bool {
-    cfg.enabled
-        && (is_a_plus || score >= cfg.min_score)
-        && matches!(
-            first_fail_reason,
-            "cont_b2s_worsening" | "cont_sell_absorption"
-        )
+    if !cfg.enabled || !(is_a_plus || score >= cfg.min_score) {
+        return false;
+    }
+    match first_fail_reason {
+        "cont_b2s_worsening" | "cont_sell_absorption" => true,
+        // A+ dip-then-rip: short confirm dip before continuation (4fqNB5-style).
+        "cont_no_uptick" => is_a_plus,
+        _ => false,
+    }
 }
 
 /// After `wait_ms`, re-poll the tape. Skip if mcap keeps falling with no demand;
@@ -1027,12 +1047,26 @@ mod continuation_tests {
             9,
             "cont_b2s_worsening"
         ));
-        assert!(!continuation_second_look_eligible(
+        assert!(continuation_second_look_eligible(
             &cfg,
             true,
             10,
             "cont_no_uptick"
         ));
+        assert!(!continuation_second_look_eligible(
+            &cfg,
+            false,
+            10,
+            "cont_no_uptick"
+        ));
+    }
+
+    #[test]
+    fn aplus_peak_recheck_rejects_collapsed_mcap() {
+        use crate::scoring::config::ContinuationAplusPeakGuardConfig;
+        let cfg = ContinuationAplusPeakGuardConfig::default();
+        assert!(!aplus_peak_recheck_mcap_acceptable(&cfg, 101.8, 101.8, 32.7));
+        assert!(aplus_peak_recheck_mcap_acceptable(&cfg, 108.8, 108.8, 98.3));
     }
 
     #[test]
