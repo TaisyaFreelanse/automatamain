@@ -1339,13 +1339,18 @@ async fn main() {
                         // strength alone, with a scoring penalty + an A+-only
                         // buy gate, so rare strong runners from prolific devs
                         // are no longer lost.
+                        let dev_pubkey = general_create.user.to_string();
+                        let spam_dev_whitelisted = filter_config
+                            .creator_config
+                            .is_spam_dev_whitelisted(&dev_pubkey);
+
                         let mut is_spam_dev = false;
                         if let Some(spam_cap) = filter_config.creator_config.spam_skip_coins {
                             match creators
                                 .count_creator_coins_capped(general_create.user, spam_cap)
                                 .await
                             {
-                                Ok(n) if n > spam_cap => {
+                                Ok(n) if n > spam_cap && !spam_dev_whitelisted => {
                                     is_spam_dev = true;
                                     eprintln!(
                                         "[FILTER] {} spam_dev (>{} coins): skipping creator-stats, \
@@ -1353,6 +1358,13 @@ async fn main() {
                                         general_create.mint, spam_cap
                                     );
                                     bot_metrics_create.note_spam_dev_skip();
+                                }
+                                Ok(n) if n > spam_cap && spam_dev_whitelisted => {
+                                    eprintln!(
+                                        "[FILTER] {} spam_dev_whitelist: dev {} has >{} coins, \
+                                         full creator-stats (no score penalty)",
+                                        general_create.mint, dev_pubkey, spam_cap
+                                    );
                                 }
                                 Ok(_) => {}
                                 Err(e) => {

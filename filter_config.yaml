@@ -5,6 +5,15 @@ creator_config:
   # if the dev has launched more than this many coins. Checked with a cheap
   # capped count. Such prolific devs are almost always spam/serial ruggers.
   spam_skip_coins: 100
+  # Prolific devs with strong runners in spam_dev audit (peak >= ~100 SOL after A-tier cut).
+  # Whitelisted: normal creator_config + scoring (no -3 penalty, no A+-only gate).
+  spam_dev_whitelist:
+    - CXoUJHtBGnuNR6zJ3zm8nTnNzCwXxFViXh29d1kTJQmK  # 4eNxx4… peak 168
+    - FaBGrHWjcJ8vKnbgUtsdpZjvF7YAAajtQTWmmEHiKtQr  # FgE8uN… peak 157
+    - 8oZiaf74SwU9YufXNWHHZj6kih6RrqaZ3T38exYD27jw  # 62yzXq… peak 138
+    - 745teG6MW6McgMbeQHdDTgHm52tirp6ysYDm6oJ17w5k  # 6xoeR2… peak 114
+    - AYjXVBtkfwNY1QbQp4gK6nbJM6fzk4fPeyLHAn1DLpFf  # DnGN5p… peak 106
+    - 4HXb7ivgvjbHC3TBesmmD9LovH8tmTv9DZsq12GMvEpU  # 5SiguT… peak 105
 
   min_median_market_cap: 90.0
   min_trader_pnl_average: 4.0
