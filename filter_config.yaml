@@ -402,5 +402,5 @@ wallets:
     private_key_env: PRIVATE_KEY_WALLET_2
     size_sol: null
     tier_size:
-      a_sol: 0.05
-      a_plus_sol: 0.06
+      a_sol: 0.5
+      a_plus_sol: 0.6

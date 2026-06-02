@@ -406,8 +406,8 @@ mod tests {
             enabled: AtomicBool::new(true),
             size_sol: RwLock::new(None),
             tier_size: RwLock::new(Some(WalletTierSize {
-                a_sol: 0.05,
-                a_plus_sol: 0.06,
+                a_sol: 0.5,
+                a_plus_sol: 0.6,
             })),
             private_key_env: "PRIVATE_KEY_WALLET_2".to_string(),
             pubkey: "pub".to_string(),
@@ -417,8 +417,8 @@ mod tests {
             broker: Arc::new(MockBroker::new(1.0)),
             balance: AtomicU64::new(1.0f64.to_bits()),
         };
-        assert!((h.amount_for_signal(0.3, Tier::A) - 0.05).abs() < f64::EPSILON);
-        assert!((h.amount_for_signal(0.4, Tier::APlus) - 0.06).abs() < f64::EPSILON);
+        assert!((h.amount_for_signal(0.3, Tier::A) - 0.5).abs() < f64::EPSILON);
+        assert!((h.amount_for_signal(0.4, Tier::APlus) - 0.6).abs() < f64::EPSILON);
     }
 
     #[test]
