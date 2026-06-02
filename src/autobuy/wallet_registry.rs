@@ -20,7 +20,15 @@ use crate::{
         pump_brocker::SolanaBroker,
     },
     generalize::{general_commands::TradeAction, general_pool::Pool},
+    scoring::score_engine::Tier,
 };
+
+/// Per-wallet buy size overrides by tier (copy wallet). `None` = use signal tier size.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WalletTierSize {
+    pub a_sol: f64,
+    pub a_plus_sol: f64,
+}
 
 /// Per-wallet entry in `filter_config.yaml` (no secret values — env var names only).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -32,9 +40,12 @@ pub struct WalletEntryConfig {
     pub enabled: bool,
     /// Env var holding base58 private key, e.g. `PRIVATE_KEY_WALLET_1`.
     pub private_key_env: String,
-    /// Fixed buy size in SOL; `None` = use tier amount from the signal.
+    /// Fixed buy size in SOL for every tier; `None` = use signal or `tier_size`.
     #[serde(default)]
     pub size_sol: Option<f64>,
+    /// Per-tier sizes (e.g. copy wallet 0.05 A / 0.06 A+). Overrides `size_sol` when set.
+    #[serde(default)]
+    pub tier_size: Option<WalletTierSize>,
     /// Demo mode starting balance for this wallet (defaults to global `start_balance_sol`).
     #[serde(default)]
     pub demo_balance_sol: Option<f64>,
@@ -63,6 +74,7 @@ pub struct WalletHandle {
     pub label: String,
     pub enabled: AtomicBool,
     pub size_sol: RwLock<Option<f64>>,
+    pub tier_size: RwLock<Option<WalletTierSize>>,
     pub private_key_env: String,
     pub pubkey: String,
     pub wallet_address: Address,
@@ -95,7 +107,26 @@ impl WalletHandle {
         *self.size_sol.write().unwrap_or_else(|e| e.into_inner()) = v;
     }
 
-    pub fn amount_for_signal(&self, signal_sol: f64) -> f64 {
+    pub fn tier_size(&self) -> Option<WalletTierSize> {
+        self.tier_size
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn set_tier_size(&self, v: Option<WalletTierSize>) {
+        *self.tier_size.write().unwrap_or_else(|e| e.into_inner()) = v;
+    }
+
+    /// Resolve buy size for this wallet: per-tier override, flat `size_sol`, or signal.
+    pub fn amount_for_signal(&self, signal_sol: f64, buy_tier: Tier) -> f64 {
+        if let Some(ts) = self.tier_size() {
+            return match buy_tier {
+                Tier::APlus => ts.a_plus_sol,
+                Tier::A => ts.a_sol,
+                Tier::Skip => signal_sol,
+            };
+        }
         self.size_sol().unwrap_or(signal_sol)
     }
 
@@ -107,6 +138,7 @@ impl WalletHandle {
             pubkey: self.pubkey.clone(),
             balance_sol: self.balance_sol(),
             size_sol: self.size_sol(),
+            tier_size: self.tier_size(),
         }
     }
 }
@@ -119,6 +151,8 @@ pub struct WalletWire {
     pub pubkey: String,
     pub balance_sol: f64,
     pub size_sol: Option<f64>,
+    #[serde(default)]
+    pub tier_size: Option<WalletTierSize>,
 }
 
 pub struct WalletRegistry {
@@ -189,6 +223,7 @@ impl WalletRegistry {
             if let Some(w) = self.by_id.get(&e.id) {
                 w.set_enabled(e.enabled);
                 w.set_size_sol(e.size_sol);
+                w.set_tier_size(e.tier_size.clone());
             }
         }
     }
@@ -202,6 +237,7 @@ pub fn default_wallet_entries() -> Vec<WalletEntryConfig> {
         enabled: true,
         private_key_env: "PRIVATE_KEY".to_string(),
         size_sol: None,
+        tier_size: None,
         demo_balance_sol: None,
         rpc_url_env: None,
     }]
@@ -302,13 +338,14 @@ pub async fn build_wallet_registry(
         };
 
         println!(
-            "[EXEC] wallet={} label={} mode={} pubkey={} enabled={} size_sol={:?}",
+            "[EXEC] wallet={} label={} mode={} pubkey={} enabled={} size_sol={:?} tier_size={:?}",
             cfg.id,
             cfg.effective_label(),
             mode_label,
             pubkey_str,
             cfg.enabled,
             cfg.size_sol,
+            cfg.tier_size.as_ref().map(|t| (t.a_sol, t.a_plus_sol)),
         );
 
         let handle = Arc::new(WalletHandle {
@@ -316,6 +353,7 @@ pub async fn build_wallet_registry(
             label: cfg.effective_label(),
             enabled: AtomicBool::new(cfg.enabled),
             size_sol: RwLock::new(cfg.size_sol),
+            tier_size: RwLock::new(cfg.tier_size.clone()),
             private_key_env: cfg.private_key_env.clone(),
             pubkey: pubkey_str,
             wallet_address,
@@ -346,6 +384,7 @@ mod tests {
             label: "Copy".to_string(),
             enabled: AtomicBool::new(true),
             size_sol: RwLock::new(Some(0.05)),
+            tier_size: RwLock::new(None),
             private_key_env: "PRIVATE_KEY_WALLET_2".to_string(),
             pubkey: "pub".to_string(),
             wallet_address: "11111111111111111111111111111111"
@@ -354,9 +393,32 @@ mod tests {
             broker: Arc::new(MockBroker::new(1.0)),
             balance: AtomicU64::new(1.0f64.to_bits()),
         };
-        assert!((h.amount_for_signal(0.4) - 0.05).abs() < f64::EPSILON);
+        assert!((h.amount_for_signal(0.4, Tier::APlus) - 0.05).abs() < f64::EPSILON);
         h.set_size_sol(None);
-        assert!((h.amount_for_signal(0.4) - 0.4).abs() < f64::EPSILON);
+        assert!((h.amount_for_signal(0.4, Tier::APlus) - 0.4).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn tier_size_per_tier_for_copy_wallet() {
+        let h = WalletHandle {
+            id: "wallet_2".to_string(),
+            label: "Copy".to_string(),
+            enabled: AtomicBool::new(true),
+            size_sol: RwLock::new(None),
+            tier_size: RwLock::new(Some(WalletTierSize {
+                a_sol: 0.05,
+                a_plus_sol: 0.06,
+            })),
+            private_key_env: "PRIVATE_KEY_WALLET_2".to_string(),
+            pubkey: "pub".to_string(),
+            wallet_address: "11111111111111111111111111111111"
+                .parse()
+                .unwrap(),
+            broker: Arc::new(MockBroker::new(1.0)),
+            balance: AtomicU64::new(1.0f64.to_bits()),
+        };
+        assert!((h.amount_for_signal(0.3, Tier::A) - 0.05).abs() < f64::EPSILON);
+        assert!((h.amount_for_signal(0.4, Tier::APlus) - 0.06).abs() < f64::EPSILON);
     }
 
     #[test]

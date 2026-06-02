@@ -908,6 +908,7 @@ async fn main() {
                         enabled: w.is_enabled(),
                         private_key_env: w.private_key_env.clone(),
                         size_sol: w.size_sol(),
+                        tier_size: w.tier_size(),
                         demo_balance_sol: None,
                         rpc_url_env: None,
                     });
@@ -2230,6 +2231,7 @@ async fn main() {
                             .send(PositionMessage::InitiateBuy {
                                 pool: scoring_bucket.pool().clone_box(),
                                 amount_sol,
+                                buy_tier: breakdown.tier,
                                 open_reason,
                                 dev_address: Some(general_create.user),
                                 early_buyers: buyers_for_position,

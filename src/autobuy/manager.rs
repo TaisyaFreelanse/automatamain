@@ -460,6 +460,7 @@ pub enum PositionMessage {
     InitiateBuy {
         pool: Box<dyn Pool>,
         amount_sol: f64,
+        buy_tier: crate::scoring::score_engine::Tier,
         open_reason: OpenReason,
         /// Token developer (used for dev_ranker on close).
         dev_address: Option<Address>,
@@ -847,6 +848,7 @@ impl PositionManagerActor {
                 PositionMessage::InitiateBuy {
                     pool,
                     amount_sol,
+                    buy_tier,
                     open_reason,
                     dev_address,
                     early_buyers,
@@ -918,7 +920,7 @@ impl PositionManagerActor {
                         .wallets
                         .enabled_wallets()
                         .iter()
-                        .map(|w| (w.id.clone(), w.amount_for_signal(amount_sol)))
+                        .map(|w| (w.id.clone(), w.amount_for_signal(amount_sol, buy_tier)))
                         .collect();
                     if enabled.is_empty() {
                         eprintln!("[BUY] {mint} skipped: no enabled wallets");
@@ -2662,6 +2664,7 @@ impl PositionManagerHandler {
         &self,
         pool: Box<dyn Pool>,
         amount_sol: f64,
+        buy_tier: crate::scoring::score_engine::Tier,
         open_reason: OpenReason,
         dev_address: Option<Address>,
         early_buyers: Vec<Address>,
@@ -2672,6 +2675,7 @@ impl PositionManagerHandler {
             .send(PositionMessage::InitiateBuy {
                 pool,
                 amount_sol,
+                buy_tier,
                 open_reason,
                 dev_address,
                 early_buyers,
