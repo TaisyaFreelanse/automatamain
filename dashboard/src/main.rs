@@ -756,19 +756,12 @@ impl Dashboard {
         q.push_back(row);
     }
 
-    /// Wallet ids for TX LOG panels (config order + any ids seen in events).
-    fn tx_log_wallet_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self.wallets.iter().map(|w| w.id.clone()).collect();
-        for k in self.tx_log_by_wallet.keys() {
-            if !ids.iter().any(|id| id == k) {
-                ids.push(k.clone());
-            }
+    /// TX LOG is hidden for `All`; otherwise the selected wallet id.
+    fn tx_log_wallet_for_view(&self) -> Option<String> {
+        if self.wallet_view == "all" {
+            return None;
         }
-        if ids.is_empty() {
-            ids = vec!["wallet_1".into(), "wallet_2".into()];
-        }
-        ids.sort();
-        ids
+        Some(self.wallet_view.clone())
     }
 
     fn wallet_display_label(&self, wallet_id: &str) -> String {
@@ -1286,6 +1279,32 @@ impl Dashboard {
             format!("${:.*}", decimals, val_sol * p)
         } else {
             format!("{:.*} SOL", decimals, val_sol)
+        }
+    }
+
+    /// Top bar balance — same text size as Config / Pause (body, not `.small()`).
+    fn render_header_balance(&self, ui: &mut egui::Ui, b: f64) {
+        let bal_lbl = if self.wallet_view == "all" {
+            "Balance (combined):"
+        } else {
+            "Balance:"
+        };
+        ui.label(bal_lbl);
+        if let Some(p) = self.sol_price {
+            ui.colored_label(
+                egui::Color32::from_rgb(255, 215, 0),
+                self.usd_val(b, 2),
+            );
+            ui.label(
+                egui::RichText::new(format!("{b:.4} SOL"))
+                    .color(egui::Color32::from_rgb(210, 215, 225)),
+            );
+            ui.label(
+                egui::RichText::new(format!("(@ ${p:.2}/SOL)"))
+                    .color(egui::Color32::from_rgb(150, 185, 220)),
+            );
+        } else {
+            ui.colored_label(egui::Color32::from_rgb(255, 215, 0), format!("{b:.4} SOL"));
         }
     }
 
@@ -2161,27 +2180,7 @@ impl eframe::App for Dashboard {
                 ui.separator();
 
                 match self.context_balance_sol() {
-                    Some(b) => {
-                        let bal_lbl = if self.wallet_view == "all" {
-                            "Balance (combined):"
-                        } else {
-                            "Balance:"
-                        };
-                        ui.label(bal_lbl);
-                        ui.colored_label(egui::Color32::from_rgb(255, 215, 0), self.usd_val(b, 2));
-                        ui.label(
-                            egui::RichText::new(format!("{b:.4} SOL"))
-                                .small()
-                                .color(egui::Color32::GRAY),
-                        );
-                        if let Some(p) = self.sol_price {
-                            ui.label(
-                                egui::RichText::new(format!("(@ ${:.2}/SOL)", p))
-                                    .small()
-                                    .color(egui::Color32::GRAY),
-                            );
-                        }
-                    }
+                    Some(b) => self.render_header_balance(ui, b),
                     None => {
                         ui.label("Balance: —");
                     }
@@ -2283,7 +2282,7 @@ impl eframe::App for Dashboard {
                         if self.wallet_view == "all" {
                             for w in &self.wallets {
                                 ui.label(format!("{}:", w.id));
-                                ui.label(format!("{:.3} SOL", w.balance_sol));
+                                ui.label(format!("{:.4} SOL", w.balance_sol));
                                 ui.separator();
                             }
                         } else if let Some(w) =
@@ -2318,6 +2317,7 @@ impl eframe::App for Dashboard {
             }
 
             let third = (ui.available_height() / 3.0).max(80.0);
+            let single_wallet_view = self.wallet_view != "all";
 
             // ── Open positions ────────────────────────────────────────────────
             ui.horizontal(|ui| {
@@ -2336,15 +2336,18 @@ impl eframe::App for Dashboard {
                 .collect();
             open_addresses.sort();
             egui::ScrollArea::vertical()
-                .id_salt("open_scroll")
+                .id_salt(format!("open_scroll_{}", self.wallet_view))
                 .max_height(third)
                 .show(ui, |ui| {
-                    egui::Grid::new("open_grid")
-                        .num_columns(9)
+                    let open_cols = if single_wallet_view { 8 } else { 9 };
+                    egui::Grid::new(format!("open_grid_{}", self.wallet_view))
+                        .num_columns(open_cols)
                         .striped(true)
                         .min_col_width(72.0)
                         .show(ui, |ui| {
-                            ui.label(egui::RichText::new("Wallet").strong());
+                            if !single_wallet_view {
+                                ui.label(egui::RichText::new("Wallet").strong());
+                            }
                             ui.label(egui::RichText::new("Address").strong());
                             ui.label(egui::RichText::new("PnL % (mcap)").strong());
                             ui.label(egui::RichText::new("Holdings").strong());
@@ -2356,11 +2359,13 @@ impl eframe::App for Dashboard {
                             ui.end_row();
                             for addr in &open_addresses {
                                 if let Some(pos) = self.open.get(addr) {
-                                    ui.label(
-                                        egui::RichText::new(&pos.wallet_id)
-                                            .small()
-                                            .color(egui::Color32::from_rgb(180, 200, 255)),
-                                    );
+                                    if !single_wallet_view {
+                                        ui.label(
+                                            egui::RichText::new(&pos.wallet_id)
+                                                .small()
+                                                .color(egui::Color32::from_rgb(180, 200, 255)),
+                                        );
+                                    }
                                     render_mint_with_copy(
                                         ui,
                                         ctx,
@@ -2419,16 +2424,15 @@ impl eframe::App for Dashboard {
 
             ui.add_space(6.0);
 
-            // ── Tx log (one panel per wallet) ───────────────────────────────────
-            let tx_wallet_ids = self.tx_log_wallet_ids();
-            let tx_panel_h = (third.min(160.0) / tx_wallet_ids.len().max(1) as f32).max(72.0);
-            for wid in tx_wallet_ids {
+            // ── Tx log (selected wallet only; hidden on All) ────────────────────
+            if let Some(wid) = self.tx_log_wallet_for_view() {
                 let count = self
                     .tx_log_by_wallet
                     .get(&wid)
                     .map(|q| q.len())
                     .unwrap_or(0);
                 let title = self.wallet_display_label(&wid);
+                let tx_panel_h = third.min(200.0).max(100.0);
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new(format!("TX LOG · {title}"))
@@ -2450,10 +2454,8 @@ impl eframe::App for Dashboard {
                 });
                 ui.separator();
                 self.render_tx_log_panel(ui, ctx, &wid, tx_panel_h);
-                ui.add_space(4.0);
+                ui.add_space(6.0);
             }
-
-            ui.add_space(6.0);
 
             // ── History ───────────────────────────────────────────────────────
             ui.horizontal(|ui| {
@@ -2471,16 +2473,19 @@ impl eframe::App for Dashboard {
                 .into_iter()
                 .cloned()
                 .collect();
+            let hist_cols = if single_wallet_view { 7 } else { 8 };
             egui::ScrollArea::vertical()
-                .id_salt("history_scroll")
+                .id_salt(format!("history_scroll_{}", self.wallet_view))
                 .show(ui, |ui| {
-                    egui::Grid::new("history_grid")
-                        .num_columns(8)
+                    egui::Grid::new(format!("history_grid_{}", self.wallet_view))
+                        .num_columns(hist_cols)
                         .striped(true)
                         .min_col_width(72.0)
                         .show(ui, |ui| {
                             ui.label(egui::RichText::new("Time").strong());
-                            ui.label(egui::RichText::new("Wallet").strong());
+                            if !single_wallet_view {
+                                ui.label(egui::RichText::new("Wallet").strong());
+                            }
                             ui.label(egui::RichText::new("Mint").strong());
                             ui.label(egui::RichText::new("PnL % (SOL)").strong());
                             ui.label(egui::RichText::new("Invested ($)").strong());
@@ -2494,7 +2499,9 @@ impl eframe::App for Dashboard {
                                     egui::RichText::new(format_age(row.closed_at))
                                         .color(egui::Color32::GRAY),
                                 );
-                                ui.label(&row.wallet_id);
+                                if !single_wallet_view {
+                                    ui.label(&row.wallet_id);
+                                }
                                 ui.horizontal(|ui| {
                                     render_mint_with_copy(
                                         ui,

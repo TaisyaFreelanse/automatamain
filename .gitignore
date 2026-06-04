@@ -1,4 +1,5 @@
 # compiled files
+/scripts/
 /target/
 **/*.rs.bk
 .env
@@ -6,6 +7,7 @@
 /Cargo.lock
 
 # build artifacts
+
 **/*.rlib
 **/*.dSYM/
 **/*.so
