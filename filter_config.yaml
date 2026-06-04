@@ -64,7 +64,8 @@ buy_config:
   # --- Adaptive time kill (V3): weak launch ~20–25s, strong ~45–70s -----------------
   time_kill_adaptive: true
   time_kill_weak_secs: 22
-  time_kill_strong_secs: 60
+  # Audit 2026-06: was 60 — strong launches need longer before TIME KILL (test 75).
+  time_kill_strong_secs: 75
   time_kill_neutral_secs: 32
   time_kill_strong_min_buyers: 38
   time_kill_strong_min_b2s: 4.5
@@ -116,7 +117,8 @@ curve_quarantine:
     decay_early_mcap_profit_min_pct: 9.0
     decay_early_extra_confirm_ticks: 1
     # A+: no TIME KILL before min_secs; skip while mcap PnL green (SL still active).
-    a_plus_time_kill_min_secs: 50
+    # Audit 2026-06: was 50 — reduce premature A+ TIME KILL (test 70).
+    a_plus_time_kill_min_secs: 70
     a_plus_time_kill_mcap_profit_min_pct: 5.0
     # Tier A + momentum_good + mcap still green: no weak TIME KILL at ~22s (floor 50s).
     tier_a_time_kill_defer_min_secs: 50
@@ -202,7 +204,8 @@ scoring:
   # Sub-samples inside scoring_window_ms: new buyers/sell tape per slice (>=2 recommended).
   # Stops early when peak mcap vs first sample hits momentum_good_low_pct (fast pump).
   buyer_velocity_slices: 3
-  a_plus_threshold: 9
+  # Audit 2026-06 A/B: was 9 — A+ underperformed A; stricter tier (revert to 9 for control).
+  a_plus_threshold: 10
   # Pre-V2 default was 6 (V2 experiment used 7–8).
   a_threshold: 6
   # --- Live-only gates (ignored when execution.mode: demo) ---------------

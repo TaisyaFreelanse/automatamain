@@ -2103,7 +2103,8 @@ impl PositionManagerActor {
         }
 
         if strong >= 4 && weak <= 1 {
-            (cfg.time_kill_strong_secs.clamp(45, 70), "strong")
+            // Upper bound must allow audit tuning above 70 (e.g. time_kill_strong_secs: 75).
+            (cfg.time_kill_strong_secs.clamp(45, 80), "strong")
         } else if weak >= 3 && strong <= 1 {
             (cfg.time_kill_weak_secs.clamp(18, 28), "weak")
         } else {
