@@ -412,12 +412,19 @@ impl<'a> ScoreEngine<'a> {
         if f.repeat_dump_slices >= 2 {
             add(
                 "repeat_dump_cluster",
+                w.repeat_dump_penalty.saturating_mul(3),
+                total,
+                items,
+            );
+        } else if f.repeat_dump_slices >= 1 {
+            // Always penalize a dump slice in the scoring window (CB7C5 had dumps=1
+            // with low sell_pressure and still reached tier A without this).
+            add(
+                "repeat_dump_cluster",
                 w.repeat_dump_penalty.saturating_mul(2),
                 total,
                 items,
             );
-        } else if f.repeat_dump_slices == 1 && f.sell_pressure_score >= 0.35 {
-            add("repeat_dump_cluster", w.repeat_dump_penalty, total, items);
         }
     }
 }

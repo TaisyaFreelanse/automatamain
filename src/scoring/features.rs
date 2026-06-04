@@ -11,8 +11,12 @@ use crate::launchpads::{
 };
 use crate::persistence::creators::CreatorStatistics;
 use crate::scoring::anti_bundle::{compute_bundle_stats, BundleStats};
-use crate::scoring::config::{AntiParabolicConfig, ContinuationConfig, FeatureThresholds};
+use crate::scoring::config::{
+    AntiParabolicConfig, ContinuationConfig, ContinuationSecondLookConfig, FeatureThresholds,
+    WeakATierGateConfig,
+};
 use crate::scoring::dev_ranker::{DevCategory, DevRecord};
+use crate::scoring::score_engine::Tier;
 use crate::trading::trader::TraderType;
 
 /// Captured at scoring-window snapshot time. Stored on the open Position so
@@ -455,6 +459,52 @@ pub fn continuation_confirm_strong(
     upticks >= cfg.strong_upticks && new_buyers >= cfg.strong_new_buyers
 }
 
+fn score_items_has(name: &str, items: &[(&'static str, i32)]) -> bool {
+    items.iter().any(|(n, _)| *n == name)
+}
+
+/// Weak tier-A profile: low score, no smart wallets, neutral dev ranker and/or weak dev history.
+pub fn weak_a_profile_match(
+    cfg: &WeakATierGateConfig,
+    tier: Tier,
+    score: i32,
+    smart_wallet_count: u32,
+    dev_category: DevCategory,
+    items: &[(&'static str, i32)],
+) -> bool {
+    if !cfg.enabled || tier != Tier::A {
+        return false;
+    }
+    if score > cfg.max_score || smart_wallet_count > cfg.max_smart_wallets {
+        return false;
+    }
+    let dev_weak = (cfg.block_dev_neutral
+        && matches!(dev_category, DevCategory::Neutral | DevCategory::Stale))
+        || (cfg.block_dev_history_weak && score_items_has("dev_history_weak", items));
+    dev_weak
+}
+
+/// Hard skip before continuation poll: dump slice and/or low buy volume on weak A.
+pub fn weak_a_hard_skip_reason(
+    cfg: &WeakATierGateConfig,
+    tier: Tier,
+    score: i32,
+    smart_wallet_count: u32,
+    f: &TokenFeatures,
+    items: &[(&'static str, i32)],
+) -> Option<&'static str> {
+    if !weak_a_profile_match(cfg, tier, score, smart_wallet_count, f.dev_category, items) {
+        return None;
+    }
+    if f.repeat_dump_slices >= cfg.block_repeat_dump_slices_ge {
+        return Some("weak_a_dump_in_tape");
+    }
+    if f.buy_volume_sol < cfg.min_buy_volume_sol {
+        return Some("weak_a_low_volume");
+    }
+    None
+}
+
 /// Whether a failed first confirm may defer skip for a second-look poll.
 pub fn continuation_second_look_eligible(
     cfg: &crate::scoring::config::ContinuationSecondLookConfig,
@@ -471,6 +521,30 @@ pub fn continuation_second_look_eligible(
         "cont_no_uptick" => is_a_plus,
         _ => false,
     }
+}
+
+/// Strong setups use `continuation_second_look_eligible`; fragile weak A also defers on any fail.
+pub fn continuation_second_look_eligible_for_buy(
+    sl_cfg: &ContinuationSecondLookConfig,
+    weak_cfg: &WeakATierGateConfig,
+    tier: Tier,
+    is_a_plus: bool,
+    score: i32,
+    smart_wallet_count: u32,
+    f: &TokenFeatures,
+    items: &[(&'static str, i32)],
+    first_fail_reason: &str,
+) -> bool {
+    if continuation_second_look_eligible(sl_cfg, is_a_plus, score, first_fail_reason) {
+        return true;
+    }
+    if !sl_cfg.enabled || !weak_cfg.enabled || tier != Tier::A {
+        return false;
+    }
+    if !weak_a_profile_match(weak_cfg, tier, score, smart_wallet_count, f.dev_category, items) {
+        return false;
+    }
+    score <= weak_cfg.continuation_second_look_max_score
 }
 
 /// After `wait_ms`, re-poll the tape. Skip if mcap keeps falling with no demand;
@@ -1208,5 +1282,50 @@ mod strong_a_bypass_tests {
             ("buyer_velocity_fading", -2),
         ];
         assert!(!strong_a_momentum_bypass_ok(&cfg(), Tier::A, 9, &f, &items));
+    }
+
+    #[test]
+    fn weak_a_hard_skip_on_dump_slice() {
+        let gate = WeakATierGateConfig::default();
+        let mut f = strong_f();
+        f.buy_volume_sol = 20.0;
+        f.repeat_dump_slices = 1;
+        let items = [("dev_history_weak", 2)];
+        assert_eq!(
+            weak_a_hard_skip_reason(&gate, Tier::A, 7, 0, &f, &items),
+            Some("weak_a_dump_in_tape")
+        );
+    }
+
+    #[test]
+    fn weak_a_hard_skip_on_low_volume() {
+        let gate = WeakATierGateConfig::default();
+        let mut f = strong_f();
+        f.buy_volume_sol = 7.8;
+        f.repeat_dump_slices = 0;
+        let items = [("dev_history_weak", 2)];
+        assert_eq!(
+            weak_a_hard_skip_reason(&gate, Tier::A, 7, 0, &f, &items),
+            Some("weak_a_low_volume")
+        );
+    }
+
+    #[test]
+    fn weak_a_second_look_on_any_cont_fail() {
+        let sl = ContinuationSecondLookConfig::default();
+        let gate = WeakATierGateConfig::default();
+        let f = strong_f();
+        let items = [("dev_history_weak", 2)];
+        assert!(continuation_second_look_eligible_for_buy(
+            &sl,
+            &gate,
+            Tier::A,
+            false,
+            7,
+            0,
+            &f,
+            &items,
+            "cont_no_uptick",
+        ));
     }
 }

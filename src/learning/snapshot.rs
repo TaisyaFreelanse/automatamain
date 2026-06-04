@@ -35,6 +35,9 @@ pub struct LearningTradeSnapshot {
     pub repeat_dump_slices: u32,
     #[serde(default)]
     pub smart_wallet_early_exits: u32,
+    /// Score breakdown included `momentum_good` at entry (tier-A TIME KILL defer).
+    #[serde(default)]
+    pub has_momentum_good: bool,
 }
 
 impl LearningTradeSnapshot {
@@ -66,6 +69,10 @@ impl LearningTradeSnapshot {
             sell_events_window: f.sell_events_window,
             repeat_dump_slices: f.repeat_dump_slices,
             smart_wallet_early_exits: f.smart_wallet_early_exits,
+            has_momentum_good: breakdown
+                .items
+                .iter()
+                .any(|(name, _)| *name == "momentum_good"),
         }
     }
 }

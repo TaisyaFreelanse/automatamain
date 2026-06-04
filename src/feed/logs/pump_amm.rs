@@ -49,6 +49,7 @@ impl PumpAmmEvent {
                 mint,
                 user: create_pool_event.creator,
                 metadata: None,
+                quote_mint: create_pool_event.quote_mint,
             }),
         }
     }

@@ -4,7 +4,9 @@ use crate::{
         exit_engine::{
             adaptive_moonbag_sell_pct, adaptive_trailing, apply_phase_to_tp,
             calculate_live_score, entry_live_score_floor, format_sl_close_reason,
-            in_exit_grace_period, in_sl_grace_period, sl_crash_triggered, sl_raw_tick_drop_pct,
+            entry_tier_is_a_plus, in_exit_grace_period_tier, in_sl_grace_period,
+            tier_a_time_kill_defer_floor_secs,
+            sl_crash_triggered, sl_raw_tick_drop_pct,
             sl_trigger_pnl_pct,
             live_metrics_from_snapshot, live_metrics_lite, maybe_upgrade_runner,
             momentum_decay_detected, profit_lock_staircase_floor, recovery_score,
@@ -811,7 +813,12 @@ impl PositionManagerActor {
                             .duration_since(UNIX_EPOCH)
                             .unwrap()
                             .as_secs();
-                        if !in_exit_grace_period(held, v4) {
+                        let entry_tier = pos
+                            .learning_snapshot
+                            .as_ref()
+                            .map(|s| s.tier.as_str())
+                            .unwrap_or("");
+                        if !in_exit_grace_period_tier(held, entry_tier, v4) {
                             pos.exit_phase = transition_position_phase(
                                 pos.exit_phase,
                                 pos.live_score,
@@ -2144,7 +2151,15 @@ impl PositionManagerActor {
             let vel = pos.time_kill_mcap_velocity_pct_per_sec(enter_mcap);
 
             let held_secs = current_time.saturating_sub(pos.entry_time);
-            let in_grace = v4_enabled && in_exit_grace_period(held_secs, &v4_cfg);
+            let entry_tier = pos
+                .learning_snapshot
+                .as_ref()
+                .map(|s| s.tier.as_str())
+                .unwrap_or("");
+            let mcap_pnl_pct = pos.pnl();
+            let is_a_plus = entry_tier_is_a_plus(entry_tier);
+            let in_grace =
+                v4_enabled && in_exit_grace_period_tier(held_secs, entry_tier, &v4_cfg);
 
             if v4_enabled
                 && !in_grace
@@ -2179,8 +2194,21 @@ impl PositionManagerActor {
                 }
             }
 
-            let (kill_after_secs, tk_tier) =
+            let (mut kill_after_secs, tk_tier) =
                 Self::time_kill_window_profile(&global_cfg, pos, profit, current_mcap, held_secs);
+            if v4_enabled && is_a_plus {
+                kill_after_secs = kill_after_secs.max(v4_cfg.a_plus_time_kill_min_secs);
+            }
+            if v4_enabled {
+                if let Some(floor) = tier_a_time_kill_defer_floor_secs(
+                    &v4_cfg,
+                    entry_tier,
+                    pos.learning_snapshot.as_ref(),
+                    mcap_pnl_pct,
+                ) {
+                    kill_after_secs = kill_after_secs.max(floor);
+                }
+            }
             pos.last_time_kill_tier = tk_tier.to_string();
             pos.last_time_kill_after_secs = kill_after_secs;
 
@@ -2237,13 +2265,20 @@ impl PositionManagerActor {
                     .as_ref()
                     .map(|s| s.sell_pressure_score)
                     .unwrap_or(0.0);
-                let decay_now = momentum_decay_detected(
+                let velocity_decay = momentum_decay_detected(
                     pos.live_buyers_per_sec,
                     pos.live_prev_buyers_per_sec,
                     sell_p,
                     vel,
-                ) || (pos.exit_phase == PositionPhase::Distribution
-                    && pos.live_score <= v4_cfg.phase_distribution_max_score);
+                );
+                let distribution_decay = pos.exit_phase == PositionPhase::Distribution
+                    && pos.live_score <= v4_cfg.phase_distribution_max_score;
+                let early_green = held_secs < v4_cfg.decay_early_hold_secs
+                    && mcap_pnl_pct >= v4_cfg.decay_early_mcap_profit_min_pct;
+                let mut decay_now = velocity_decay || distribution_decay;
+                if early_green && distribution_decay && !velocity_decay {
+                    decay_now = false;
+                }
 
                 // Flush tracking: drawdown from session high opens a flush window
                 // and records its bottom for higher-low detection on recovery.
@@ -2281,7 +2316,15 @@ impl PositionManagerActor {
                     pos.decay_streak = 0;
                 }
 
-                if pos.decay_streak >= v4_cfg.decay_confirm_ticks.max(1) {
+                let decay_confirm_needed = if early_green {
+                    v4_cfg
+                        .decay_confirm_ticks
+                        .saturating_add(v4_cfg.decay_early_extra_confirm_ticks)
+                } else {
+                    v4_cfg.decay_confirm_ticks
+                }
+                .max(1);
+                if pos.decay_streak >= decay_confirm_needed {
                     pos.is_closing = true;
                     let reason = if pos.exit_phase == PositionPhase::Distribution {
                         format!(
@@ -2308,6 +2351,13 @@ impl PositionManagerActor {
                     || pos.exit_profile == ExitProfile::Runner)
                 && (pos.tp1_triggered || pos.tp2_triggered)
                 && profit >= v4_cfg.strong_time_kill_min_profit_after_tp
+            {
+                skip_time_kill = true;
+            }
+            if v4_enabled
+                && is_a_plus
+                && (held_secs < v4_cfg.a_plus_time_kill_min_secs
+                    || mcap_pnl_pct >= v4_cfg.a_plus_time_kill_mcap_profit_min_pct)
             {
                 skip_time_kill = true;
             }

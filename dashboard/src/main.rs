@@ -96,15 +96,6 @@ fn default_wallet_id() -> String {
     "wallet_1".to_string()
 }
 
-/// TX LOG shows main wallet only; copy wallet trades appear in HISTORY / OPEN.
-fn primary_tx_log_wallet() -> &'static str {
-    "wallet_1"
-}
-
-fn show_in_tx_log(wallet_id: &str) -> bool {
-    wallet_id == primary_tx_log_wallet()
-}
-
 fn pos_map_key(mint: &str, wallet_id: &str) -> String {
     format!("{mint}:{wallet_id}")
 }
@@ -220,6 +211,7 @@ pub enum TxEventKind {
 
 #[derive(Clone, Debug)]
 pub struct TxLogRow {
+    pub wallet_id: String,
     pub kind: TxEventKind,
     pub mint: String,
     pub signature: Option<String>,
@@ -645,9 +637,8 @@ struct Dashboard {
     pubkey: Option<String>,
     /// Currently active broker mode reported by `/status` (`"demo"` / `"live"`).
     mode: Option<String>,
-    /// Bounded log of recent tx events (buy/sell/failed) — live signatures
-    /// and demo synthetic entries share the same row format.
-    tx_log: std::collections::VecDeque<TxLogRow>,
+    /// Per-wallet bounded tx log (buy/sell/failed).
+    tx_log_by_wallet: HashMap<String, std::collections::VecDeque<TxLogRow>>,
     /// Last UI tick when we polled `/tx-log` and `/mode` over HTTP. Keeps the
     /// dashboard tolerant of WS gaps without spamming the backend.
     last_http_poll: Option<std::time::Instant>,
@@ -710,7 +701,7 @@ impl Dashboard {
             sol_price: None,
             pubkey: None,
             mode: None,
-            tx_log: std::collections::VecDeque::with_capacity(256),
+            tx_log_by_wallet: HashMap::new(),
             last_http_poll: None,
             config_panel: ConfigPanel::new(),
             mint_copy_flash_until: None,
@@ -749,6 +740,252 @@ impl Dashboard {
             .values()
             .filter(|p| self.wallet_matches_view(&p.wallet_id))
             .collect()
+    }
+
+    const TX_LOG_CAP: usize = 256;
+
+    fn push_tx_log(&mut self, row: TxLogRow) {
+        let wid = row.wallet_id.clone();
+        let q = self
+            .tx_log_by_wallet
+            .entry(wid)
+            .or_insert_with(|| std::collections::VecDeque::with_capacity(Self::TX_LOG_CAP));
+        if q.len() >= Self::TX_LOG_CAP {
+            q.pop_front();
+        }
+        q.push_back(row);
+    }
+
+    /// Wallet ids for TX LOG panels (config order + any ids seen in events).
+    fn tx_log_wallet_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.wallets.iter().map(|w| w.id.clone()).collect();
+        for k in self.tx_log_by_wallet.keys() {
+            if !ids.iter().any(|id| id == k) {
+                ids.push(k.clone());
+            }
+        }
+        if ids.is_empty() {
+            ids = vec!["wallet_1".into(), "wallet_2".into()];
+        }
+        ids.sort();
+        ids
+    }
+
+    fn wallet_display_label(&self, wallet_id: &str) -> String {
+        self.wallets
+            .iter()
+            .find(|w| w.id == wallet_id)
+            .map(|w| {
+                if w.label.is_empty() {
+                    wallet_id.to_string()
+                } else {
+                    format!("{} · {}", wallet_id, w.label)
+                }
+            })
+            .unwrap_or_else(|| wallet_id.to_string())
+    }
+
+    fn render_tx_log_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        wallet_id: &str,
+        max_height: f32,
+    ) {
+        let rows = self
+            .tx_log_by_wallet
+            .get(wallet_id)
+            .cloned()
+            .unwrap_or_default();
+        let scroll_id = format!("tx_log_scroll_{wallet_id}");
+        let grid_id = format!("tx_log_grid_{wallet_id}");
+        let tx_ctx = ctx.clone();
+        egui::ScrollArea::vertical()
+            .id_salt(scroll_id)
+            .max_height(max_height)
+            .show(ui, |ui| {
+                egui::Grid::new(grid_id)
+                    .num_columns(9)
+                    .striped(true)
+                    .min_col_width(52.0)
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Time").strong());
+                        ui.label(egui::RichText::new("Kind").strong());
+                        ui.label(egui::RichText::new("Mode").strong());
+                        ui.label(egui::RichText::new("Mint").strong());
+                        ui.label(egui::RichText::new("SOL act.").strong());
+                        ui.label(egui::RichText::new("SOL est.").strong());
+                        ui.label(egui::RichText::new("PnL").strong());
+                        ui.label(egui::RichText::new("V3 / time kill").strong());
+                        ui.label(egui::RichText::new("Status").strong());
+                        ui.end_row();
+
+                        for row in rows.iter().rev() {
+                            ui.label(
+                                egui::RichText::new(format_age(row.ts))
+                                    .color(egui::Color32::GRAY),
+                            );
+                            let (lbl, col) = match row.kind {
+                                TxEventKind::Buy => {
+                                    ("BUY", egui::Color32::from_rgb(120, 200, 255))
+                                }
+                                TxEventKind::Sell => {
+                                    ("SELL", egui::Color32::from_rgb(255, 200, 100))
+                                }
+                            };
+                            ui.colored_label(col, lbl);
+                            let mode_col = match row.mode.as_str() {
+                                "live" => egui::Color32::from_rgb(255, 90, 90),
+                                "demo" => egui::Color32::from_rgb(120, 220, 120),
+                                _ => egui::Color32::GRAY,
+                            };
+                            ui.colored_label(mode_col, row.mode.to_uppercase());
+                            render_mint_with_copy(
+                                ui,
+                                &tx_ctx,
+                                &row.mint,
+                                &mut self.mint_copy_flash_until,
+                            );
+                            ui.label(format!("{:.4}", row.amount_sol));
+                            match (row.kind, row.amount_sol_estimated) {
+                                (TxEventKind::Sell, Some(est)) => {
+                                    ui.label(format!("{:.4}", est)).on_hover_text(
+                                        "Estimated from bonding curve / Jupiter quote × slippage; \
+                                         act. = wallet lamport delta from tx meta.",
+                                    );
+                                }
+                                _ => {
+                                    ui.label(
+                                        egui::RichText::new("—")
+                                            .small()
+                                            .color(egui::Color32::GRAY),
+                                    );
+                                }
+                            }
+
+                            match (row.kind, row.pnl_mcap_pct, row.pnl_sol_pct) {
+                                (TxEventKind::Sell, mcap, sol) => {
+                                    let mcap_s = mcap
+                                        .map(|p| format!("mcap {:+.1}%", p))
+                                        .unwrap_or_else(|| "mcap —".into());
+                                    let sol_s = sol
+                                        .map(|p| format!("SOL {:+.1}%", p))
+                                        .unwrap_or_else(|| "SOL —".into());
+                                    let pnl_resp = ui.vertical(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(mcap_s)
+                                                .small()
+                                                .monospace(),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(sol_s)
+                                                .small()
+                                                .monospace()
+                                                .color(egui::Color32::from_rgb(200, 220, 255)),
+                                        );
+                                    });
+                                    pnl_resp.response.on_hover_text(
+                                        "mcap = bonding curve at sell; SOL = wallet PnL on position.",
+                                    );
+                                }
+                                _ => {
+                                    ui.label(
+                                        egui::RichText::new("—")
+                                            .small()
+                                            .color(egui::Color32::GRAY),
+                                    );
+                                }
+                            }
+
+                            match row.kind {
+                                TxEventKind::Buy => {
+                                    if let Some(ref t) = row.v3_tape {
+                                        let s = format_v3_tape_compact(t);
+                                        ui.label(
+                                            egui::RichText::new(&s)
+                                                .small()
+                                                .monospace()
+                                                .color(egui::Color32::from_rgb(180, 200, 235)),
+                                        )
+                                        .on_hover_text("V3 tape at entry (buy)");
+                                    } else {
+                                        ui.label(
+                                            egui::RichText::new("—")
+                                                .small()
+                                                .color(egui::Color32::GRAY),
+                                        );
+                                    }
+                                }
+                                TxEventKind::Sell => {
+                                    if let Some(ref d) = row.time_kill_detail {
+                                        ui.label(
+                                            egui::RichText::new(d.as_str())
+                                                .small()
+                                                .monospace()
+                                                .color(egui::Color32::from_rgb(240, 190, 120)),
+                                        )
+                                        .on_hover_text(
+                                            "TIME KILL: adaptive tier + kill window seconds, or fixed window from config.",
+                                        );
+                                    } else {
+                                        ui.label(
+                                            egui::RichText::new("—")
+                                                .small()
+                                                .color(egui::Color32::GRAY),
+                                        );
+                                    }
+                                }
+                            }
+
+                            if let Some(sig) = &row.signature {
+                                ui.horizontal(|ui| {
+                                    let (st_lbl, st_col) = match row.status.as_str() {
+                                        "sent" | "confirmed" => {
+                                            ("ok", egui::Color32::from_rgb(110, 190, 130))
+                                        }
+                                        "failed" => ("failed", egui::Color32::from_rgb(220, 90, 90)),
+                                        _ => (row.status.as_str(), egui::Color32::LIGHT_GRAY),
+                                    };
+                                    ui.colored_label(st_col, st_lbl);
+                                    if let Some(ref r) = row.reason {
+                                        if !r.is_empty() {
+                                            let short = if r.len() > 28 {
+                                                format!("{}…", &r[..28])
+                                            } else {
+                                                r.clone()
+                                            };
+                                            ui.label(
+                                                egui::RichText::new(short)
+                                                    .small()
+                                                    .color(egui::Color32::GRAY),
+                                            );
+                                        }
+                                    }
+                                    let tip = format!(
+                                        "Signature (click 📋 to copy)\n{sig}\n\nSolscan:\nhttps://solscan.io/tx/{sig}"
+                                    );
+                                    if ui
+                                        .add(egui::Button::new("📋").small())
+                                        .on_hover_text(&tip)
+                                        .clicked()
+                                    {
+                                        tx_ctx.copy_text(sig.clone());
+                                    }
+                                });
+                            } else {
+                                let (lbl, col) = match row.status.as_str() {
+                                    "failed" => (
+                                        row.reason.clone().unwrap_or_else(|| "failed".into()),
+                                        egui::Color32::from_rgb(220, 90, 90),
+                                    ),
+                                    _ => ("simulated".into(), egui::Color32::GRAY),
+                                };
+                                ui.colored_label(col, lbl);
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
     }
 
     /// Balance for the active wallet view (sum for All, single wallet otherwise).
@@ -860,12 +1097,9 @@ impl Dashboard {
                     self.config_panel.mode_info = Some(info);
                 }
                 AppEvent::TxLog(rows) => {
-                    self.tx_log.clear();
+                    self.tx_log_by_wallet.clear();
                     for r in rows {
-                        if self.tx_log.len() >= 256 {
-                            self.tx_log.pop_front();
-                        }
-                        self.tx_log.push_back(r);
+                        self.push_tx_log(r);
                     }
                 }
                 AppEvent::ModeSetOk {
@@ -1022,26 +1256,22 @@ impl Dashboard {
                         }
                         let refresh_history =
                             kind == TxEventKind::Sell && status == "confirmed";
-                        if show_in_tx_log(&wallet_id) {
-                            if self.tx_log.len() >= 256 {
-                                self.tx_log.pop_front();
-                            }
-                            self.tx_log.push_back(TxLogRow {
-                                kind,
-                                mint,
-                                signature,
-                                amount_sol,
-                                amount_sol_estimated,
-                                status,
-                                reason,
-                                mode,
-                                ts,
-                                v3_tape,
-                                time_kill_detail,
-                                pnl_mcap_pct,
-                                pnl_sol_pct,
-                            });
-                        }
+                        self.push_tx_log(TxLogRow {
+                            wallet_id,
+                            kind,
+                            mint,
+                            signature,
+                            amount_sol,
+                            amount_sol_estimated,
+                            status,
+                            reason,
+                            mode,
+                            ts,
+                            v3_tape,
+                            time_kill_detail,
+                            pnl_mcap_pct,
+                            pnl_sol_pct,
+                        });
                         if refresh_history {
                             send_dash_cmd(&self.cmd_tx, DashCmd::RefreshBotTradesAfterClose);
                         }
@@ -2189,218 +2419,39 @@ impl eframe::App for Dashboard {
 
             ui.add_space(6.0);
 
-            // ── Tx log ────────────────────────────────────────────────────────
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("TX LOG").strong().size(14.0));
-                if let Some(m) = self.mode.as_deref() {
-                    let (txt, col) = match m {
-                        "live" => ("LIVE", egui::Color32::from_rgb(255, 90, 90)),
-                        "demo" => ("DEMO", egui::Color32::from_rgb(120, 220, 120)),
-                        _ => ("?", egui::Color32::GRAY),
-                    };
-                    ui.colored_label(col, txt);
-                }
-                ui.label(
-                    egui::RichText::new(format!("({})", self.tx_log.len()))
-                        .color(egui::Color32::GRAY),
-                );
-            });
-            ui.separator();
-            let tx_ctx = ctx.clone();
-            egui::ScrollArea::vertical()
-                .id_salt("tx_log_scroll")
-                .max_height(third.min(180.0))
-                .show(ui, |ui| {
-                    egui::Grid::new("tx_log_grid")
-                        .num_columns(9)
-                        .striped(true)
-                        .min_col_width(52.0)
-                        .show(ui, |ui| {
-                            ui.label(egui::RichText::new("Time").strong());
-                            ui.label(egui::RichText::new("Kind").strong());
-                            ui.label(egui::RichText::new("Mode").strong());
-                            ui.label(egui::RichText::new("Mint").strong());
-                            ui.label(egui::RichText::new("SOL act.").strong());
-                            ui.label(egui::RichText::new("SOL est.").strong());
-                            ui.label(egui::RichText::new("PnL").strong());
-                            ui.label(egui::RichText::new("V3 / time kill").strong());
-                            ui.label(egui::RichText::new("Status").strong());
-                            ui.end_row();
-
-                            // Newest first.
-                            for row in self.tx_log.iter().rev() {
-                                ui.label(
-                                    egui::RichText::new(format_age(row.ts))
-                                        .color(egui::Color32::GRAY),
-                                );
-                                let (lbl, col) = match row.kind {
-                                    TxEventKind::Buy => (
-                                        "BUY",
-                                        egui::Color32::from_rgb(120, 200, 255),
-                                    ),
-                                    TxEventKind::Sell => (
-                                        "SELL",
-                                        egui::Color32::from_rgb(255, 200, 100),
-                                    ),
-                                };
-                                ui.colored_label(col, lbl);
-                                let mode_col = match row.mode.as_str() {
-                                    "live" => egui::Color32::from_rgb(255, 90, 90),
-                                    "demo" => egui::Color32::from_rgb(120, 220, 120),
-                                    _ => egui::Color32::GRAY,
-                                };
-                                ui.colored_label(mode_col, row.mode.to_uppercase());
-                                render_mint_with_copy(
-                                    ui,
-                                    &tx_ctx,
-                                    &row.mint,
-                                    &mut self.mint_copy_flash_until,
-                                );
-                                ui.label(format!("{:.4}", row.amount_sol));
-                                match (row.kind, row.amount_sol_estimated) {
-                                    (TxEventKind::Sell, Some(est)) => {
-                                        ui.label(format!("{:.4}", est)).on_hover_text(
-                                            "Estimated from bonding curve / Jupiter quote × slippage; \
-                                             act. = wallet lamport delta from tx meta.",
-                                        );
-                                    }
-                                    _ => {
-                                        ui.label(
-                                            egui::RichText::new("—")
-                                                .small()
-                                                .color(egui::Color32::GRAY),
-                                        );
-                                    }
-                                }
-
-                                match (row.kind, row.pnl_mcap_pct, row.pnl_sol_pct) {
-                                    (TxEventKind::Sell, mcap, sol) => {
-                                        let mcap_s = mcap
-                                            .map(|p| format!("mcap {:+.1}%", p))
-                                            .unwrap_or_else(|| "mcap —".into());
-                                        let sol_s = sol
-                                            .map(|p| format!("SOL {:+.1}%", p))
-                                            .unwrap_or_else(|| "SOL —".into());
-                                        let pnl_resp = ui.vertical(|ui| {
-                                            ui.label(
-                                                egui::RichText::new(mcap_s)
-                                                    .small()
-                                                    .monospace(),
-                                            );
-                                            ui.label(
-                                                egui::RichText::new(sol_s)
-                                                    .small()
-                                                    .monospace()
-                                                    .color(egui::Color32::from_rgb(200, 220, 255)),
-                                            );
-                                        });
-                                        pnl_resp.response.on_hover_text(
-                                            "mcap = bonding curve at sell; SOL = wallet PnL on position.",
-                                        );
-                                    }
-                                    _ => {
-                                        ui.label(
-                                            egui::RichText::new("—")
-                                                .small()
-                                                .color(egui::Color32::GRAY),
-                                        );
-                                    }
-                                }
-
-                                match row.kind {
-                                    TxEventKind::Buy => {
-                                        if let Some(ref t) = row.v3_tape {
-                                            let s = format_v3_tape_compact(t);
-                                            ui.label(
-                                                egui::RichText::new(&s)
-                                                    .small()
-                                                    .monospace()
-                                                    .color(egui::Color32::from_rgb(180, 200, 235)),
-                                            )
-                                            .on_hover_text("V3 tape at entry (buy)");
-                                        } else {
-                                            ui.label(
-                                                egui::RichText::new("—")
-                                                    .small()
-                                                    .color(egui::Color32::GRAY),
-                                            );
-                                        }
-                                    }
-                                    TxEventKind::Sell => {
-                                        if let Some(ref d) = row.time_kill_detail {
-                                            ui.label(
-                                                egui::RichText::new(d.as_str())
-                                                    .small()
-                                                    .monospace()
-                                                    .color(egui::Color32::from_rgb(240, 190, 120)),
-                                            )
-                                            .on_hover_text(
-                                                "TIME KILL: adaptive tier + kill window seconds, or fixed window from config.",
-                                            );
-                                        } else {
-                                            ui.label(
-                                                egui::RichText::new("—")
-                                                    .small()
-                                                    .color(egui::Color32::GRAY),
-                                            );
-                                        }
-                                    }
-                                }
-
-                                // Live: hide raw signatures in-grid; show compact status + optional
-                                // close hint, full sig only in tooltip / copy.
-                                if let Some(sig) = &row.signature {
-                                    ui.horizontal(|ui| {
-                                        let (st_lbl, st_col) = match row.status.as_str() {
-                                            "sent" | "confirmed" => {
-                                                ("ok", egui::Color32::from_rgb(110, 190, 130))
-                                            }
-                                            "failed" => ("failed", egui::Color32::from_rgb(220, 90, 90)),
-                                            _ => (row.status.as_str(), egui::Color32::LIGHT_GRAY),
-                                        };
-                                        ui.colored_label(st_col, st_lbl);
-                                        if let Some(ref r) = row.reason {
-                                            if !r.is_empty() {
-                                                let short = if r.len() > 28 {
-                                                    format!("{}…", &r[..28])
-                                                } else {
-                                                    r.clone()
-                                                };
-                                                ui.label(
-                                                    egui::RichText::new(short)
-                                                        .small()
-                                                        .color(egui::Color32::GRAY),
-                                                );
-                                            }
-                                        }
-                                        let tip = format!(
-                                            "Signature (click 📋 to copy)\n{sig}\n\nSolscan:\nhttps://solscan.io/tx/{sig}"
-                                        );
-                                        if ui
-                                            .add(egui::Button::new("📋").small())
-                                            .on_hover_text(&tip)
-                                            .clicked()
-                                        {
-                                            tx_ctx.copy_text(sig.clone());
-                                        }
-                                    });
-                                } else {
-                                    let (lbl, col) = match row.status.as_str() {
-                                        "failed" => (
-                                            row.reason.clone().unwrap_or_else(|| "failed".into()),
-                                            egui::Color32::from_rgb(220, 90, 90),
-                                        ),
-                                        _ => (
-                                            "simulated".into(),
-                                            egui::Color32::GRAY,
-                                        ),
-                                    };
-                                    ui.colored_label(col, lbl);
-                                }
-                                ui.end_row();
-                            }
-                        });
+            // ── Tx log (one panel per wallet) ───────────────────────────────────
+            let tx_wallet_ids = self.tx_log_wallet_ids();
+            let tx_panel_h = (third.min(160.0) / tx_wallet_ids.len().max(1) as f32).max(72.0);
+            for wid in tx_wallet_ids {
+                let count = self
+                    .tx_log_by_wallet
+                    .get(&wid)
+                    .map(|q| q.len())
+                    .unwrap_or(0);
+                let title = self.wallet_display_label(&wid);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("TX LOG · {title}"))
+                            .strong()
+                            .size(14.0),
+                    );
+                    if let Some(m) = self.mode.as_deref() {
+                        let (txt, col) = match m {
+                            "live" => ("LIVE", egui::Color32::from_rgb(255, 90, 90)),
+                            "demo" => ("DEMO", egui::Color32::from_rgb(120, 220, 120)),
+                            _ => ("?", egui::Color32::GRAY),
+                        };
+                        ui.colored_label(col, txt);
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("({count})"))
+                            .color(egui::Color32::GRAY),
+                    );
                 });
+                ui.separator();
+                self.render_tx_log_panel(ui, ctx, &wid, tx_panel_h);
+                ui.add_space(4.0);
+            }
 
             ui.add_space(6.0);
 
@@ -2755,7 +2806,8 @@ async fn ws_loop(
                                                             time_kill_detail,
                                                             pnl_mcap_pct,
                                                             pnl_sol_pct,
-                                                        } if show_in_tx_log(&wallet_id) => Some(TxLogRow {
+                                                        } => Some(TxLogRow {
+                                                            wallet_id,
                                                             kind,
                                                             mint,
                                                             signature,

@@ -1247,6 +1247,36 @@ async fn main() {
     while let Some((slot, event, bucket)) = general_rx.recv().await {
         match event {
             Action::Create(general_create) => {
+                if general_create.is_unsupported_quote_mint() {
+                    eprintln!(
+                        "[FILTER] {} skipped: unsupported_quote_mint ({})",
+                        general_create.mint, general_create.quote_mint
+                    );
+                    bot_metrics.note_filter_rejected();
+                    if let Some(ref log) = learning_log {
+                        let log = log.clone();
+                        let mint_s = general_create.mint.to_string();
+                        let dev_s = general_create.user.to_string();
+                        let quote_s = general_create.quote_mint.to_string();
+                        let ts = SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        tokio::spawn(async move {
+                            let _ = log
+                                .log_skipped(
+                                    &mint_s,
+                                    Some(dev_s.as_str()),
+                                    "filter_quote_mint",
+                                    "unsupported_quote_mint",
+                                    serde_json::json!({ "quote_mint": quote_s }),
+                                    ts,
+                                )
+                                .await;
+                        });
+                    }
+                    continue;
+                }
                 println!("created {}", general_create.mint);
                 bot_metrics.note_create();
                 let creators = creators.clone();
@@ -1836,6 +1866,55 @@ async fn main() {
                             }
                         }
 
+                        if filter_config.execution.mode == ExecutionMode::Live {
+                            if let Some(reason) = features::weak_a_hard_skip_reason(
+                                &filter_config.scoring.weak_a_gate,
+                                breakdown.tier,
+                                breakdown.total,
+                                smart_count,
+                                &token_features,
+                                &breakdown.items,
+                            ) {
+                                eprintln!(
+                                    "[BUY] {} skipped (weak_a_gate): {} | tier={:?} score={} smart={} \
+                                     vol={:.2} dumps={} dev_cat={:?}",
+                                    general_create.mint,
+                                    reason,
+                                    breakdown.tier,
+                                    breakdown.total,
+                                    smart_count,
+                                    token_features.buy_volume_sol,
+                                    token_features.repeat_dump_slices,
+                                    token_features.dev_category,
+                                );
+                                if let Some(ref log) = learning_log_create {
+                                    let log = log.clone();
+                                    let mint_s = general_create.mint.to_string();
+                                    let dev_s = general_create.user.to_string();
+                                    let snap = LearningTradeSnapshot::from_scoring(
+                                        &token_features,
+                                        &breakdown,
+                                    );
+                                    let payload = serde_json::to_value(&snap)
+                                        .unwrap_or_else(|_| serde_json::json!({}));
+                                    let ts = unix_now();
+                                    tokio::spawn(async move {
+                                        let _ = log
+                                            .log_skipped(
+                                                &mint_s,
+                                                Some(dev_s.as_str()),
+                                                "weak_a_gate",
+                                                reason,
+                                                payload,
+                                                ts,
+                                            )
+                                            .await;
+                                    });
+                                }
+                                return;
+                            }
+                        }
+
                         match breakdown.tier {
                             Tier::A => bot_metrics_create.note_score_a(),
                             Tier::APlus => bot_metrics_create.note_score_a_plus(),
@@ -2008,10 +2087,15 @@ async fn main() {
                                             }
                                         }
                                         Err(reason) => {
-                                            if features::continuation_second_look_eligible(
+                                            if features::continuation_second_look_eligible_for_buy(
                                                 sl_cfg,
+                                                &filter_config.scoring.weak_a_gate,
+                                                breakdown.tier,
                                                 is_a_plus,
                                                 breakdown.total,
+                                                smart_count,
+                                                &token_features,
+                                                &breakdown.items,
                                                 reason,
                                             ) {
                                                 match features::evaluate_continuation_second_look(
@@ -2058,10 +2142,15 @@ async fn main() {
                                         }
                                     }
                                 } else if let Err(reason) = first_cont {
-                                    if features::continuation_second_look_eligible(
+                                    if features::continuation_second_look_eligible_for_buy(
                                         sl_cfg,
+                                        &filter_config.scoring.weak_a_gate,
+                                        breakdown.tier,
                                         is_a_plus,
                                         breakdown.total,
+                                        smart_count,
+                                        &token_features,
+                                        &breakdown.items,
                                         reason,
                                     ) {
                                         eprintln!(

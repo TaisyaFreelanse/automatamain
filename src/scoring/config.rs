@@ -112,6 +112,10 @@ pub struct ScoringConfig {
     /// peak with no smart money and no strong continuation (bought-the-top).
     #[serde(default)]
     pub anti_parabolic: AntiParabolicConfig,
+
+    /// Live gate: block or defer weak tier-A (low score, no smart, neutral/weak dev).
+    #[serde(default)]
+    pub weak_a_gate: WeakATierGateConfig,
 }
 
 impl Default for ScoringConfig {
@@ -135,8 +139,65 @@ impl Default for ScoringConfig {
             anti_rug: AntiRugConfig::default(),
             continuation: ContinuationConfig::default(),
             anti_parabolic: AntiParabolicConfig::default(),
+            weak_a_gate: WeakATierGateConfig::default(),
         }
     }
+}
+
+/// Blocks or forces continuation second-look on fragile tier-A entries (score≤7,
+/// no smart money, neutral/weak dev, low volume or dump slices in the scoring tape).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WeakATierGateConfig {
+    #[serde(default = "default_weak_a_gate_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_weak_a_max_score")]
+    pub max_score: i32,
+    #[serde(default)]
+    pub max_smart_wallets: u32,
+    /// Hard-skip weak A when `buy_volume_sol` in the scoring window is below this.
+    #[serde(default = "default_weak_a_min_buy_volume_sol")]
+    pub min_buy_volume_sol: f64,
+    /// Hard-skip weak A when `repeat_dump_slices` is at or above this (≥1 catches CB7C5-style tape).
+    #[serde(default = "default_weak_a_block_dump_slices_ge")]
+    pub block_repeat_dump_slices_ge: u32,
+    #[serde(default = "default_true")]
+    pub block_dev_neutral: bool,
+    #[serde(default = "default_true")]
+    pub block_dev_history_weak: bool,
+    /// Weak A that reaches continuation may defer on any first-fail reason up to this score.
+    #[serde(default = "default_weak_a_cont_second_look_max_score")]
+    pub continuation_second_look_max_score: i32,
+}
+
+impl Default for WeakATierGateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_weak_a_gate_enabled(),
+            max_score: default_weak_a_max_score(),
+            max_smart_wallets: 0,
+            min_buy_volume_sol: default_weak_a_min_buy_volume_sol(),
+            block_repeat_dump_slices_ge: default_weak_a_block_dump_slices_ge(),
+            block_dev_neutral: default_true(),
+            block_dev_history_weak: default_true(),
+            continuation_second_look_max_score: default_weak_a_cont_second_look_max_score(),
+        }
+    }
+}
+
+fn default_weak_a_gate_enabled() -> bool {
+    true
+}
+fn default_weak_a_max_score() -> i32 {
+    7
+}
+fn default_weak_a_min_buy_volume_sol() -> f64 {
+    12.0
+}
+fn default_weak_a_block_dump_slices_ge() -> u32 {
+    1
+}
+fn default_weak_a_cont_second_look_max_score() -> i32 {
+    7
 }
 
 /// Strong smart-money count that bypasses the `require_momentum_good` live gate.

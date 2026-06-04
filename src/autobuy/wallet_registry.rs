@@ -24,7 +24,7 @@ use crate::{
 };
 
 /// Per-wallet buy size overrides by tier (copy wallet). `None` = use signal tier size.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct WalletTierSize {
     pub a_sol: f64,
     pub a_plus_sol: f64,
@@ -43,7 +43,7 @@ pub struct WalletEntryConfig {
     /// Fixed buy size in SOL for every tier; `None` = use signal or `tier_size`.
     #[serde(default)]
     pub size_sol: Option<f64>,
-    /// Per-tier sizes (e.g. copy wallet 0.05 A / 0.06 A+). Overrides `size_sol` when set.
+    /// Per-tier sizes (e.g. copy wallet 0.5 A / 0.6 A+). Overrides `size_sol` when set.
     #[serde(default)]
     pub tier_size: Option<WalletTierSize>,
     /// Demo mode starting balance for this wallet (defaults to global `start_balance_sol`).

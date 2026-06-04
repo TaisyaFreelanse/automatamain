@@ -18,6 +18,7 @@ impl From<PumpEvent> for Action {
                     ticker: create_event.symbol,
                     uri: create_event.uri,
                 }),
+                quote_mint: create_event.quote_mint,
             }),
             PumpEvent::TradeEvent(trade_event) => Action::Trade(trade_event.into()),
         }

@@ -115,6 +115,34 @@ pub struct ExitEngineV4Config {
     /// No V4 decay exit and no lite-score phase downgrade for this long after entry.
     #[serde(default = "default_exit_grace_secs")]
     pub exit_grace_secs: u64,
+    /// Tier A grace (0 = use [`Self::exit_grace_secs`]).
+    #[serde(default = "default_exit_grace_secs_tier_a")]
+    pub exit_grace_secs_tier_a: u64,
+    /// Tier A+ grace (0 = use [`Self::exit_grace_secs`]).
+    #[serde(default = "default_exit_grace_secs_tier_a_plus")]
+    pub exit_grace_secs_tier_a_plus: u64,
+    /// While held < this and mcap PnL >= [`Self::decay_early_mcap_profit_min_pct`],
+    /// suppress distribution-only decay (recovery path instead).
+    #[serde(default = "default_decay_early_hold_secs")]
+    pub decay_early_hold_secs: u64,
+    #[serde(default = "default_decay_early_mcap_profit_min_pct")]
+    pub decay_early_mcap_profit_min_pct: f64,
+    /// Extra decay confirm ticks during the early-green window.
+    #[serde(default = "default_decay_early_extra_confirm_ticks")]
+    pub decay_early_extra_confirm_ticks: u8,
+    /// A+ positions: minimum adaptive time-kill window (seconds).
+    #[serde(default = "default_a_plus_time_kill_min_secs")]
+    pub a_plus_time_kill_min_secs: u64,
+    /// A+ with mcap PnL at/above this: skip TIME KILL (SL / SL CRASH still apply).
+    #[serde(default = "default_a_plus_time_kill_mcap_profit_min_pct")]
+    pub a_plus_time_kill_mcap_profit_min_pct: f64,
+    /// Tier A + entry `momentum_good` + mcap PnL above `tier_a_time_kill_defer_mcap_min_pct`:
+    /// floor adaptive TIME KILL window (weak ~22s → at least this many seconds).
+    #[serde(default = "default_tier_a_time_kill_defer_min_secs")]
+    pub tier_a_time_kill_defer_min_secs: u64,
+    /// Minimum mcap PnL (%) to apply tier-A TIME KILL defer; at/below → normal weak window.
+    #[serde(default = "default_tier_a_time_kill_defer_mcap_min_pct")]
+    pub tier_a_time_kill_defer_mcap_min_pct: f64,
     #[serde(default = "default_profile_weak")]
     pub weak: ExitTpProfile,
     #[serde(default = "default_profile_neutral")]
@@ -223,6 +251,42 @@ fn default_exit_grace_secs() -> u64 {
     8
 }
 
+fn default_exit_grace_secs_tier_a() -> u64 {
+    14
+}
+
+fn default_exit_grace_secs_tier_a_plus() -> u64 {
+    19
+}
+
+fn default_decay_early_hold_secs() -> u64 {
+    25
+}
+
+fn default_decay_early_mcap_profit_min_pct() -> f64 {
+    9.0
+}
+
+fn default_decay_early_extra_confirm_ticks() -> u8 {
+    1
+}
+
+fn default_a_plus_time_kill_min_secs() -> u64 {
+    50
+}
+
+fn default_a_plus_time_kill_mcap_profit_min_pct() -> f64 {
+    5.0
+}
+
+fn default_tier_a_time_kill_defer_min_secs() -> u64 {
+    50
+}
+
+fn default_tier_a_time_kill_defer_mcap_min_pct() -> f64 {
+    0.0
+}
+
 fn default_decay_confirm_ticks() -> u8 {
     3
 }
@@ -241,8 +305,68 @@ pub fn entry_live_score_floor(snap: Option<&crate::learning::LearningTradeSnapsh
         .unwrap_or(1)
 }
 
+/// Scoring tier string (`LearningTradeSnapshot::tier`, Debug format).
+pub fn entry_tier_is_a_plus(tier: &str) -> bool {
+    let t = tier.to_ascii_lowercase();
+    t.contains("aplus") || t.contains("a+")
+}
+
+pub fn entry_tier_is_a(tier: &str) -> bool {
+    if entry_tier_is_a_plus(tier) {
+        return false;
+    }
+    let t = tier.to_ascii_lowercase();
+    t == "a" || t.starts_with("a ") || t.ends_with("::a")
+}
+
+/// Tier-A TIME KILL defer: extend weak (~22s) window when entry had `momentum_good` and
+/// mcap is still green. Returns `None` for A+ (separate rules), non-A, red mcap, or no flag.
+pub fn tier_a_time_kill_defer_floor_secs(
+    cfg: &ExitEngineV4Config,
+    entry_tier: &str,
+    snap: Option<&crate::learning::LearningTradeSnapshot>,
+    mcap_pnl_pct: f64,
+) -> Option<u64> {
+    let min_secs = cfg.tier_a_time_kill_defer_min_secs;
+    if min_secs == 0 || entry_tier_is_a_plus(entry_tier) || !entry_tier_is_a(entry_tier) {
+        return None;
+    }
+    let snap = snap?;
+    if !snap.has_momentum_good {
+        return None;
+    }
+    if mcap_pnl_pct <= cfg.tier_a_time_kill_defer_mcap_min_pct {
+        return None;
+    }
+    Some(min_secs)
+}
+
+pub fn exit_grace_secs_for_tier(tier: &str, cfg: &ExitEngineV4Config) -> u64 {
+    if entry_tier_is_a_plus(tier) {
+        let v = cfg.exit_grace_secs_tier_a_plus;
+        if v > 0 {
+            v
+        } else {
+            cfg.exit_grace_secs
+        }
+    } else if entry_tier_is_a(tier) {
+        let v = cfg.exit_grace_secs_tier_a;
+        if v > 0 {
+            v
+        } else {
+            cfg.exit_grace_secs
+        }
+    } else {
+        cfg.exit_grace_secs
+    }
+}
+
 pub fn in_exit_grace_period(held_secs: u64, cfg: &ExitEngineV4Config) -> bool {
     held_secs < cfg.exit_grace_secs
+}
+
+pub fn in_exit_grace_period_tier(held_secs: u64, tier: &str, cfg: &ExitEngineV4Config) -> bool {
+    held_secs < exit_grace_secs_for_tier(tier, cfg)
 }
 
 /// Stop-loss grace: no SL (even confirmed ticks) until held this long after entry.
@@ -519,6 +643,15 @@ impl Default for ExitEngineV4Config {
             enabled: default_exit_v4_enabled(),
             live_score_refresh_secs: default_live_score_refresh_secs(),
             exit_grace_secs: default_exit_grace_secs(),
+            exit_grace_secs_tier_a: default_exit_grace_secs_tier_a(),
+            exit_grace_secs_tier_a_plus: default_exit_grace_secs_tier_a_plus(),
+            decay_early_hold_secs: default_decay_early_hold_secs(),
+            decay_early_mcap_profit_min_pct: default_decay_early_mcap_profit_min_pct(),
+            decay_early_extra_confirm_ticks: default_decay_early_extra_confirm_ticks(),
+            a_plus_time_kill_min_secs: default_a_plus_time_kill_min_secs(),
+            a_plus_time_kill_mcap_profit_min_pct: default_a_plus_time_kill_mcap_profit_min_pct(),
+            tier_a_time_kill_defer_min_secs: default_tier_a_time_kill_defer_min_secs(),
+            tier_a_time_kill_defer_mcap_min_pct: default_tier_a_time_kill_defer_mcap_min_pct(),
             weak: default_profile_weak(),
             neutral: default_profile_neutral(),
             strong: default_profile_strong(),
@@ -1044,6 +1177,70 @@ mod tests {
         // Guards doc 6.4: default must not be single-tick.
         assert!(ExitEngineV4Config::default().decay_confirm_ticks >= 3);
         assert!(ExitEngineV4Config::default().exit_grace_secs >= 8);
+    }
+
+    #[test]
+    fn tier_exit_grace_a_and_a_plus() {
+        let cfg = ExitEngineV4Config::default();
+        assert_eq!(exit_grace_secs_for_tier("A", &cfg), 14);
+        assert_eq!(exit_grace_secs_for_tier("APlus", &cfg), 19);
+        assert!(in_exit_grace_period_tier(10, "A", &cfg));
+        assert!(!in_exit_grace_period_tier(15, "A", &cfg));
+        assert!(entry_tier_is_a("A"));
+        assert!(entry_tier_is_a_plus("APlus"));
+        assert!(!entry_tier_is_a("APlus"));
+    }
+
+    fn test_snap(has_momentum_good: bool) -> crate::learning::LearningTradeSnapshot {
+        crate::learning::LearningTradeSnapshot {
+            mint: "m".into(),
+            dev: "d".into(),
+            entry_mcap_sol: 100.0,
+            smart_wallet_count: 0,
+            velocity_pct: 15.0,
+            bundle_similar: 0.0,
+            bundle_identical: 0.0,
+            buyer_count: 20,
+            buy_to_sell_ratio: 4.0,
+            buy_volume_sol: 10.0,
+            score_total: 8,
+            tier: "A".into(),
+            buyer_velocity_persistence: 0.0,
+            buyer_velocity_new_per_slice: vec![],
+            sell_pressure_score: 0.0,
+            absorb_quality_score: 0.5,
+            sell_volume_window_sol: 0.0,
+            sell_events_window: 0,
+            repeat_dump_slices: 0,
+            smart_wallet_early_exits: 0,
+            has_momentum_good,
+        }
+    }
+
+    #[test]
+    fn tier_a_time_kill_defer_floor() {
+        let cfg = ExitEngineV4Config::default();
+        let snap = test_snap(true);
+        assert_eq!(
+            tier_a_time_kill_defer_floor_secs(&cfg, "A", Some(&snap), 6.0),
+            Some(50)
+        );
+        assert_eq!(
+            tier_a_time_kill_defer_floor_secs(&cfg, "A", Some(&snap), 0.0),
+            None
+        );
+        assert_eq!(
+            tier_a_time_kill_defer_floor_secs(&cfg, "A", Some(&snap), -1.0),
+            None
+        );
+        assert_eq!(
+            tier_a_time_kill_defer_floor_secs(&cfg, "APlus", Some(&snap), 10.0),
+            None
+        );
+        assert_eq!(
+            tier_a_time_kill_defer_floor_secs(&cfg, "A", Some(&test_snap(false)), 10.0),
+            None
+        );
     }
 
     #[test]

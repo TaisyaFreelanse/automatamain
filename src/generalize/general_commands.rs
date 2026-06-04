@@ -113,11 +113,38 @@ pub struct GeneralMetadata {
     pub uri: String,
 }
 
+/// Pump bonding-curve / pool quote mint the bot supports for live entry (SOL only).
+pub const NATIVE_SOL_QUOTE_MINT: Address =
+    Address::from_str_const("So11111111111111111111111111111111111111112");
+
+/// Legacy pump `Create` events leave `quote_mint` unset (defaults to system program).
+pub const LEGACY_SOL_QUOTE_MINT: Address =
+    Address::from_str_const("11111111111111111111111111111111");
+
+/// USDC-quote bonding curves (bot uses `buy_exact_in` with SOL only).
+pub const USDC_QUOTE_MINT: Address =
+    Address::from_str_const("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+
 #[derive(Debug)]
 pub struct GeneralCreate {
     pub mint: Address,
     pub user: Address,
     pub metadata: Option<GeneralMetadata>,
+    /// Quote asset for the launch (native SOL vs USDC, etc.). Non-SOL quotes are
+    /// skipped before scoring — `buy_exact_in` and mcap tape assume SOL reserves.
+    pub quote_mint: Address,
+}
+
+impl GeneralCreate {
+    /// True when the launch is SOL-denominated (or legacy unset → treat as SOL).
+    pub fn is_native_sol_quote(&self) -> bool {
+        self.quote_mint == NATIVE_SOL_QUOTE_MINT || self.quote_mint == LEGACY_SOL_QUOTE_MINT
+    }
+
+    /// Non-SOL quotes we must not score/buy (e.g. USDC bonding curves).
+    pub fn is_unsupported_quote_mint(&self) -> bool {
+        !self.is_native_sol_quote()
+    }
 }
 
 #[derive(Debug)]
