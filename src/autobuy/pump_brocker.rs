@@ -336,24 +336,35 @@ impl SolanaBroker {
             .unwrap_or(0);
 
         let mint_s = mint.to_string();
-        let build = jupiter_build_swap_wsol_to_mint_exact_in(
-            &mint_s,
-            sol_lamports,
-            slippage_bps_u16,
-            &self.wallet_address.to_string(),
-            JupiterQuoteOpts::POST_GRADUATION,
-        )
-        .await?;
+        let (build, used_fallback) = self
+            .jupiter_buy_build_post_graduation(&mint_s, sol_lamports, slippage_bps_u16)
+            .await?;
 
         let tx_bytes = STANDARD
             .decode(build.swap_transaction_b64.trim())
             .map_err(|e| BrokerError::Custom(format!("Jupiter swapTransaction base64: {e}")))?;
         let template = decode_jupiter_swap_transaction(&tx_bytes)?;
 
-        let sig_str = self
+        let sig_str = match self
             .send_versioned_jupiter_with_retries(&template, "BUY-JUPITER")
-            .await?
-            .to_string();
+            .await
+        {
+            Ok(sig) => sig.to_string(),
+            // Allow-Pump fallback routed back through the bonding curve, which is
+            // complete (6005). No tradable AMM route exists → skip, do not retry.
+            Err(BrokerError::TransactionFailed(ref msg))
+                if is_bonding_curve_complete_pump_error(msg) =>
+            {
+                eprintln!(
+                    "[BROKER BUY] {mint}: post_grad_no_route — Jupiter route hit bonding curve 6005 \
+                     (fallback={used_fallback})"
+                );
+                return Err(BrokerError::Custom(format!(
+                    "post_grad_no_route: {mint} BUY route hit bonding curve 6005 (fallback={used_fallback})"
+                )));
+            }
+            Err(e) => return Err(e),
+        };
 
         {
             let mut bal = self.balance.lock().unwrap();
@@ -401,6 +412,61 @@ impl SolanaBroker {
             signature: Some(sig_str),
             entry_mcap_fill_sol: None,
         })
+    }
+
+    /// Post-graduation BUY (WSOL → mint) quote/build with route fallback, mirroring
+    /// the SELL post-graduation chain:
+    ///   1. exclude Pump DEXes — avoids re-routing through the (complete) bonding curve.
+    ///   2. on `NO_ROUTES_FOUND` → log `post_grad_buy_fallback`, retry WITHOUT
+    ///      `excludeDexes` (migrated Pump AMM / PumpSwap is where liquidity now lives).
+    /// Returns `(build, used_fallback)`. Both quotes `NO_ROUTES` → `post_grad_no_route`.
+    async fn jupiter_buy_build_post_graduation(
+        &self,
+        mint_s: &str,
+        sol_lamports: u64,
+        slippage_bps_u16: u16,
+    ) -> Result<(JupiterSwapBuild, bool), BrokerError> {
+        let wallet = self.wallet_address.to_string();
+        match jupiter_build_swap_wsol_to_mint_exact_in(
+            mint_s,
+            sol_lamports,
+            slippage_bps_u16,
+            &wallet,
+            JupiterQuoteOpts::POST_GRADUATION,
+        )
+        .await
+        {
+            Ok(build) => return Ok((build, false)),
+            Err(e) if is_jupiter_no_routes_found(&e) => {
+                eprintln!(
+                    "[JUPITER] post_grad_buy_fallback mint={mint_s} lamports={sol_lamports}: \
+                     exclude-Pump NO_ROUTES — retrying quote without excludeDexes"
+                );
+            }
+            Err(e) => return Err(e),
+        }
+
+        match jupiter_build_swap_wsol_to_mint_exact_in(
+            mint_s,
+            sol_lamports,
+            slippage_bps_u16,
+            &wallet,
+            JupiterQuoteOpts::POST_GRADUATION_ALLOW_PUMP,
+        )
+        .await
+        {
+            Ok(build) => Ok((build, true)),
+            Err(e) if is_jupiter_no_routes_found(&e) => {
+                eprintln!(
+                    "[BROKER BUY] post_grad_no_route mint={mint_s}: no Jupiter buy route \
+                     (excluded-Pump and allow-Pump both NO_ROUTES)"
+                );
+                Err(BrokerError::Custom(format!(
+                    "post_grad_no_route: {mint_s} no Jupiter buy route (excluded+allow-pump NO_ROUTES)"
+                )))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn jupiter_quote_swap_build(

@@ -1624,6 +1624,40 @@ impl PositionManagerActor {
                 }
                 return;
             }
+            // Graduated token with no tradable Jupiter route (excluded-Pump and
+            // allow-Pump both NO_ROUTES, or route hit bonding-curve 6005). Not a
+            // failed on-chain trade — skip and record `post_grad_no_route`.
+            Err(e) if e.is_post_grad_no_route() => {
+                if let Some(ref lat) = self.buy_latency {
+                    lat.on_buy_failed(mint, &wallet_id);
+                }
+                eprintln!(
+                    "[BUY] wallet_id={wallet_id} Skipped {mint} — post_grad_no_route: {e}"
+                );
+                self.pending_wallet_buys.remove(&pos_key);
+                if !self.any_position_for_mint(mint) {
+                    self.closed_mints.insert(mint);
+                }
+                if let Some(ref log) = self.learning {
+                    let log = log.clone();
+                    let mint_s = mint.to_string();
+                    let dev_s = dev_address.map(|d| d.to_string());
+                    let detail = e.to_string();
+                    tokio::spawn(async move {
+                        let _ = log
+                            .log_skipped(
+                                &mint_s,
+                                dev_s.as_deref(),
+                                "buy_route",
+                                "post_grad_no_route",
+                                json!({ "detail": detail }),
+                                now_secs(),
+                            )
+                            .await;
+                    });
+                }
+                return;
+            }
             Err(e) => {
                 if let Some(ref lat) = self.buy_latency {
                     lat.on_buy_failed(mint, &wallet_id);

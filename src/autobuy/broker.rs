@@ -76,6 +76,13 @@ impl BrokerError {
     pub fn is_mint_not_on_chain(&self) -> bool {
         matches!(self, BrokerError::MintNotOnChain { .. })
     }
+
+    /// Post-graduation BUY found no Jupiter route (excluded-Pump and allow-Pump
+    /// both `NO_ROUTES_FOUND`, or the route hit bonding-curve 6005). Treated as a
+    /// skip (`post_grad_no_route`), not a failed on-chain trade.
+    pub fn is_post_grad_no_route(&self) -> bool {
+        matches!(self, BrokerError::Custom(msg) if msg.contains("post_grad_no_route"))
+    }
 }
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
