@@ -1300,6 +1300,8 @@ async fn main() {
                     let buy_latency_create = buy_latency.clone();
                     async move {
                         buy_latency_create.on_created(mint_address);
+                        // Fine-grained per-stage pipeline timer (created → buy).
+                        let pipeline_t0 = std::time::Instant::now();
                         let unix_now = || {
                             SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -1532,6 +1534,13 @@ async fn main() {
                             Some(momentum_low_pct),
                         )
                         .await;
+                        eprintln!(
+                            "[LATENCY] {} stage=scoring_window ms={} window_ms={} exited_early={}",
+                            general_create.mint,
+                            pipeline_t0.elapsed().as_millis(),
+                            window_ms,
+                            tape_observe.exited_early,
+                        );
                         let tape_points = tape_observe.points;
 
                         let scoring_bucket = tape_observe
@@ -2315,6 +2324,12 @@ async fn main() {
                             LearningTradeSnapshot::from_scoring(&token_features, &breakdown);
 
                         buy_latency_create.on_score_done(mint_address);
+                        eprintln!(
+                            "[LATENCY] {} stage=pre_initiate_buy ms={} (created → InitiateBuy; \
+                             remaining buy_fanout stagger applies only to wallet 2+)",
+                            general_create.mint,
+                            pipeline_t0.elapsed().as_millis(),
+                        );
 
                         if tx
                             .send(PositionMessage::InitiateBuy {

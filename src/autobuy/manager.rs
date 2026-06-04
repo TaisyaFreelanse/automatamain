@@ -941,8 +941,14 @@ impl PositionManagerActor {
                     let delay_ms = self.config.buy_fanout_delay_ms;
                     let tx_clone = self.tx.clone();
                     tokio::spawn(async move {
-                        sleep(Duration::from_millis(delay_ms)).await;
-                        for (wallet_id, wallet_amount_sol) in enabled {
+                        // First wallet fires immediately (no leading dead latency
+                        // on the critical path); subsequent wallets are staggered
+                        // by `buy_fanout_delay_ms` to avoid RPC/blockhash
+                        // collisions. Same fan-out logic, just no pre-first sleep.
+                        for (i, (wallet_id, wallet_amount_sol)) in enabled.into_iter().enumerate() {
+                            if i > 0 && delay_ms > 0 {
+                                sleep(Duration::from_millis(delay_ms)).await;
+                            }
                             let _ = tx_clone
                                 .send(PositionMessage::ExecuteBuy {
                                     mint,

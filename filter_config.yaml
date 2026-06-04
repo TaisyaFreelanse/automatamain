@@ -88,8 +88,9 @@ buy_config:
   # fill/score gap (hard spike during our buy) this keeps the SL baseline from
   # dropping so low it disables the stop. 1.0 = no honest adjustment.
   honest_entry_baseline_min_ratio: 0.85
-  # Delay after BUY GATE before fan-out ExecuteBuy per wallet (ms). 0–300 for tighter copy.
-  buy_fanout_delay_ms: 800
+  # Stagger BETWEEN wallets on fan-out (ms). First wallet fires immediately; each
+  # subsequent wallet waits this long to avoid RPC/blockhash collisions. 0 = all at once.
+  buy_fanout_delay_ms: 150
   # exit_v4 live tape refresh: min interval per open mint (ms); Tick is every 100ms.
   exit_v4_live_snapshot_interval_ms: 500
 
