@@ -1923,7 +1923,7 @@ async fn main() {
                                 return;
                             }
 
-                            if let Some(reason) = features::aplus_no_smart_fake_b2s_skip_reason(
+                            if let Some(reason) = features::aplus_rug_gate_skip_reason(
                                 breakdown.tier,
                                 smart_count,
                                 token_features.buy_to_sell_ratio,

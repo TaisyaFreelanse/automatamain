@@ -484,17 +484,23 @@ pub fn weak_a_profile_match(
     dev_weak
 }
 
-/// A+ with no smart money and extreme buy-only tape (serial rug pattern).
-pub fn aplus_no_smart_fake_b2s_skip_reason(
+/// Live A+ entry gates (serial rug pattern).
+pub fn aplus_rug_gate_skip_reason(
     tier: Tier,
     smart_wallet_count: u32,
     buy_to_sell_ratio: f64,
 ) -> Option<&'static str> {
-    if tier == Tier::APlus && smart_wallet_count == 0 && buy_to_sell_ratio > 10.0 {
-        Some("aplus_no_smart_fake_b2s")
-    } else {
-        None
+    if tier != Tier::APlus {
+        return None;
     }
+    if smart_wallet_count < 1 {
+        return Some("aplus_no_smart_required");
+    }
+    // Belt-and-suspenders if min-smart is ever relaxed in config.
+    if smart_wallet_count == 0 && buy_to_sell_ratio > 10.0 {
+        return Some("aplus_no_smart_fake_b2s");
+    }
+    None
 }
 
 /// Hard skip before continuation poll: dump slice and/or low buy volume on weak A.
@@ -1194,21 +1200,15 @@ mod continuation_tests {
     }
 
     #[test]
-    fn aplus_no_smart_fake_b2s_blocks_extreme_buy_only() {
+    fn aplus_rug_gate_requires_smart_and_blocks_fake_b2s() {
         assert_eq!(
-            aplus_no_smart_fake_b2s_skip_reason(Tier::APlus, 0, 15.0),
-            Some("aplus_no_smart_fake_b2s")
+            aplus_rug_gate_skip_reason(Tier::APlus, 0, 5.0),
+            Some("aplus_no_smart_required")
         );
+        assert_eq!(aplus_rug_gate_skip_reason(Tier::APlus, 1, 15.0), None);
+        assert_eq!(aplus_rug_gate_skip_reason(Tier::APlus, 2, 10.0), None);
         assert_eq!(
-            aplus_no_smart_fake_b2s_skip_reason(Tier::APlus, 0, 10.0),
-            None
-        );
-        assert_eq!(
-            aplus_no_smart_fake_b2s_skip_reason(Tier::APlus, 1, 20.0),
-            None
-        );
-        assert_eq!(
-            aplus_no_smart_fake_b2s_skip_reason(Tier::A, 0, 20.0),
+            aplus_rug_gate_skip_reason(Tier::A, 0, 20.0),
             None
         );
     }
