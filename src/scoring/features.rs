@@ -484,6 +484,18 @@ pub fn weak_a_profile_match(
     dev_weak
 }
 
+/// Minimum peak mcap velocity (%) for tier-A live buys (export: weak A setups cluster 0–5%).
+pub const TIER_A_MIN_VELOCITY_PCT: f64 = 3.0;
+
+/// Tier A with near-flat momentum in the scoring window.
+pub fn tier_a_low_velocity_skip_reason(tier: Tier, velocity_pct: f64) -> Option<&'static str> {
+    if tier == Tier::A && velocity_pct < TIER_A_MIN_VELOCITY_PCT {
+        Some("low_velocity_a_setup")
+    } else {
+        None
+    }
+}
+
 /// Live A+ entry gates (serial rug pattern).
 pub fn aplus_rug_gate_skip_reason(
     tier: Tier,
@@ -1197,6 +1209,16 @@ mod continuation_tests {
             evaluate_continuation_second_look(ref_mcap, 30, &recheck),
             Ok(())
         );
+    }
+
+    #[test]
+    fn tier_a_low_velocity_skip_blocks_flat_momentum() {
+        assert_eq!(
+            tier_a_low_velocity_skip_reason(Tier::A, 2.9),
+            Some("low_velocity_a_setup")
+        );
+        assert_eq!(tier_a_low_velocity_skip_reason(Tier::A, 3.0), None);
+        assert_eq!(tier_a_low_velocity_skip_reason(Tier::APlus, 0.0), None);
     }
 
     #[test]

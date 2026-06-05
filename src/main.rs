@@ -1964,6 +1964,60 @@ async fn main() {
                                 }
                                 return;
                             }
+
+                            let velocity_pct = features::momentum_peak_pct(
+                                token_features.initial_mcap_sol,
+                                token_features
+                                    .peak_mcap_sol
+                                    .max(token_features.current_mcap_sol),
+                            );
+                            if let Some(reason) =
+                                features::tier_a_low_velocity_skip_reason(breakdown.tier, velocity_pct)
+                            {
+                                eprintln!(
+                                    "[BUY] {} skipped (velocity_gate): {} | tier={:?} score={} \
+                                     velocity_pct={:.2} smart={} buyers={} vol={:.2}",
+                                    general_create.mint,
+                                    reason,
+                                    breakdown.tier,
+                                    breakdown.total,
+                                    velocity_pct,
+                                    smart_count,
+                                    token_features.buyer_count(),
+                                    token_features.buy_volume_sol,
+                                );
+                                if let Some(ref log) = learning_log_create {
+                                    let log = log.clone();
+                                    let mint_s = general_create.mint.to_string();
+                                    let dev_s = general_create.user.to_string();
+                                    let snap = LearningTradeSnapshot::from_scoring(
+                                        &token_features,
+                                        &breakdown,
+                                    );
+                                    let mut payload = serde_json::to_value(&snap)
+                                        .unwrap_or_else(|_| serde_json::json!({}));
+                                    if let Some(obj) = payload.as_object_mut() {
+                                        obj.insert(
+                                            "velocity_pct".into(),
+                                            serde_json::json!(velocity_pct),
+                                        );
+                                    }
+                                    let ts = unix_now();
+                                    tokio::spawn(async move {
+                                        let _ = log
+                                            .log_skipped(
+                                                &mint_s,
+                                                Some(dev_s.as_str()),
+                                                "velocity_gate",
+                                                reason,
+                                                payload,
+                                                ts,
+                                            )
+                                            .await;
+                                    });
+                                }
+                                return;
+                            }
                         }
 
                         match breakdown.tier {
