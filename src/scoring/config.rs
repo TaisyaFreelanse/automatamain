@@ -683,7 +683,7 @@ pub struct ScoringWeights {
 impl Default for ScoringWeights {
     fn default() -> Self {
         Self {
-            dev_history_strong: 4,
+            dev_history_strong: 2,
             dev_history_weak: 2,
             dev_ranker_a_plus: 3,
             dev_ranker_a: 1,

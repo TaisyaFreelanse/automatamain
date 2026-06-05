@@ -484,6 +484,19 @@ pub fn weak_a_profile_match(
     dev_weak
 }
 
+/// A+ with no smart money and extreme buy-only tape (serial rug pattern).
+pub fn aplus_no_smart_fake_b2s_skip_reason(
+    tier: Tier,
+    smart_wallet_count: u32,
+    buy_to_sell_ratio: f64,
+) -> Option<&'static str> {
+    if tier == Tier::APlus && smart_wallet_count == 0 && buy_to_sell_ratio > 10.0 {
+        Some("aplus_no_smart_fake_b2s")
+    } else {
+        None
+    }
+}
+
 /// Hard skip before continuation poll: dump slice and/or low buy volume on weak A.
 pub fn weak_a_hard_skip_reason(
     cfg: &WeakATierGateConfig,
@@ -1177,6 +1190,26 @@ mod continuation_tests {
         assert_eq!(
             evaluate_continuation_second_look(ref_mcap, 30, &recheck),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn aplus_no_smart_fake_b2s_blocks_extreme_buy_only() {
+        assert_eq!(
+            aplus_no_smart_fake_b2s_skip_reason(Tier::APlus, 0, 15.0),
+            Some("aplus_no_smart_fake_b2s")
+        );
+        assert_eq!(
+            aplus_no_smart_fake_b2s_skip_reason(Tier::APlus, 0, 10.0),
+            None
+        );
+        assert_eq!(
+            aplus_no_smart_fake_b2s_skip_reason(Tier::APlus, 1, 20.0),
+            None
+        );
+        assert_eq!(
+            aplus_no_smart_fake_b2s_skip_reason(Tier::A, 0, 20.0),
+            None
         );
     }
 

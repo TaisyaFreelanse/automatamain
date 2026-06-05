@@ -1922,6 +1922,48 @@ async fn main() {
                                 }
                                 return;
                             }
+
+                            if let Some(reason) = features::aplus_no_smart_fake_b2s_skip_reason(
+                                breakdown.tier,
+                                smart_count,
+                                token_features.buy_to_sell_ratio,
+                            ) {
+                                eprintln!(
+                                    "[BUY] {} skipped (aplus_rug_gate): {} | tier={:?} score={} \
+                                     smart={} b2s={:.1}",
+                                    general_create.mint,
+                                    reason,
+                                    breakdown.tier,
+                                    breakdown.total,
+                                    smart_count,
+                                    token_features.buy_to_sell_ratio,
+                                );
+                                if let Some(ref log) = learning_log_create {
+                                    let log = log.clone();
+                                    let mint_s = general_create.mint.to_string();
+                                    let dev_s = general_create.user.to_string();
+                                    let snap = LearningTradeSnapshot::from_scoring(
+                                        &token_features,
+                                        &breakdown,
+                                    );
+                                    let payload = serde_json::to_value(&snap)
+                                        .unwrap_or_else(|_| serde_json::json!({}));
+                                    let ts = unix_now();
+                                    tokio::spawn(async move {
+                                        let _ = log
+                                            .log_skipped(
+                                                &mint_s,
+                                                Some(dev_s.as_str()),
+                                                "aplus_rug_gate",
+                                                reason,
+                                                payload,
+                                                ts,
+                                            )
+                                            .await;
+                                    });
+                                }
+                                return;
+                            }
                         }
 
                         match breakdown.tier {
