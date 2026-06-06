@@ -515,6 +515,32 @@ pub fn aplus_rug_gate_skip_reason(
     None
 }
 
+/// Hard skip: tier-A weak dev history, no smart, inflated b2s, no sell flow (synthetic pump).
+pub fn weak_a_synthetic_pump_skip_reason(
+    cfg: &crate::scoring::config::WeakASyntheticPumpConfig,
+    tier: Tier,
+    smart_wallet_count: u32,
+    f: &TokenFeatures,
+    items: &[(&'static str, i32)],
+) -> Option<&'static str> {
+    if !cfg.enabled || tier != Tier::A {
+        return None;
+    }
+    if smart_wallet_count != 0 {
+        return None;
+    }
+    if !score_items_has("dev_history_weak", items) {
+        return None;
+    }
+    if f.buy_to_sell_ratio <= cfg.buy_to_sell_ratio_gt {
+        return None;
+    }
+    if f.sell_volume_window_sol >= cfg.sell_volume_window_sol_lt {
+        return None;
+    }
+    Some("weak_a_synthetic_pump")
+}
+
 /// Hard skip before continuation poll: dump slice and/or low buy volume on weak A.
 pub fn weak_a_hard_skip_reason(
     cfg: &WeakATierGateConfig,
@@ -1337,6 +1363,49 @@ mod strong_a_bypass_tests {
             ("buyer_velocity_fading", -2),
         ];
         assert!(!strong_a_momentum_bypass_ok(&cfg(), Tier::A, 9, &f, &items));
+    }
+
+    #[test]
+    fn weak_a_synthetic_pump_blocks_fake_b2s_no_sell_flow() {
+        use crate::scoring::config::WeakASyntheticPumpConfig;
+        let cfg = WeakASyntheticPumpConfig::default();
+        let mut f = strong_f();
+        f.buy_to_sell_ratio = 17.0;
+        f.sell_volume_window_sol = 0.06;
+        let items = [("dev_history_weak", 2)];
+        assert_eq!(
+            weak_a_synthetic_pump_skip_reason(&cfg, Tier::A, 0, &f, &items),
+            Some("weak_a_synthetic_pump")
+        );
+    }
+
+    #[test]
+    fn weak_a_synthetic_pump_allows_real_sell_flow() {
+        use crate::scoring::config::WeakASyntheticPumpConfig;
+        let cfg = WeakASyntheticPumpConfig::default();
+        let mut f = strong_f();
+        f.buy_to_sell_ratio = 17.0;
+        f.sell_volume_window_sol = 2.5;
+        let items = [("dev_history_weak", 2)];
+        assert_eq!(weak_a_synthetic_pump_skip_reason(&cfg, Tier::A, 0, &f, &items), None);
+    }
+
+    #[test]
+    fn weak_a_synthetic_pump_allows_a_plus_and_smart() {
+        use crate::scoring::config::WeakASyntheticPumpConfig;
+        let cfg = WeakASyntheticPumpConfig::default();
+        let mut f = strong_f();
+        f.buy_to_sell_ratio = 17.0;
+        f.sell_volume_window_sol = 0.0;
+        let items = [("dev_history_weak", 2)];
+        assert_eq!(
+            weak_a_synthetic_pump_skip_reason(&cfg, Tier::APlus, 0, &f, &items),
+            None
+        );
+        assert_eq!(
+            weak_a_synthetic_pump_skip_reason(&cfg, Tier::A, 1, &f, &items),
+            None
+        );
     }
 
     #[test]

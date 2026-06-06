@@ -167,6 +167,32 @@ pub struct WeakATierGateConfig {
     /// Weak A that reaches continuation may defer on any first-fail reason up to this score.
     #[serde(default = "default_weak_a_cont_second_look_max_score")]
     pub continuation_second_look_max_score: i32,
+    /// Hard skip: tier-A + dev_history_weak + no smart + fake b2s + no sell flow.
+    #[serde(default)]
+    pub synthetic_pump: WeakASyntheticPumpConfig,
+}
+
+/// Blocks weak-A synthetic pumps: high b2s with no real sell volume and weak dev history.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WeakASyntheticPumpConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Skip when `buy_to_sell_ratio` is strictly greater than this.
+    #[serde(default = "default_synthetic_pump_b2s_threshold")]
+    pub buy_to_sell_ratio_gt: f64,
+    /// Skip when `sell_volume_window_sol` is strictly less than this.
+    #[serde(default = "default_synthetic_pump_min_sell_vol")]
+    pub sell_volume_window_sol_lt: f64,
+}
+
+impl Default for WeakASyntheticPumpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            buy_to_sell_ratio_gt: default_synthetic_pump_b2s_threshold(),
+            sell_volume_window_sol_lt: default_synthetic_pump_min_sell_vol(),
+        }
+    }
 }
 
 impl Default for WeakATierGateConfig {
@@ -180,6 +206,7 @@ impl Default for WeakATierGateConfig {
             block_dev_neutral: default_true(),
             block_dev_history_weak: default_true(),
             continuation_second_look_max_score: default_weak_a_cont_second_look_max_score(),
+            synthetic_pump: WeakASyntheticPumpConfig::default(),
         }
     }
 }
@@ -198,6 +225,12 @@ fn default_weak_a_block_dump_slices_ge() -> u32 {
 }
 fn default_weak_a_cont_second_look_max_score() -> i32 {
     7
+}
+fn default_synthetic_pump_b2s_threshold() -> f64 {
+    10.0
+}
+fn default_synthetic_pump_min_sell_vol() -> f64 {
+    2.0
 }
 
 /// Strong smart-money count that bypasses the `require_momentum_good` live gate.

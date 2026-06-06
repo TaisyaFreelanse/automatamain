@@ -297,6 +297,11 @@ scoring:
     block_dev_neutral: true
     block_dev_history_weak: true
     continuation_second_look_max_score: 7
+    # Hard skip: tier-A + dev_history_weak + smart=0 + b2s>10 + sell_vol<2 (synthetic pump).
+    synthetic_pump:
+      enabled: true
+      buy_to_sell_ratio_gt: 10.0
+      sell_volume_window_sol_lt: 2.0
   # Anti-parabolic peak gate: skip weak A-tier entries with no smart money bought
   # at the local peak unless the confirm window shows strong fresh demand. A+ /
   # smart-money / runner setups are exempt. Ships dark (enabled: false).
