@@ -26,6 +26,8 @@ pub enum DevCategory {
     /// Dev hasn't been seen in TTL window — we treat them as if we have no
     /// information, neither bonus nor penalty.
     Stale,
+    /// No creator history in the analytics DB (tier-B lane).
+    Fresh,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -193,6 +195,7 @@ pub fn spawn(config: PersistenceConfig) -> DevRankerHandle {
                                     DevCategory::Neutral => snap.neutral += 1,
                                     DevCategory::Bad => snap.bad += 1,
                                     DevCategory::Stale => snap.stale += 1,
+                                    DevCategory::Fresh => {}
                                 }
                             }
                             let _ = respond_to.send(snap);

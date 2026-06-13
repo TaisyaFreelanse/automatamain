@@ -71,6 +71,23 @@ pub struct DevStats {
 }
 
 #[derive(Deserialize, Clone, Debug)]
+pub struct TierExitReasonCount {
+    pub reason: String,
+    pub n: i64,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct TierStatsWire {
+    pub tier: String,
+    pub n: i64,
+    pub wins: i64,
+    pub winrate_pct: f64,
+    pub avg_pnl_pct: f64,
+    pub profit_factor: f64,
+    pub exit_reasons: Vec<TierExitReasonCount>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
 #[serde(tag = "source", rename_all = "snake_case")]
 pub enum OpenReason {
     DevStats(DevStats),
@@ -500,6 +517,7 @@ enum DashCmd {
     /// Retried refresh after position close (DB write is async on the bot).
     RefreshBotTradesAfterClose,
     FetchOpenPositions,
+    FetchTierStats,
     /// Switch broker mode. `confirm_live` must be true to switch to live;
     /// the dashboard enforces this via a two-step typed confirmation.
     SetMode { mode: String, confirm_live: bool },
@@ -541,6 +559,7 @@ enum AppEvent {
     Wallets(Vec<WalletWire>),
     WalletsSaveOk,
     WalletsSaveErr(String),
+    TierStats(TierStatsWire),
 }
 
 // ── Positions ─────────────────────────────────────────────────────────────────
@@ -651,6 +670,7 @@ struct Dashboard {
     /// Global wallet context: `"all"` | `wallet_1` | `wallet_2` — stats, OPEN, HISTORY.
     wallet_view: String,
     wallet_save_status: Option<String>,
+    tier_b_stats: Option<TierStatsWire>,
 }
 
 #[derive(Clone, Debug)]
@@ -709,6 +729,7 @@ impl Dashboard {
             wallets: Vec::new(),
             wallet_view: "all".to_string(),
             wallet_save_status: None,
+            tier_b_stats: None,
         }
     }
 
@@ -1147,6 +1168,7 @@ impl Dashboard {
                 AppEvent::WalletsSaveErr(msg) => {
                     self.wallet_save_status = Some(format!("✗ {msg}"));
                 }
+                AppEvent::TierStats(stats) => self.tier_b_stats = Some(stats),
                 AppEvent::OpenPositions(rows) => self.apply_open_positions(rows),
                 AppEvent::Msg(msg) => match msg {
                     WsMsg::PositionOpen {
@@ -2045,6 +2067,7 @@ impl eframe::App for Dashboard {
             send_dash_cmd(&self.cmd_tx, DashCmd::FetchBotTrades);
             send_dash_cmd(&self.cmd_tx, DashCmd::FetchStatus);
             send_dash_cmd(&self.cmd_tx, DashCmd::FetchOpenPositions);
+            send_dash_cmd(&self.cmd_tx, DashCmd::FetchTierStats);
             self.last_http_poll = Some(std::time::Instant::now());
         }
 
@@ -2293,6 +2316,47 @@ impl eframe::App for Dashboard {
                             if let Some(sz) = w.size_sol {
                                 ui.separator();
                                 ui.label(format!("size: {sz:.4} SOL"));
+                            }
+                        }
+                    });
+                });
+            }
+
+            if let Some(ref b) = self.tier_b_stats {
+                egui::TopBottomPanel::top("tier_b_stats_bar").show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(200, 180, 255),
+                            egui::RichText::new("Tier B · Fresh Dev Setup").strong(),
+                        );
+                        ui.separator();
+                        ui.label(format!("Trades: {}", b.n));
+                        ui.separator();
+                        ui.label("Winrate:");
+                        ui.colored_label(
+                            pnl_color(b.winrate_pct - 50.0),
+                            format!("{:.1}%", b.winrate_pct),
+                        );
+                        ui.separator();
+                        ui.label("Avg PnL:");
+                        ui.colored_label(
+                            pnl_color(b.avg_pnl_pct),
+                            format!("{:+.2}%", b.avg_pnl_pct),
+                        );
+                        ui.separator();
+                        ui.label("Profit Factor:");
+                        let pf = if b.profit_factor.is_finite() {
+                            format!("{:.2}", b.profit_factor)
+                        } else {
+                            "∞".to_string()
+                        };
+                        ui.colored_label(pnl_color(b.profit_factor.signum() * 10.0), pf);
+                        if !b.exit_reasons.is_empty() {
+                            ui.separator();
+                            ui.label("Exits:");
+                            for r in b.exit_reasons.iter().take(4) {
+                                ui.label(format!("{}: {}", r.reason, r.n));
+                                ui.separator();
                             }
                         }
                     });
@@ -2681,6 +2745,7 @@ async fn ws_loop(
                 }
 
                 fetch_open_positions_http(&http_url, &tx, &ctx);
+                fetch_tier_stats_http(&http_url, &tx, &ctx);
 
                 let (mut sink, mut stream) = ws.split();
                 loop {
@@ -2867,6 +2932,14 @@ async fn ws_loop(
                                     let ctx2 = ctx.clone();
                                     tokio::spawn(async move {
                                         fetch_open_positions_http(&url, &tx2, &ctx2);
+                                    });
+                                }
+                                Some(DashCmd::FetchTierStats) => {
+                                    let url = http_url.clone();
+                                    let tx2 = tx.clone();
+                                    let ctx2 = ctx.clone();
+                                    tokio::spawn(async move {
+                                        fetch_tier_stats_http(&url, &tx2, &ctx2);
                                     });
                                 }
                                 Some(DashCmd::PutWallets(wallets)) => {
@@ -3068,6 +3141,26 @@ fn schedule_bot_trades_refresh(
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             }
             fetch_bot_trades_http(&http_url, &tx, &ctx, &fetch_gen).await;
+        }
+    });
+}
+
+fn fetch_tier_stats_http(
+    http_url: &str,
+    tx: &mpsc::SyncSender<AppEvent>,
+    ctx: &egui::Context,
+) {
+    let url = format!("{}/tier-stats", http_url);
+    let tx = tx.clone();
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        if let Ok(resp) = reqwest::get(&url).await {
+            if resp.status().is_success() {
+                if let Ok(stats) = resp.json::<TierStatsWire>().await {
+                    let _ = tx.send(AppEvent::TierStats(stats));
+                    ctx.request_repaint();
+                }
+            }
         }
     });
 }

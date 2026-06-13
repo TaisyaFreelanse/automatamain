@@ -362,6 +362,16 @@ scoring:
     a_plus_sol: 0.4
     # Tier A: smaller than A+; operator cap must be >= a_plus_sol (see buy_config.amount_sol).
     a_sol: 0.3
+    # Tier B — Fresh Dev Setup (MVP stats lane).
+    b_sol: 0.2
+
+  # Tier B — Fresh Dev Setup: experimental lane for devs with no creator history.
+  # All continuation / anti-rug / bundle / late-entry protections stay active.
+  tier_b:
+    enabled: true
+    min_smart_wallets: 1
+    min_buyers: 8
+    min_buy_volume_sol: 8.0
 
 # After our bot cliff exit (SL CRASH / deep SL / large tick drop), block this dev's
 # new mints until expires_at (stored in dev_blacklist table).

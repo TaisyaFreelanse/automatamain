@@ -28,6 +28,12 @@ use crate::{
 pub struct WalletTierSize {
     pub a_sol: f64,
     pub a_plus_sol: f64,
+    #[serde(default = "default_wallet_b_sol")]
+    pub b_sol: f64,
+}
+
+fn default_wallet_b_sol() -> f64 {
+    0.2
 }
 
 /// Per-wallet entry in `filter_config.yaml` (no secret values — env var names only).
@@ -124,6 +130,7 @@ impl WalletHandle {
             return match buy_tier {
                 Tier::APlus => ts.a_plus_sol,
                 Tier::A => ts.a_sol,
+                Tier::B => ts.b_sol,
                 Tier::Skip => signal_sol,
             };
         }
@@ -408,6 +415,7 @@ mod tests {
             tier_size: RwLock::new(Some(WalletTierSize {
                 a_sol: 0.5,
                 a_plus_sol: 0.6,
+                b_sol: 0.2,
             })),
             private_key_env: "PRIVATE_KEY_WALLET_2".to_string(),
             pubkey: "pub".to_string(),

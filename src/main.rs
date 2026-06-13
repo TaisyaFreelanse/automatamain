@@ -28,7 +28,7 @@ use loggaper::{
     scoring::{
         anti_rug::entry_skip_reason,
         config::MinBuyTier,
-        dev_ranker::{self, DevRankerHandle, DevRankerSnapshot},
+        dev_ranker::{self, DevCategory, DevRankerHandle, DevRankerSnapshot, DevRecord},
         features,
         score_engine::{ScoreEngine, Tier},
         smart_money::{self, SmartMoneyHandle, SmartMoneySnapshot},
@@ -243,6 +243,7 @@ async fn main() {
         live_cfg: loggaper::autobuy::execution::LiveExecutionConfig,
         /// Minimum allowed `PUT /buy-size` (and seed floor): at least 0.4 SOL and >= `a_plus_sol`.
         buy_cap_floor: f64,
+        learning_log: Option<LearningLogPg>,
     }
 
     let (waiter_actor, waiter_handle) = DatabaseCreateWaiter::new();
@@ -459,7 +460,7 @@ async fn main() {
                 println!(
                     "[metrics:bot] creates={} no_history={} filter_rejected={} \
                      spam_dev_skipped={} passed_filter={} score_skip={} score_a={} \
-                     score_a_plus={} continuation_skipped={} parabolic_skipped={} \
+                     score_a_plus={} score_b={} continuation_skipped={} parabolic_skipped={} \
                      strategy_blocked={} positions_initiated={}",
                     b.creates_total,
                     b.creates_no_history,
@@ -469,6 +470,7 @@ async fn main() {
                     b.score_skipped,
                     b.score_a,
                     b.score_a_plus,
+                    b.score_b,
                     b.continuation_skipped,
                     b.parabolic_skipped,
                     b.strategy_blocked,
@@ -524,6 +526,7 @@ async fn main() {
         config_path: "filter_config.yaml".to_string(),
         live_cfg: config.execution.live.clone(),
         buy_cap_floor,
+        learning_log: learning_log.clone(),
     };
 
     let http_addr = format!("0.0.0.0:{}", config.http_port);
@@ -1019,6 +1022,19 @@ async fn main() {
             })
         }
 
+        async fn get_tier_stats(State(state): State<ApiState>) -> impl IntoResponse {
+            let Some(ref log) = state.learning_log else {
+                return Json(serde_json::json!({"error": "learning disabled"})).into_response();
+            };
+            match log.stats_by_tier("B").await {
+                Ok(stats) => Json(stats).into_response(),
+                Err(e) => {
+                    eprintln!("[HTTP] tier-stats error: {e}");
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }
+        }
+
         async fn get_tx_log(State(state): State<ApiState>) -> impl IntoResponse {
             let snapshot: Vec<WsFeedMessage> = match state.tx_log.lock() {
                 Ok(log) => log.iter().cloned().collect(),
@@ -1229,6 +1245,7 @@ async fn main() {
             .route("/chart/{mint}", get(get_chart))
             .route("/buy-size", get(get_buy_size).put(set_buy_size))
             .route("/metrics", get(get_metrics))
+            .route("/tier-stats", get(get_tier_stats))
             .route("/tx-log", get(get_tx_log))
             .route("/mode", get(get_mode).put(put_mode))
             .route("/positions", get(get_open_positions))
@@ -1455,64 +1472,73 @@ async fn main() {
                                     }
                                 };
 
-                                let s = match dev_stats_opt {
-                                    Some(s) => s,
-                                    None => {
-                                        eprintln!(
-                                            "[FILTER] {} skipped: no creator history",
-                                            general_create.mint
-                                        );
-                                        bot_metrics_create.note_no_history();
-                                        if let Some(ref log) = learning_log_create {
-                                            let log = log.clone();
-                                            let mint_s = general_create.mint.to_string();
-                                            let dev_s = general_create.user.to_string();
-                                            let ts = unix_now();
-                                            tokio::spawn(async move {
-                                                let _ = log
-                                                    .log_skipped(
-                                                        &mint_s,
-                                                        Some(dev_s.as_str()),
-                                                        "filter_no_history",
-                                                        "no_creator_history",
-                                                        serde_json::json!({}),
-                                                        ts,
-                                                    )
-                                                    .await;
-                                            });
+                                match dev_stats_opt {
+                                    Some(s) => {
+                                        if !filter_config.creator_config.filter(&s) {
+                                            eprintln!(
+                                                "[FILTER] {} rejected by creator_config",
+                                                general_create.mint
+                                            );
+                                            bot_metrics_create.note_filter_rejected();
+                                            if let Some(ref log) = learning_log_create {
+                                                let log = log.clone();
+                                                let mint_s = general_create.mint.to_string();
+                                                let dev_s = general_create.user.to_string();
+                                                let ts = unix_now();
+                                                tokio::spawn(async move {
+                                                    let _ = log
+                                                        .log_skipped(
+                                                            &mint_s,
+                                                            Some(dev_s.as_str()),
+                                                            "filter_creator",
+                                                            "creator_config_rejected",
+                                                            serde_json::json!({}),
+                                                            ts,
+                                                        )
+                                                        .await;
+                                                });
+                                            }
+                                            return;
                                         }
-                                        return;
+                                        registry.save(mint_address, s.clone()).await;
+                                        Some(s)
                                     }
-                                };
-
-                                if !filter_config.creator_config.filter(&s) {
-                                    eprintln!(
-                                        "[FILTER] {} rejected by creator_config",
-                                        general_create.mint
-                                    );
-                                    bot_metrics_create.note_filter_rejected();
-                                    if let Some(ref log) = learning_log_create {
-                                        let log = log.clone();
-                                        let mint_s = general_create.mint.to_string();
-                                        let dev_s = general_create.user.to_string();
-                                        let ts = unix_now();
-                                        tokio::spawn(async move {
-                                            let _ = log
-                                                .log_skipped(
-                                                    &mint_s,
-                                                    Some(dev_s.as_str()),
-                                                    "filter_creator",
-                                                    "creator_config_rejected",
-                                                    serde_json::json!({}),
-                                                    ts,
-                                                )
-                                                .await;
-                                        });
+                                    None => {
+                                        if filter_config.scoring.tier_b.enabled && !is_spam_dev {
+                                            eprintln!(
+                                                "[FILTER] {} fresh_dev_b_lane: no creator history, \
+                                                 continuing for tier B evaluation",
+                                                general_create.mint
+                                            );
+                                            None
+                                        } else {
+                                            eprintln!(
+                                                "[FILTER] {} skipped: no creator history",
+                                                general_create.mint
+                                            );
+                                            bot_metrics_create.note_no_history();
+                                            if let Some(ref log) = learning_log_create {
+                                                let log = log.clone();
+                                                let mint_s = general_create.mint.to_string();
+                                                let dev_s = general_create.user.to_string();
+                                                let ts = unix_now();
+                                                tokio::spawn(async move {
+                                                    let _ = log
+                                                        .log_skipped(
+                                                            &mint_s,
+                                                            Some(dev_s.as_str()),
+                                                            "filter_no_history",
+                                                            "no_creator_history",
+                                                            serde_json::json!({}),
+                                                            ts,
+                                                        )
+                                                        .await;
+                                                });
+                                            }
+                                            return;
+                                        }
                                     }
-                                    return;
                                 }
-                                registry.save(mint_address, s.clone()).await;
-                                Some(s)
                             };
                         bot_metrics_create.note_passed_filter();
 
@@ -1573,8 +1599,14 @@ async fn main() {
                         let (early_buyers, _buy_sizes_sol, buy_volume_sol, still_long, sold, bundle) =
                             features::snapshot_early_buyers(&scoring_bucket, thr_snapshot).await;
 
-                        let (dev_category, dev_record) =
-                            dev_ranker_for_create.category(general_create.user).await;
+                        let (dev_category, dev_record) = if dev_stats.is_none()
+                            && filter_config.scoring.tier_b.enabled
+                            && !is_spam_dev
+                        {
+                            (DevCategory::Fresh, DevRecord::default())
+                        } else {
+                            dev_ranker_for_create.category(general_create.user).await
+                        };
                         let buyers_for_position = early_buyers.all();
                         let smart_count = smart_money_for_create
                             .count_smart(buyers_for_position.clone())
@@ -1659,6 +1691,35 @@ async fn main() {
 
                         if matches!(breakdown.tier, Tier::Skip) {
                             bot_metrics_create.note_score_skip();
+                            let fresh_b_lane = features::tier_b_dev_eligible(
+                                &token_features,
+                                &filter_config.scoring.tier_b,
+                            );
+                            let fail_reason = fresh_b_lane.then(|| {
+                                features::fresh_b_gate_fail_reason(
+                                    &filter_config.scoring.tier_b,
+                                    &token_features,
+                                    &breakdown.items,
+                                )
+                            }).flatten();
+                            if let Some(reason) = fail_reason {
+                                eprintln!(
+                                    "[BUY] {} skipped (fresh_b_gate): {} | score={} smart={} \
+                                     buyers={} vol={:.2} dev_cat={:?}",
+                                    general_create.mint,
+                                    reason,
+                                    breakdown.total,
+                                    smart_count,
+                                    token_features.buyer_count(),
+                                    token_features.buy_volume_sol,
+                                    token_features.dev_category,
+                                );
+                            }
+                            let (skip_stage, skip_reason) = if let Some(r) = fail_reason {
+                                ("fresh_b_gate", r)
+                            } else {
+                                ("score_skip", "tier_skip")
+                            };
                             if let Some(ref log) = learning_log_create {
                                 let log = log.clone();
                                 let mint_s = general_create.mint.to_string();
@@ -1666,13 +1727,15 @@ async fn main() {
                                 let snap = LearningTradeSnapshot::from_scoring(&token_features, &breakdown);
                                 let payload = serde_json::to_value(&snap).unwrap_or_else(|_| serde_json::json!({}));
                                 let ts = unix_now();
+                                let stage = skip_stage.to_string();
+                                let reason = skip_reason.to_string();
                                 tokio::spawn(async move {
                                     let _ = log
                                         .log_skipped(
                                             &mint_s,
                                             Some(dev_s.as_str()),
-                                            "score_skip",
-                                            "tier_skip",
+                                            &stage,
+                                            &reason,
                                             payload,
                                             ts,
                                         )
@@ -1680,6 +1743,18 @@ async fn main() {
                                 });
                             }
                             return;
+                        }
+
+                        if features::tier_b_dev_eligible(
+                            &token_features,
+                            &filter_config.scoring.tier_b,
+                        ) && breakdown.tier == Tier::B
+                        {
+                            eprintln!(
+                                "[SCORE] {} fresh_dev_cap: tier=B score={} (fresh dev — A/A+ blocked)",
+                                general_create.mint,
+                                breakdown.total,
+                            );
                         }
 
                         // Live-only gates: avoid A-tier noise entries with flat
@@ -1803,6 +1878,7 @@ async fn main() {
 
                             if filter_config.scoring.minimum_tier_for_buy == MinBuyTier::APlus
                                 && breakdown.tier != Tier::APlus
+                                && breakdown.tier != Tier::B
                             {
                                 eprintln!(
                                     "[BUY] {} skipped (live): minimum_tier_for_buy=APlus but tier={:?}",
@@ -2068,6 +2144,7 @@ async fn main() {
                         match breakdown.tier {
                             Tier::A => bot_metrics_create.note_score_a(),
                             Tier::APlus => bot_metrics_create.note_score_a_plus(),
+                            Tier::B => bot_metrics_create.note_score_b(),
                             Tier::Skip => unreachable!("tier Skip filtered above"),
                         }
 

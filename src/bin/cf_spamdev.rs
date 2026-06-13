@@ -244,13 +244,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tiers[i] = match bd.tier {
                 Tier::APlus => "A+",
                 Tier::A => "A",
+                Tier::B => "B",
                 Tier::Skip => "Sk",
             };
             let bump = |o: &mut Outcome| {
                 match bd.tier {
                     Tier::APlus => o.a_plus += 1,
                     Tier::A => o.a += 1,
-                    Tier::Skip => o.skip += 1,
+                    Tier::B | Tier::Skip => o.skip += 1,
                 }
                 if bd.tier == Tier::APlus && mom_ok {
                     o.buy_a_plus += 1;

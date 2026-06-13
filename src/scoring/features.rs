@@ -952,6 +952,62 @@ pub fn assemble(
     }
 }
 
+/// Tier B lane: fresh dev (no creator history) or launch_count=0.
+pub fn tier_b_dev_eligible(
+    f: &TokenFeatures,
+    cfg: &crate::scoring::config::TierBGateConfig,
+) -> bool {
+    if !cfg.enabled || f.is_spam_dev {
+        return false;
+    }
+    f.dev_total_coins == 0 || f.dev_category == DevCategory::Fresh
+}
+
+/// Tier B entry gates (in addition to all live protections).
+pub fn tier_b_entry_ok(
+    cfg: &crate::scoring::config::TierBGateConfig,
+    f: &TokenFeatures,
+    items: &[(&'static str, i32)],
+) -> bool {
+    if !cfg.enabled {
+        return false;
+    }
+    if f.smart_wallet_count < cfg.min_smart_wallets {
+        return false;
+    }
+    if f.buyer_count() < cfg.min_buyers {
+        return false;
+    }
+    if f.buy_volume_sol < cfg.min_buy_volume_sol {
+        return false;
+    }
+    items.iter().any(|(name, _)| *name == "momentum_good")
+}
+
+/// Which tier-B gate failed for a fresh-dev cap lane (for skip logging).
+pub fn fresh_b_gate_fail_reason(
+    cfg: &crate::scoring::config::TierBGateConfig,
+    f: &TokenFeatures,
+    items: &[(&'static str, i32)],
+) -> Option<&'static str> {
+    if !cfg.enabled {
+        return Some("fresh_b_disabled");
+    }
+    if f.smart_wallet_count < cfg.min_smart_wallets {
+        return Some("fresh_b_no_smart");
+    }
+    if f.buyer_count() < cfg.min_buyers {
+        return Some("fresh_b_low_buyers");
+    }
+    if f.buy_volume_sol < cfg.min_buy_volume_sol {
+        return Some("fresh_b_low_volume");
+    }
+    if !items.iter().any(|(name, _)| *name == "momentum_good") {
+        return Some("fresh_b_no_momentum");
+    }
+    None
+}
+
 /// Strong tier-A bypass for the live `require_momentum_good` gate: score >= configured
 /// minimum with strong early tape (buyers, volume, absorb, buyer-velocity persistence)
 /// but **without** requiring smart wallets. Weak A (score 6–7, fading tape) stays out.
@@ -1451,5 +1507,91 @@ mod strong_a_bypass_tests {
             &items,
             "cont_no_uptick",
         ));
+    }
+
+    #[test]
+    fn tier_b_dev_eligible_fresh_or_zero_launches() {
+        use crate::scoring::config::TierBGateConfig;
+        let cfg = TierBGateConfig::default();
+        let mut f = strong_f();
+        f.dev_total_coins = 0;
+        f.dev_category = DevCategory::Stale;
+        assert!(tier_b_dev_eligible(&f, &cfg));
+        f.dev_total_coins = 5;
+        f.dev_category = DevCategory::Fresh;
+        assert!(tier_b_dev_eligible(&f, &cfg));
+        f.dev_category = DevCategory::Neutral;
+        assert!(!tier_b_dev_eligible(&f, &cfg));
+        f.is_spam_dev = true;
+        f.dev_total_coins = 0;
+        assert!(!tier_b_dev_eligible(&f, &cfg));
+    }
+
+    #[test]
+    fn tier_b_entry_requires_momentum_and_thresholds() {
+        use crate::scoring::config::TierBGateConfig;
+        let cfg = TierBGateConfig::default();
+        let mut f = strong_f();
+        f.smart_wallet_count = 1;
+        f.regular_buyer_count = 8;
+        f.buy_volume_sol = 8.0;
+        let items = [("momentum_good", 3)];
+        assert!(tier_b_entry_ok(&cfg, &f, &items));
+        let no_mom: [(&str, i32); 0] = [];
+        assert!(!tier_b_entry_ok(&cfg, &f, &no_mom));
+        f.buy_volume_sol = 7.9;
+        assert!(!tier_b_entry_ok(&cfg, &f, &items));
+    }
+
+    #[test]
+    fn fresh_b_gate_fail_reason_reports_first_miss() {
+        use crate::scoring::config::TierBGateConfig;
+        let cfg = TierBGateConfig::default();
+        let mut f = strong_f();
+        f.smart_wallet_count = 0;
+        f.regular_buyer_count = 10;
+        f.buy_volume_sol = 10.0;
+        let items = [("momentum_good", 2)];
+        assert_eq!(
+            fresh_b_gate_fail_reason(&cfg, &f, &items),
+            Some("fresh_b_no_smart")
+        );
+        f.smart_wallet_count = 1;
+        f.regular_buyer_count = 5;
+        assert_eq!(
+            fresh_b_gate_fail_reason(&cfg, &f, &items),
+            Some("fresh_b_low_buyers")
+        );
+    }
+
+    #[test]
+    fn fresh_dev_caps_a_to_b_or_skip() {
+        use crate::scoring::config::{FeatureThresholds, ScoringConfig, TierBGateConfig};
+        use crate::scoring::score_engine::{ScoreEngine, Tier};
+
+        let mut cfg = ScoringConfig::default();
+        cfg.tier_b = TierBGateConfig::default();
+        let thr = FeatureThresholds::default();
+        let engine = ScoreEngine::new(&cfg);
+
+        let mut f = strong_f();
+        f.dev_category = DevCategory::Fresh;
+        f.smart_wallet_count = 1;
+        f.initial_mcap_sol = 40.0;
+        f.peak_mcap_sol = 48.0;
+        f.current_mcap_sol = 48.0;
+
+        let bd = engine.score(&f, &thr);
+        assert!(
+            bd.total >= cfg.a_threshold,
+            "fixture should score at least tier-A threshold, got {} items={:?}",
+            bd.total,
+            bd.items
+        );
+        assert_eq!(bd.tier, Tier::B, "fresh dev must cap to B, not A");
+
+        f.smart_wallet_count = 0;
+        let bd = engine.score(&f, &thr);
+        assert_eq!(bd.tier, Tier::Skip, "fresh dev without smart must skip");
     }
 }

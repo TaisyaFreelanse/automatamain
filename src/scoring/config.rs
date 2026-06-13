@@ -116,6 +116,11 @@ pub struct ScoringConfig {
     /// Live gate: block or defer weak tier-A (low score, no smart, neutral/weak dev).
     #[serde(default)]
     pub weak_a_gate: WeakATierGateConfig,
+
+    /// Fresh-dev experimental lane (tier B): stats collection for devs with no
+    /// creator history / launch_count=0. Does not relax continuation or anti-rug.
+    #[serde(default)]
+    pub tier_b: TierBGateConfig,
 }
 
 impl Default for ScoringConfig {
@@ -140,8 +145,43 @@ impl Default for ScoringConfig {
             continuation: ContinuationConfig::default(),
             anti_parabolic: AntiParabolicConfig::default(),
             weak_a_gate: WeakATierGateConfig::default(),
+            tier_b: TierBGateConfig::default(),
         }
     }
+}
+
+/// Tier B — Fresh Dev Setup (MVP stats lane).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TierBGateConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_tier_b_min_smart_wallets")]
+    pub min_smart_wallets: u32,
+    #[serde(default = "default_tier_b_min_buyers")]
+    pub min_buyers: u64,
+    #[serde(default = "default_tier_b_min_buy_volume_sol")]
+    pub min_buy_volume_sol: f64,
+}
+
+impl Default for TierBGateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            min_smart_wallets: default_tier_b_min_smart_wallets(),
+            min_buyers: default_tier_b_min_buyers(),
+            min_buy_volume_sol: default_tier_b_min_buy_volume_sol(),
+        }
+    }
+}
+
+fn default_tier_b_min_smart_wallets() -> u32 {
+    1
+}
+fn default_tier_b_min_buyers() -> u64 {
+    8
+}
+fn default_tier_b_min_buy_volume_sol() -> f64 {
+    8.0
 }
 
 /// Blocks or forces continuation second-look on fragile tier-A entries (score≤7,
@@ -825,6 +865,12 @@ fn default_smart_wallet_1plus_min() -> u32 {
 pub struct TierSize {
     pub a_plus_sol: f64,
     pub a_sol: f64,
+    #[serde(default = "default_b_sol")]
+    pub b_sol: f64,
+}
+
+fn default_b_sol() -> f64 {
+    0.2
 }
 
 impl Default for TierSize {
@@ -832,6 +878,7 @@ impl Default for TierSize {
         Self {
             a_plus_sol: 0.4,
             a_sol: 0.3,
+            b_sol: default_b_sol(),
         }
     }
 }

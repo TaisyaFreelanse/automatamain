@@ -110,6 +110,99 @@ impl LearningLogPg {
         .await?;
         Ok(row)
     }
+
+    /// Closed-trade stats for a scoring tier (e.g. `"B"`).
+    pub async fn stats_by_tier(&self, tier: &str) -> Result<TierTradeStats, sqlx::Error> {
+        let summary = sqlx::query_as::<_, TierSummaryRow>(
+            r#"
+            SELECT
+                COUNT(*)::bigint AS n,
+                COUNT(*) FILTER (WHERE pnl_sol_pct > 0.0)::bigint AS wins,
+                COALESCE(AVG(pnl_sol_pct), 0.0)::float8 AS avg_pnl,
+                COALESCE(SUM(pnl_sol_pct) FILTER (WHERE pnl_sol_pct > 0.0), 0.0)::float8 AS gross_profit,
+                COALESCE(ABS(SUM(pnl_sol_pct) FILTER (WHERE pnl_sol_pct <= 0.0)), 0.0)::float8 AS gross_loss
+            FROM learning_trades
+            WHERE tier = $1
+            "#,
+        )
+        .bind(tier)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let exit_reasons = sqlx::query_as::<_, TierExitReasonRow>(
+            r#"
+            SELECT close_reason, COUNT(*)::bigint AS n
+            FROM learning_trades
+            WHERE tier = $1
+            GROUP BY close_reason
+            ORDER BY n DESC
+            "#,
+        )
+        .bind(tier)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let winrate_pct = if summary.n > 0 {
+            summary.wins as f64 / summary.n as f64 * 100.0
+        } else {
+            0.0
+        };
+        let profit_factor = if summary.gross_loss > f64::EPSILON {
+            summary.gross_profit / summary.gross_loss
+        } else if summary.gross_profit > 0.0 {
+            f64::INFINITY
+        } else {
+            0.0
+        };
+
+        Ok(TierTradeStats {
+            tier: tier.to_string(),
+            n: summary.n,
+            wins: summary.wins,
+            winrate_pct,
+            avg_pnl_pct: summary.avg_pnl,
+            profit_factor,
+            exit_reasons: exit_reasons
+                .into_iter()
+                .map(|r| TierExitReasonCount {
+                    reason: r.close_reason,
+                    n: r.n,
+                })
+                .collect(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct TierSummaryRow {
+    n: i64,
+    wins: i64,
+    avg_pnl: f64,
+    gross_profit: f64,
+    gross_loss: f64,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct TierExitReasonRow {
+    close_reason: String,
+    n: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TierExitReasonCount {
+    pub reason: String,
+    pub n: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TierTradeStats {
+    pub tier: String,
+    pub n: i64,
+    pub wins: i64,
+    pub winrate_pct: f64,
+    pub avg_pnl_pct: f64,
+    pub profit_factor: f64,
+    pub exit_reasons: Vec<TierExitReasonCount>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]

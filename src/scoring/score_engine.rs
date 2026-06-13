@@ -5,7 +5,7 @@ use serde::Serialize;
 use crate::scoring::anti_rug::{cap_tier_for_low_mcap, rewards_buy_to_sell_ratio};
 use crate::scoring::config::{FeatureThresholds, ScoringConfig, ScoringWeights};
 use crate::scoring::dev_ranker::DevCategory;
-use crate::scoring::features::{momentum_peak_pct, TokenFeatures};
+use crate::scoring::features::{momentum_peak_pct, tier_b_dev_eligible, tier_b_entry_ok, TokenFeatures};
 
 /// Momentum for scoring: peak mcap in the window vs first sample (not end-only).
 fn scoring_momentum_pct(f: &TokenFeatures) -> f64 {
@@ -17,6 +17,7 @@ fn scoring_momentum_pct(f: &TokenFeatures) -> f64 {
 pub enum Tier {
     APlus,
     A,
+    B,
     Skip,
 }
 
@@ -104,7 +105,7 @@ impl<'a> ScoreEngine<'a> {
                 &mut total,
                 &mut items,
             ),
-            DevCategory::Neutral | DevCategory::Stale => {}
+            DevCategory::Neutral | DevCategory::Stale | DevCategory::Fresh => {}
         }
 
         if f.smart_wallet_count >= t.smart_wallet_3plus_min {
@@ -234,7 +235,7 @@ impl<'a> ScoreEngine<'a> {
                 &mut total,
                 &mut items,
             ),
-            DevCategory::Neutral | DevCategory::Stale => {}
+            DevCategory::Neutral | DevCategory::Stale | DevCategory::Fresh => {}
         }
 
         // --- Smart wallets -------------------------------------------------
@@ -318,7 +319,7 @@ impl<'a> ScoreEngine<'a> {
         total: i32,
         items: Vec<(&'static str, i32)>,
     ) -> ScoreBreakdown {
-        let tier = cap_tier_for_low_mcap(
+        let score_tier = cap_tier_for_low_mcap(
             f,
             &self.cfg.anti_rug,
             if total >= self.cfg.a_plus_threshold {
@@ -330,9 +331,21 @@ impl<'a> ScoreEngine<'a> {
             },
         );
 
+        // Fresh dev / zero-launch: never A or A+ — only tier B (if B gates pass) or Skip.
+        let tier = if tier_b_dev_eligible(f, &self.cfg.tier_b) {
+            if tier_b_entry_ok(&self.cfg.tier_b, f, &items) {
+                Tier::B
+            } else {
+                Tier::Skip
+            }
+        } else {
+            score_tier
+        };
+
         let recommended_size_sol = match tier {
             Tier::APlus => self.cfg.size.a_plus_sol,
             Tier::A => self.cfg.size.a_sol,
+            Tier::B => self.cfg.size.b_sol,
             Tier::Skip => 0.0,
         };
 
