@@ -224,8 +224,8 @@ scoring:
   momentum_good_strong_a:
     enabled: true
     min_score: 8
-    min_buyers: 10
-    min_buy_volume_sol: 12.0
+    min_buyers: 8
+    min_buy_volume_sol: 8.0
     min_buy_to_sell_ratio: 1.7
     require_absorb_strong: true
     min_absorb_quality: 0.58
@@ -292,7 +292,7 @@ scoring:
     enabled: true
     max_score: 7
     max_smart_wallets: 0
-    min_buy_volume_sol: 12.0
+    min_buy_volume_sol: 8.0
     block_repeat_dump_slices_ge: 1
     block_dev_neutral: true
     block_dev_history_weak: true

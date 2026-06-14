@@ -265,7 +265,7 @@ fn default_weak_a_max_score() -> i32 {
     7
 }
 fn default_weak_a_min_buy_volume_sol() -> f64 {
-    12.0
+    8.0
 }
 fn default_weak_a_block_dump_slices_ge() -> u32 {
     1
@@ -346,11 +346,11 @@ fn default_strong_a_min_score() -> i32 {
 }
 
 fn default_strong_a_min_buyers() -> u64 {
-    10
+    8
 }
 
 fn default_strong_a_min_buy_volume_sol() -> f64 {
-    12.0
+    8.0
 }
 
 fn default_strong_a_min_buy_to_sell_ratio() -> f64 {
