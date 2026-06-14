@@ -10,7 +10,10 @@ use loggaper::{
         },
         performance_tracker::{CreatorRegistryHandle, PerformanceTrackerHandle},
     },
-    feed::metrics::{BotMetrics, BotSnapshot, FeedMetrics, FeedSnapshot, new_dedup},
+    feed::metrics::{
+        BotMetrics, BotSnapshot, FeedHealthEvent, FeedHealthMonitor, FeedMetrics, FeedSnapshot,
+        FEED_STALL_MSG_AGE_SECS, FEED_ZERO_RATE_STREAK, new_dedup,
+    },
     generalize::general_commands::Action,
     learning::{
         load_patch, merge_thresholds, spawn_learning_engine, LearningLogPg, LearningTradeSnapshot,
@@ -398,8 +401,9 @@ async fn main() {
     tokio::spawn(async move { pump.run() });
 
     // Periodic feed-metrics logger with simple anomaly alerting: EMA of
-    // messages/sec per feed, and an [ALERT] line if the latest interval is
-    // more than 3x the EMA. Keeps a single log line per feed every 30s.
+    // messages/sec per feed, stall detection (last_msg_age / zero msgs/s),
+    // and an [ALERT] line if the latest interval is more than 3x the EMA.
+    // Keeps a single log line per feed every 30s.
     {
         let metrics_for_logger = feed_metrics_vec.clone();
         let bot_for_logger = bot_metrics.clone();
@@ -409,6 +413,7 @@ async fn main() {
                 std::collections::HashMap::new();
             let mut ema_msgs: std::collections::HashMap<String, f64> =
                 std::collections::HashMap::new();
+            let mut feed_health = FeedHealthMonitor::new();
             let alpha = 0.3_f64;
 
             let mut ticker =
@@ -427,11 +432,13 @@ async fn main() {
                     let prior = *ema;
                     *ema = alpha * rate + (1.0 - alpha) * prior;
 
+                    let last_msg_age_s = FeedHealthMonitor::last_msg_age_secs(&snap);
+
                     println!(
                         "[metrics:{}] msgs/s={:.1} ema={:.1} ev/s={:.1} \
                          bytes/s={:.0} drop_failed={} drop_npd={} drop_self_dup={} \
                          cross_dup={} parse_err={} useful={:.3} subs={} reconn={} \
-                         idle_reconn={}",
+                         idle_reconn={} last_msg_age_s={}",
                         snap.name,
                         rate,
                         *ema,
@@ -446,7 +453,44 @@ async fn main() {
                         snap.subscribed,
                         snap.reconnects,
                         snap.idle_reconnects,
+                        last_msg_age_s,
                     );
+
+                    match feed_health.evaluate(&snap, rate) {
+                        FeedHealthEvent::Stall => {
+                            let zero_streak = feed_health.zero_rate_streak(&snap.name);
+                            let mut reasons = Vec::new();
+                            if last_msg_age_s > FEED_STALL_MSG_AGE_SECS {
+                                reasons.push(format!(
+                                    "last_msg_age_s={last_msg_age_s}>{FEED_STALL_MSG_AGE_SECS}"
+                                ));
+                            }
+                            if zero_streak >= FEED_ZERO_RATE_STREAK {
+                                reasons.push(format!(
+                                    "msgs/s_zero_streak={zero_streak}>={FEED_ZERO_RATE_STREAK}"
+                                ));
+                            }
+                            println!(
+                                "[WARN:feed:{}] feed stall: {} | msgs/s={:.1} \
+                                 reconn={} idle_reconn={} stream_err={} — \
+                                 bot may miss new tokens; check WS/RPC",
+                                snap.name,
+                                reasons.join(", "),
+                                rate,
+                                snap.reconnects,
+                                snap.idle_reconnects,
+                                snap.stream_errors,
+                            );
+                        }
+                        FeedHealthEvent::Recovered => {
+                            println!(
+                                "[OK:feed:{}] feed recovered: msgs/s={:.1} \
+                                 last_msg_age_s={last_msg_age_s} reconn={}",
+                                snap.name, rate, snap.reconnects,
+                            );
+                        }
+                        FeedHealthEvent::Ok => {}
+                    }
 
                     if prior > 1.0 && rate > prior * 3.0 {
                         println!(

@@ -263,6 +263,96 @@ impl SelfDedup {
     }
 }
 
+// --- Feed health (stall detection for metrics logger) ----------------------
+
+/// Feed stall detection for the periodic metrics logger (see `main.rs`).
+pub const FEED_STALL_MSG_AGE_SECS: u64 = 60;
+/// Consecutive zero-rate intervals (each ~30s) before declaring msgs/s dead.
+pub const FEED_ZERO_RATE_STREAK: u32 = 3;
+/// Skip stall alerts right after process start while WS connects.
+pub const FEED_STARTUP_GRACE_SECS: u64 = 90;
+
+/// Interval `msgs/s` below this counts as zero (guards float noise).
+const FEED_ZERO_RATE_EPS: f64 = 0.05;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedHealthEvent {
+    Ok,
+    Stall,
+    Recovered,
+}
+
+/// Tracks per-feed message-rate streaks and emits stall / recovery events.
+pub struct FeedHealthMonitor {
+    zero_rate_streak: HashMap<String, u32>,
+    was_stalled: HashMap<String, bool>,
+}
+
+impl FeedHealthMonitor {
+    pub fn new() -> Self {
+        Self {
+            zero_rate_streak: HashMap::new(),
+            was_stalled: HashMap::new(),
+        }
+    }
+
+    /// Evaluate one feed snapshot against the latest interval message rate.
+    pub fn evaluate(&mut self, snap: &FeedSnapshot, interval_rate: f64) -> FeedHealthEvent {
+        if snap.uptime_secs < FEED_STARTUP_GRACE_SECS {
+            return FeedHealthEvent::Ok;
+        }
+        // Feeds that were never subscribed (e.g. disabled pumpswap) are ignored.
+        if snap.subscribed == 0 {
+            return FeedHealthEvent::Ok;
+        }
+
+        let now = now_unix();
+        let last_msg_age_s = if snap.last_message_unix == 0 {
+            snap.uptime_secs
+        } else {
+            now.saturating_sub(snap.last_message_unix)
+        };
+
+        let zero_rate = interval_rate < FEED_ZERO_RATE_EPS;
+        let streak = self
+            .zero_rate_streak
+            .entry(snap.name.clone())
+            .or_insert(0);
+        if zero_rate {
+            *streak = streak.saturating_add(1);
+        } else {
+            *streak = 0;
+        }
+
+        let stalled = last_msg_age_s > FEED_STALL_MSG_AGE_SECS
+            || *streak >= FEED_ZERO_RATE_STREAK;
+
+        let was = *self.was_stalled.get(&snap.name).unwrap_or(&false);
+        self.was_stalled.insert(snap.name.clone(), stalled);
+
+        if stalled {
+            FeedHealthEvent::Stall
+        } else if was {
+            FeedHealthEvent::Recovered
+        } else {
+            FeedHealthEvent::Ok
+        }
+    }
+
+    pub fn zero_rate_streak(&self, feed: &str) -> u32 {
+        self.zero_rate_streak.get(feed).copied().unwrap_or(0)
+    }
+
+    pub fn last_msg_age_secs(snap: &FeedSnapshot) -> u64 {
+        let now = now_unix();
+        if snap.last_message_unix == 0 {
+            snap.uptime_secs
+        } else {
+            now.saturating_sub(snap.last_message_unix)
+        }
+    }
+}
+
 // --- Bot-level usefulness metrics --------------------------------------------
 
 #[derive(Debug, serde::Serialize)]
@@ -378,5 +468,72 @@ impl BotMetrics {
             positions_initiated: self.positions_initiated.load(Ordering::Relaxed),
             uptime_secs: uptime,
         }
+    }
+}
+
+#[cfg(test)]
+mod feed_health_tests {
+    use super::*;
+
+    fn snap(name: &str, uptime: u64, last_msg_age: u64) -> FeedSnapshot {
+        let now = now_unix();
+        FeedSnapshot {
+            name: name.to_string(),
+            subscribed: 1,
+            reconnects: 0,
+            idle_reconnects: 0,
+            stream_errors: 0,
+            messages: 100,
+            events: 10,
+            parse_errors: 0,
+            err_logs: 0,
+            bytes_in: 0,
+            dropped_failed_tx: 0,
+            dropped_no_program_data: 0,
+            dropped_self_dup: 0,
+            duplicates_cross_feed: 0,
+            lines_total: 0,
+            lines_program_data: 0,
+            last_message_unix: now.saturating_sub(last_msg_age),
+            started_unix: now.saturating_sub(uptime),
+            uptime_secs: uptime,
+            msg_per_sec_avg: 0.0,
+            events_per_sec_avg: 0.0,
+            bytes_per_sec_avg: 0.0,
+            useful_msg_ratio: 0.0,
+            events_per_msg_total: 0.0,
+        }
+    }
+
+    #[test]
+    fn startup_grace_suppresses_alerts() {
+        let mut m = FeedHealthMonitor::new();
+        let s = snap("pump", FEED_STARTUP_GRACE_SECS - 1, 120);
+        assert_eq!(m.evaluate(&s, 0.0), FeedHealthEvent::Ok);
+    }
+
+    #[test]
+    fn last_msg_age_triggers_stall() {
+        let mut m = FeedHealthMonitor::new();
+        let s = snap("pump", 200, FEED_STALL_MSG_AGE_SECS + 1);
+        assert_eq!(m.evaluate(&s, 5.0), FeedHealthEvent::Stall);
+    }
+
+    #[test]
+    fn zero_rate_streak_triggers_stall() {
+        let mut m = FeedHealthMonitor::new();
+        let s = snap("pump", 200, 0);
+        assert_eq!(m.evaluate(&s, 0.0), FeedHealthEvent::Ok);
+        assert_eq!(m.evaluate(&s, 0.0), FeedHealthEvent::Ok);
+        assert_eq!(m.evaluate(&s, 0.0), FeedHealthEvent::Stall);
+    }
+
+    #[test]
+    fn recovery_after_stall() {
+        let mut m = FeedHealthMonitor::new();
+        let s = snap("pump", 200, FEED_STALL_MSG_AGE_SECS + 5);
+        assert_eq!(m.evaluate(&s, 0.0), FeedHealthEvent::Stall);
+        let healthy = snap("pump", 200, 1);
+        assert_eq!(m.evaluate(&healthy, 10.0), FeedHealthEvent::Recovered);
     }
 }
