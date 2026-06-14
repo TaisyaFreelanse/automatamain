@@ -369,9 +369,10 @@ scoring:
   # All continuation / anti-rug / bundle / late-entry protections stay active.
   tier_b:
     enabled: true
-    min_smart_wallets: 1
-    min_buyers: 8
-    min_buy_volume_sol: 8.0
+    min_smart_wallets: 0
+    min_buyers: 10
+    min_buy_volume_sol: 10.0
+    min_velocity_pct: 5.0
 
 # After our bot cliff exit (SL CRASH / deep SL / large tick drop), block this dev's
 # new mints until expires_at (stored in dev_blacklist table).

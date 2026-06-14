@@ -952,7 +952,7 @@ pub fn assemble(
     }
 }
 
-/// Tier B lane: fresh dev (no creator history) or launch_count=0.
+/// Tier B lane: `dev_cat = Fresh` only (includes no-history fresh path in main).
 pub fn tier_b_dev_eligible(
     f: &TokenFeatures,
     cfg: &crate::scoring::config::TierBGateConfig,
@@ -960,7 +960,7 @@ pub fn tier_b_dev_eligible(
     if !cfg.enabled || f.is_spam_dev {
         return false;
     }
-    f.dev_total_coins == 0 || f.dev_category == DevCategory::Fresh
+    f.dev_category == DevCategory::Fresh
 }
 
 /// Tier B entry gates (in addition to all live protections).
@@ -981,7 +981,11 @@ pub fn tier_b_entry_ok(
     if f.buy_volume_sol < cfg.min_buy_volume_sol {
         return false;
     }
-    items.iter().any(|(name, _)| *name == "momentum_good")
+    if !items.iter().any(|(name, _)| *name == "momentum_good") {
+        return false;
+    }
+    let peak = f.peak_mcap_sol.max(f.current_mcap_sol);
+    momentum_peak_pct(f.initial_mcap_sol, peak) >= cfg.min_velocity_pct
 }
 
 /// Which tier-B gate failed for a fresh-dev cap lane (for skip logging).
@@ -1004,6 +1008,10 @@ pub fn fresh_b_gate_fail_reason(
     }
     if !items.iter().any(|(name, _)| *name == "momentum_good") {
         return Some("fresh_b_no_momentum");
+    }
+    let peak = f.peak_mcap_sol.max(f.current_mcap_sol);
+    if momentum_peak_pct(f.initial_mcap_sol, peak) < cfg.min_velocity_pct {
+        return Some("fresh_b_low_velocity");
     }
     None
 }
@@ -1510,36 +1518,42 @@ mod strong_a_bypass_tests {
     }
 
     #[test]
-    fn tier_b_dev_eligible_fresh_or_zero_launches() {
+    fn tier_b_dev_eligible_fresh_only() {
         use crate::scoring::config::TierBGateConfig;
         let cfg = TierBGateConfig::default();
         let mut f = strong_f();
-        f.dev_total_coins = 0;
-        f.dev_category = DevCategory::Stale;
-        assert!(tier_b_dev_eligible(&f, &cfg));
-        f.dev_total_coins = 5;
         f.dev_category = DevCategory::Fresh;
         assert!(tier_b_dev_eligible(&f, &cfg));
+        f.dev_total_coins = 0;
+        f.dev_category = DevCategory::Stale;
+        assert!(!tier_b_dev_eligible(&f, &cfg));
         f.dev_category = DevCategory::Neutral;
         assert!(!tier_b_dev_eligible(&f, &cfg));
         f.is_spam_dev = true;
-        f.dev_total_coins = 0;
+        f.dev_category = DevCategory::Fresh;
         assert!(!tier_b_dev_eligible(&f, &cfg));
     }
 
     #[test]
-    fn tier_b_entry_requires_momentum_and_thresholds() {
+    fn tier_b_entry_requires_momentum_velocity_and_thresholds() {
         use crate::scoring::config::TierBGateConfig;
         let cfg = TierBGateConfig::default();
         let mut f = strong_f();
-        f.smart_wallet_count = 1;
-        f.regular_buyer_count = 8;
-        f.buy_volume_sol = 8.0;
+        f.smart_wallet_count = 0;
+        f.regular_buyer_count = 10;
+        f.buy_volume_sol = 10.0;
+        f.initial_mcap_sol = 40.0;
+        f.peak_mcap_sol = 44.0;
+        f.current_mcap_sol = 44.0;
         let items = [("momentum_good", 3)];
         assert!(tier_b_entry_ok(&cfg, &f, &items));
         let no_mom: [(&str, i32); 0] = [];
         assert!(!tier_b_entry_ok(&cfg, &f, &no_mom));
-        f.buy_volume_sol = 7.9;
+        f.buy_volume_sol = 9.9;
+        assert!(!tier_b_entry_ok(&cfg, &f, &items));
+        f.buy_volume_sol = 10.0;
+        f.peak_mcap_sol = 41.0;
+        f.current_mcap_sol = 41.0;
         assert!(!tier_b_entry_ok(&cfg, &f, &items));
     }
 
@@ -1549,18 +1563,20 @@ mod strong_a_bypass_tests {
         let cfg = TierBGateConfig::default();
         let mut f = strong_f();
         f.smart_wallet_count = 0;
-        f.regular_buyer_count = 10;
+        f.regular_buyer_count = 5;
         f.buy_volume_sol = 10.0;
+        f.initial_mcap_sol = 40.0;
+        f.peak_mcap_sol = 44.0;
         let items = [("momentum_good", 2)];
         assert_eq!(
             fresh_b_gate_fail_reason(&cfg, &f, &items),
-            Some("fresh_b_no_smart")
+            Some("fresh_b_low_buyers")
         );
-        f.smart_wallet_count = 1;
-        f.regular_buyer_count = 5;
+        f.regular_buyer_count = 10;
+        f.buy_volume_sol = 5.0;
         assert_eq!(
             fresh_b_gate_fail_reason(&cfg, &f, &items),
-            Some("fresh_b_low_buyers")
+            Some("fresh_b_low_volume")
         );
     }
 
@@ -1576,22 +1592,24 @@ mod strong_a_bypass_tests {
 
         let mut f = strong_f();
         f.dev_category = DevCategory::Fresh;
-        f.smart_wallet_count = 1;
+        f.smart_wallet_count = 0;
+        f.regular_buyer_count = 10;
+        f.buy_volume_sol = 10.0;
         f.initial_mcap_sol = 40.0;
         f.peak_mcap_sol = 48.0;
         f.current_mcap_sol = 48.0;
 
         let bd = engine.score(&f, &thr);
-        assert!(
-            bd.total >= cfg.a_threshold,
-            "fixture should score at least tier-A threshold, got {} items={:?}",
+        assert_eq!(
+            bd.tier,
+            Tier::B,
+            "fresh dev with B gates must cap to B, not A; score={} items={:?}",
             bd.total,
             bd.items
         );
-        assert_eq!(bd.tier, Tier::B, "fresh dev must cap to B, not A");
 
-        f.smart_wallet_count = 0;
+        f.buy_volume_sol = 5.0;
         let bd = engine.score(&f, &thr);
-        assert_eq!(bd.tier, Tier::Skip, "fresh dev without smart must skip");
+        assert_eq!(bd.tier, Tier::Skip, "fresh dev below B volume must skip");
     }
 }

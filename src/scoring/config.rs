@@ -161,6 +161,9 @@ pub struct TierBGateConfig {
     pub min_buyers: u64,
     #[serde(default = "default_tier_b_min_buy_volume_sol")]
     pub min_buy_volume_sol: f64,
+    /// Minimum peak mcap % vs scoring-window start (`momentum_peak_pct`).
+    #[serde(default = "default_tier_b_min_velocity_pct")]
+    pub min_velocity_pct: f64,
 }
 
 impl Default for TierBGateConfig {
@@ -170,18 +173,22 @@ impl Default for TierBGateConfig {
             min_smart_wallets: default_tier_b_min_smart_wallets(),
             min_buyers: default_tier_b_min_buyers(),
             min_buy_volume_sol: default_tier_b_min_buy_volume_sol(),
+            min_velocity_pct: default_tier_b_min_velocity_pct(),
         }
     }
 }
 
 fn default_tier_b_min_smart_wallets() -> u32 {
-    1
+    0
 }
 fn default_tier_b_min_buyers() -> u64 {
-    8
+    10
 }
 fn default_tier_b_min_buy_volume_sol() -> f64 {
-    8.0
+    10.0
+}
+fn default_tier_b_min_velocity_pct() -> f64 {
+    5.0
 }
 
 /// Blocks or forces continuation second-look on fragile tier-A entries (score≤7,
