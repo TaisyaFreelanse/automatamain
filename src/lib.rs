@@ -7,6 +7,7 @@ pub mod generalize;
 pub mod helper;
 pub mod launchpads;
 pub mod persistence;
+pub mod pipeline;
 pub mod pipelines;
 pub mod scoring;
 pub mod trading;

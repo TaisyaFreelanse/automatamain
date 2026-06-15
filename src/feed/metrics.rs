@@ -370,6 +370,9 @@ pub struct BotSnapshot {
     pub parabolic_skipped: u64,
     pub strategy_blocked: u64,
     pub positions_initiated: u64,
+    pub fresh_watchlist_added: u64,
+    pub fresh_watchlist_passed: u64,
+    pub fresh_watchlist_rejected: u64,
     pub uptime_secs: u64,
 }
 
@@ -387,6 +390,9 @@ pub struct BotMetrics {
     pub parabolic_skipped: AtomicU64,
     pub strategy_blocked: AtomicU64,
     pub positions_initiated: AtomicU64,
+    pub fresh_watchlist_added: AtomicU64,
+    pub fresh_watchlist_passed: AtomicU64,
+    pub fresh_watchlist_rejected: AtomicU64,
     pub started_unix: u64,
 }
 
@@ -406,6 +412,9 @@ impl BotMetrics {
             parabolic_skipped: AtomicU64::new(0),
             strategy_blocked: AtomicU64::new(0),
             positions_initiated: AtomicU64::new(0),
+            fresh_watchlist_added: AtomicU64::new(0),
+            fresh_watchlist_passed: AtomicU64::new(0),
+            fresh_watchlist_rejected: AtomicU64::new(0),
             started_unix: now_unix(),
         })
     }
@@ -449,6 +458,15 @@ impl BotMetrics {
     pub fn note_position_initiated(&self) {
         self.positions_initiated.fetch_add(1, Ordering::Relaxed);
     }
+    pub fn note_fresh_watchlist_added(&self) {
+        self.fresh_watchlist_added.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn note_fresh_watchlist_passed(&self) {
+        self.fresh_watchlist_passed.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn note_fresh_watchlist_rejected(&self) {
+        self.fresh_watchlist_rejected.fetch_add(1, Ordering::Relaxed);
+    }
 
     pub fn snapshot(&self) -> BotSnapshot {
         let uptime = now_unix().saturating_sub(self.started_unix).max(1);
@@ -466,6 +484,9 @@ impl BotMetrics {
             parabolic_skipped: self.parabolic_skipped.load(Ordering::Relaxed),
             strategy_blocked: self.strategy_blocked.load(Ordering::Relaxed),
             positions_initiated: self.positions_initiated.load(Ordering::Relaxed),
+            fresh_watchlist_added: self.fresh_watchlist_added.load(Ordering::Relaxed),
+            fresh_watchlist_passed: self.fresh_watchlist_passed.load(Ordering::Relaxed),
+            fresh_watchlist_rejected: self.fresh_watchlist_rejected.load(Ordering::Relaxed),
             uptime_secs: uptime,
         }
     }

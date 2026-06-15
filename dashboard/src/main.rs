@@ -76,6 +76,24 @@ pub struct TierExitReasonCount {
     pub n: i64,
 }
 
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct TierSubtypeStatsWire {
+    pub n: i64,
+    pub wins: i64,
+    pub winrate_pct: f64,
+    pub avg_pnl_pct: f64,
+    pub profit_factor: f64,
+    #[serde(default)]
+    pub exit_reasons: Vec<TierExitReasonCount>,
+}
+
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct FreshWatchlistSkipStatsWire {
+    pub added: i64,
+    pub passed: i64,
+    pub rejected: i64,
+}
+
 #[derive(Deserialize, Clone, Debug)]
 pub struct TierStatsWire {
     pub tier: String,
@@ -85,6 +103,12 @@ pub struct TierStatsWire {
     pub avg_pnl_pct: f64,
     pub profit_factor: f64,
     pub exit_reasons: Vec<TierExitReasonCount>,
+    #[serde(default)]
+    pub b_true_fresh: TierSubtypeStatsWire,
+    #[serde(default)]
+    pub b_unknown: TierSubtypeStatsWire,
+    #[serde(default)]
+    pub fresh_watchlist: FreshWatchlistSkipStatsWire,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -2358,6 +2382,30 @@ impl eframe::App for Dashboard {
                                 ui.label(format!("{}: {}", r.reason, r.n));
                                 ui.separator();
                             }
+                        }
+                        if b.b_true_fresh.n > 0 || b.b_unknown.n > 0 {
+                            ui.separator();
+                            ui.label(format!(
+                                "B_TRUE_FRESH: {} ({:.0}% WR)",
+                                b.b_true_fresh.n, b.b_true_fresh.winrate_pct
+                            ));
+                            ui.separator();
+                            ui.label(format!(
+                                "B_UNKNOWN: {} ({:.0}% WR)",
+                                b.b_unknown.n, b.b_unknown.winrate_pct
+                            ));
+                        }
+                        if b.fresh_watchlist.added > 0
+                            || b.fresh_watchlist.passed > 0
+                            || b.fresh_watchlist.rejected > 0
+                        {
+                            ui.separator();
+                            ui.label(format!(
+                                "WL: +{} / ok{} / x{}",
+                                b.fresh_watchlist.added,
+                                b.fresh_watchlist.passed,
+                                b.fresh_watchlist.rejected,
+                            ));
                         }
                     });
                 });

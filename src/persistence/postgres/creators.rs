@@ -225,4 +225,27 @@ impl CreatorRepository for CreatorsRepositoryPostgres {
         self.cache_put(dev_address, Some(stats.clone()));
         Ok(Some(stats))
     }
+
+    async fn count_prior_coins(
+        &self,
+        dev_address: Address,
+        exclude_mint: Address,
+    ) -> Result<u64, Error> {
+        let dev_address = dev_address.to_string();
+        let exclude_mint = exclude_mint.to_string();
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*) AS n
+            FROM coins
+            WHERE developer = $1 AND coin_address != $2
+            "#,
+        )
+        .bind(&dev_address)
+        .bind(&exclude_mint)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let n: i64 = row.get("n");
+        Ok(n.max(0) as u64)
+    }
 }

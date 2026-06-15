@@ -31,4 +31,11 @@ pub trait CreatorRepository {
         dev_address: Address,
         cap: u64,
     ) -> Result<u64, Error>;
+
+    /// Coins launched by this dev **before** the given mint (excludes current).
+    async fn count_prior_coins(
+        &self,
+        dev_address: Address,
+        exclude_mint: Address,
+    ) -> Result<u64, Error>;
 }

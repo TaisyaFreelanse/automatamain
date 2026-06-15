@@ -164,6 +164,43 @@ pub struct TierBGateConfig {
     /// Minimum peak mcap % vs scoring-window start (`momentum_peak_pct`).
     #[serde(default = "default_tier_b_min_velocity_pct")]
     pub min_velocity_pct: f64,
+    /// Deferred re-evaluation for fresh devs rejected only on immature early stats.
+    #[serde(default)]
+    pub fresh_watchlist: FreshWatchlistConfig,
+}
+
+/// Poll loop for fresh devs that fail creator_config on early-stats only.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FreshWatchlistConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_fresh_watchlist_poll_ms")]
+    pub poll_interval_ms: u64,
+    #[serde(default = "default_fresh_watchlist_max_ms")]
+    pub max_wait_ms: u64,
+    #[serde(default = "default_fresh_watchlist_max_concurrent")]
+    pub max_concurrent: usize,
+}
+
+impl Default for FreshWatchlistConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_interval_ms: default_fresh_watchlist_poll_ms(),
+            max_wait_ms: default_fresh_watchlist_max_ms(),
+            max_concurrent: default_fresh_watchlist_max_concurrent(),
+        }
+    }
+}
+
+fn default_fresh_watchlist_poll_ms() -> u64 {
+    5000
+}
+fn default_fresh_watchlist_max_ms() -> u64 {
+    30000
+}
+fn default_fresh_watchlist_max_concurrent() -> usize {
+    50
 }
 
 impl Default for TierBGateConfig {
@@ -174,6 +211,7 @@ impl Default for TierBGateConfig {
             min_buyers: default_tier_b_min_buyers(),
             min_buy_volume_sol: default_tier_b_min_buy_volume_sol(),
             min_velocity_pct: default_tier_b_min_velocity_pct(),
+            fresh_watchlist: FreshWatchlistConfig::default(),
         }
     }
 }

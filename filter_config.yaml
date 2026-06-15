@@ -373,6 +373,11 @@ scoring:
     min_buyers: 10
     min_buy_volume_sol: 10.0
     min_velocity_pct: 5.0
+    fresh_watchlist:
+      enabled: true
+      poll_interval_ms: 5000
+      max_wait_ms: 30000
+      max_concurrent: 50
 
 # After our bot cliff exit (SL CRASH / deep SL / large tick drop), block this dev's
 # new mints until expires_at (stored in dev_blacklist table).

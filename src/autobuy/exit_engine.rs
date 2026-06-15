@@ -1214,6 +1214,8 @@ mod tests {
             repeat_dump_slices: 0,
             smart_wallet_early_exits: 0,
             has_momentum_good,
+            fresh_b_subtype: None,
+            fresh_watchlist: None,
         }
     }
 

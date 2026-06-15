@@ -2,6 +2,7 @@ use serde_json::json;
 use sqlx::PgPool;
 
 use crate::learning::snapshot::LearningTradeSnapshot;
+use crate::scoring::fresh_b::FreshBSubtype;
 
 /// Postgres writer for learning tables.
 #[derive(Clone)]
@@ -171,6 +172,116 @@ impl LearningLogPg {
                 .collect(),
         })
     }
+
+    /// Tier B closed trades + fresh subtype breakdown + watchlist funnel from learning tables.
+    pub async fn stats_tier_b_detailed(&self) -> Result<TierBDetailedStats, sqlx::Error> {
+        let overall = self.stats_by_tier("B").await?;
+        let b_true_fresh = self
+            .stats_by_tier_fresh_subtype(FreshBSubtype::TRUE_FRESH)
+            .await?;
+        let b_unknown = self
+            .stats_by_tier_fresh_subtype(FreshBSubtype::UNKNOWN)
+            .await?;
+        let fresh_watchlist = self.fresh_watchlist_skip_stats().await?;
+        Ok(TierBDetailedStats {
+            overall,
+            b_true_fresh,
+            b_unknown,
+            fresh_watchlist,
+        })
+    }
+
+    async fn stats_by_tier_fresh_subtype(
+        &self,
+        subtype: &str,
+    ) -> Result<TierSubtypeStats, sqlx::Error> {
+        let summary = sqlx::query_as::<_, TierSummaryRow>(
+            r#"
+            SELECT
+                COUNT(*)::bigint AS n,
+                COUNT(*) FILTER (WHERE pnl_sol_pct > 0.0)::bigint AS wins,
+                COALESCE(AVG(pnl_sol_pct), 0.0)::float8 AS avg_pnl,
+                COALESCE(SUM(pnl_sol_pct) FILTER (WHERE pnl_sol_pct > 0.0), 0.0)::float8 AS gross_profit,
+                COALESCE(ABS(SUM(pnl_sol_pct) FILTER (WHERE pnl_sol_pct <= 0.0)), 0.0)::float8 AS gross_loss
+            FROM learning_trades
+            WHERE tier = 'B'
+              AND feature_json->>'fresh_b_subtype' = $1
+            "#,
+        )
+        .bind(subtype)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let exit_reasons = sqlx::query_as::<_, TierExitReasonRow>(
+            r#"
+            SELECT close_reason, COUNT(*)::bigint AS n
+            FROM learning_trades
+            WHERE tier = 'B'
+              AND feature_json->>'fresh_b_subtype' = $1
+            GROUP BY close_reason
+            ORDER BY n DESC
+            "#,
+        )
+        .bind(subtype)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(tier_summary_to_subtype(summary, exit_reasons))
+    }
+
+    async fn fresh_watchlist_skip_stats(&self) -> Result<FreshWatchlistSkipStats, sqlx::Error> {
+        let row = sqlx::query_as::<_, FreshWatchlistSkipRow>(
+            r#"
+            SELECT
+                COUNT(*) FILTER (WHERE reason = 'watchlist_added')::bigint AS added,
+                COUNT(*) FILTER (WHERE reason = 'watchlist_passed')::bigint AS passed,
+                COUNT(*) FILTER (
+                    WHERE reason IN ('watchlist_rejected', 'timeout_b_gates')
+                )::bigint AS rejected
+            FROM learning_skipped
+            WHERE stage = 'fresh_watchlist'
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(FreshWatchlistSkipStats {
+            added: row.added,
+            passed: row.passed,
+            rejected: row.rejected,
+        })
+    }
+}
+
+fn tier_summary_to_subtype(
+    summary: TierSummaryRow,
+    exit_reasons: Vec<TierExitReasonRow>,
+) -> TierSubtypeStats {
+    let winrate_pct = if summary.n > 0 {
+        summary.wins as f64 / summary.n as f64 * 100.0
+    } else {
+        0.0
+    };
+    let profit_factor = if summary.gross_loss > f64::EPSILON {
+        summary.gross_profit / summary.gross_loss
+    } else if summary.gross_profit > 0.0 {
+        f64::INFINITY
+    } else {
+        0.0
+    };
+    TierSubtypeStats {
+        n: summary.n,
+        wins: summary.wins,
+        winrate_pct,
+        avg_pnl_pct: summary.avg_pnl,
+        profit_factor,
+        exit_reasons: exit_reasons
+            .into_iter()
+            .map(|r| TierExitReasonCount {
+                reason: r.close_reason,
+                n: r.n,
+            })
+            .collect(),
+    }
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -203,6 +314,39 @@ pub struct TierTradeStats {
     pub avg_pnl_pct: f64,
     pub profit_factor: f64,
     pub exit_reasons: Vec<TierExitReasonCount>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TierSubtypeStats {
+    pub n: i64,
+    pub wins: i64,
+    pub winrate_pct: f64,
+    pub avg_pnl_pct: f64,
+    pub profit_factor: f64,
+    pub exit_reasons: Vec<TierExitReasonCount>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FreshWatchlistSkipStats {
+    pub added: i64,
+    pub passed: i64,
+    pub rejected: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TierBDetailedStats {
+    #[serde(flatten)]
+    pub overall: TierTradeStats,
+    pub b_true_fresh: TierSubtypeStats,
+    pub b_unknown: TierSubtypeStats,
+    pub fresh_watchlist: FreshWatchlistSkipStats,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct FreshWatchlistSkipRow {
+    added: i64,
+    passed: i64,
+    rejected: i64,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
