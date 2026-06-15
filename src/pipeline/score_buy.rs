@@ -308,6 +308,18 @@ pub async fn run_scoring_and_buy(deps: &ScoringPipelineDeps, input: ScoringPipel
         &deps.filter_config.scoring.tier_b,
     ) && breakdown.tier == Tier::B
     {
+        if breakdown.fresh_b_hot_override {
+            eprintln!(
+                "Fresh Hot Override Passed {} fresh_b_hot_override=true \
+                 reason=momentum_overheated_only buyers={} buy_volume_sol={:.2} \
+                 velocity_pct={:.1} momentum_overheated={} tier=B",
+                mint,
+                token_features.buyer_count(),
+                token_features.buy_volume_sol,
+                features::fresh_b_velocity_pct(&token_features),
+                features::has_momentum_overheated(&breakdown.items),
+            );
+        }
         if let Some(sub) = FreshBSubtype::for_path(dev_stats.as_ref(), from_fresh_watchlist) {
             eprintln!(
                 "[SCORE] {} tier=B fresh_b_subtype={} score={} (fresh dev — A/A+ blocked)",
@@ -356,7 +368,16 @@ pub async fn run_scoring_and_buy(deps: &ScoringPipelineDeps, input: ScoringPipel
         let momentum_good_satisfied = has_momentum_good
             || (smart_bypass > 0 && smart_count >= smart_bypass)
             || aplus_smart_ok
-            || strong_a_ok;
+            || strong_a_ok
+            || (breakdown.tier == Tier::B && breakdown.fresh_b_hot_override);
+
+        if breakdown.tier == Tier::B && breakdown.fresh_b_hot_override && !has_momentum_good {
+            eprintln!(
+                "[BUY] {} tier=B fresh_b_hot_override bypass require_momentum_good \
+                 (reason=momentum_overheated_only)",
+                mint,
+            );
+        }
 
         if strong_a_ok && !has_momentum_good {
             eprintln!(

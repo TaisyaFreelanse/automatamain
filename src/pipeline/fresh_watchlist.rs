@@ -127,11 +127,13 @@ impl FreshWatchlistManager {
         tokio::spawn(async move {
             let deadline = Instant::now() + Duration::from_millis(max_wait_ms);
             let mut passed = false;
+            let mut passed_hot_override = false;
+            let mut last_momentum_only_poll: Option<features::TierBGatePoll> = None;
 
             while Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(poll_ms)).await;
 
-                if poll_b_gates_ready(
+                if let Some(poll) = poll_b_gates(
                     &launchpad,
                     &smart_money,
                     &learning_overrides,
@@ -143,8 +145,28 @@ impl FreshWatchlistManager {
                 )
                 .await
                 {
-                    passed = true;
-                    break;
+                    if poll.momentum_only_fail {
+                        last_momentum_only_poll = Some(poll.clone());
+                    }
+                    if features::tier_b_poll_passes(&poll) {
+                        passed = true;
+                        passed_hot_override = poll.hot_override;
+                        if poll.hot_override {
+                            eprintln!(
+                                "Fresh Hot Override Passed {} fresh_b_subtype={} \
+                                 fresh_b_hot_override=true reason=momentum_overheated_only \
+                                 buyers={} buy_volume_sol={:.2} velocity_pct={:.1} \
+                                 momentum_overheated={}",
+                                mint,
+                                FreshBSubtype::TrueFresh.as_str(),
+                                poll.buyers,
+                                poll.buy_volume_sol,
+                                poll.velocity_pct,
+                                poll.momentum_overheated,
+                            );
+                        }
+                        break;
+                    }
                 }
             }
 
@@ -156,19 +178,31 @@ impl FreshWatchlistManager {
 
             if passed {
                 bot_metrics.note_fresh_watchlist_passed();
-                eprintln!(
-                    "Fresh Watchlist Passed {} fresh_b_subtype={}",
-                    mint,
-                    FreshBSubtype::TrueFresh.as_str(),
-                );
+                if !passed_hot_override {
+                    eprintln!(
+                        "Fresh Watchlist Passed {} fresh_b_subtype={}",
+                        mint,
+                        FreshBSubtype::TrueFresh.as_str(),
+                    );
+                }
                 if let Some(ref log) = learning_log {
                     let log = log.clone();
                     let mint_s = mint.to_string();
                     let dev_s = dev.to_string();
                     let ts = unix_now();
-                    let payload = serde_json::json!({
+                    let mut payload = serde_json::json!({
                         "fresh_b_subtype": FreshBSubtype::TrueFresh.as_str(),
                     });
+                    if passed_hot_override {
+                        payload["fresh_b_hot_override"] = serde_json::json!(true);
+                        payload["hot_override_reason"] = serde_json::json!("momentum_overheated_only");
+                        if let Some(ref p) = last_momentum_only_poll {
+                            payload["velocity_pct"] = serde_json::json!(p.velocity_pct);
+                            payload["buyers"] = serde_json::json!(p.buyers);
+                            payload["buy_volume_sol"] = serde_json::json!(p.buy_volume_sol);
+                            payload["momentum_overheated"] = serde_json::json!(p.momentum_overheated);
+                        }
+                    }
                     tokio::spawn(async move {
                         let _ = log
                             .log_skipped(
@@ -198,21 +232,44 @@ impl FreshWatchlistManager {
                 .await;
             } else {
                 bot_metrics.note_fresh_watchlist_rejected();
-                eprintln!(
-                    "Fresh Watchlist Rejected {} fresh_b_subtype={}",
-                    mint,
-                    FreshBSubtype::TrueFresh.as_str(),
-                );
+                if let Some(ref poll) = last_momentum_only_poll {
+                    eprintln!(
+                        "Fresh Hot Override Rejected {} fresh_b_subtype={} \
+                         fresh_b_hot_override=false reason=momentum_overheated_only \
+                         buyers={} buy_volume_sol={:.2} velocity_pct={:.1} \
+                         momentum_overheated={} (hot thresholds not met)",
+                        mint,
+                        FreshBSubtype::TrueFresh.as_str(),
+                        poll.buyers,
+                        poll.buy_volume_sol,
+                        poll.velocity_pct,
+                        poll.momentum_overheated,
+                    );
+                } else {
+                    eprintln!(
+                        "Fresh Watchlist Rejected {} fresh_b_subtype={}",
+                        mint,
+                        FreshBSubtype::TrueFresh.as_str(),
+                    );
+                }
                 if let Some(ref log) = learning_log {
                     let log = log.clone();
                     let mint_s = mint.to_string();
                     let dev_s = dev.to_string();
                     let ts = unix_now();
-                    let payload = serde_json::json!({
+                    let mut payload = serde_json::json!({
                         "fresh_b_subtype": FreshBSubtype::TrueFresh.as_str(),
                         "failed_reasons": failed_reasons,
                         "max_wait_ms": max_wait_ms,
                     });
+                    if let Some(ref poll) = last_momentum_only_poll {
+                        payload["fresh_b_hot_override"] = serde_json::json!(false);
+                        payload["hot_override_reason"] = serde_json::json!("momentum_overheated_only");
+                        payload["velocity_pct"] = serde_json::json!(poll.velocity_pct);
+                        payload["buyers"] = serde_json::json!(poll.buyers);
+                        payload["buy_volume_sol"] = serde_json::json!(poll.buy_volume_sol);
+                        payload["momentum_overheated"] = serde_json::json!(poll.momentum_overheated);
+                    }
                     tokio::spawn(async move {
                         let _ = log
                             .log_skipped(
@@ -233,7 +290,7 @@ impl FreshWatchlistManager {
     }
 }
 
-async fn poll_b_gates_ready(
+async fn poll_b_gates(
     launchpad: &mpsc::Sender<PumpLaunchpadCommand>,
     smart_money: &SmartMoneyHandle,
     learning_overrides: &Arc<RwLock<LearningOverridesFile>>,
@@ -242,10 +299,8 @@ async fn poll_b_gates_ready(
     initial_mcap_sol: f64,
     scoring_cfg: &crate::scoring::config::ScoringConfig,
     tier_b: &crate::scoring::config::TierBGateConfig,
-) -> bool {
-    let Some(bucket) = features::fetch_live_bucket(launchpad, mint).await else {
-        return false;
-    };
+) -> Option<features::TierBGatePoll> {
+    let bucket = features::fetch_live_bucket(launchpad, mint).await?;
 
     let tape_point = features::snapshot_early_tape(&bucket).await;
     let current_mcap_sol = tape_point.mcap_sol;
@@ -291,5 +346,9 @@ async fn poll_b_gates_ready(
 
     let engine = ScoreEngine::new(scoring_cfg);
     let breakdown = engine.score(&token_features, thr);
-    features::tier_b_entry_ok(tier_b, &token_features, &breakdown.items)
+    Some(features::evaluate_tier_b_poll(
+        tier_b,
+        &token_features,
+        &breakdown.items,
+    ))
 }

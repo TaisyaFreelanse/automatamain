@@ -167,6 +167,9 @@ pub struct TierBGateConfig {
     /// Deferred re-evaluation for fresh devs rejected only on immature early stats.
     #[serde(default)]
     pub fresh_watchlist: FreshWatchlistConfig,
+    /// Strong fresh impulse bypass when B fails only on momentum (overheated band).
+    #[serde(default)]
+    pub hot_fresh_override: HotFreshOverrideConfig,
 }
 
 /// Poll loop for fresh devs that fail creator_config on early-stats only.
@@ -203,6 +206,40 @@ fn default_fresh_watchlist_max_concurrent() -> usize {
     50
 }
 
+/// Tier B only: allow overheated fresh runners with exceptional tape into full pipeline.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HotFreshOverrideConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_hot_fresh_min_buyers")]
+    pub min_buyers: u64,
+    #[serde(default = "default_hot_fresh_min_buy_volume_sol")]
+    pub min_buy_volume_sol: f64,
+    #[serde(default = "default_hot_fresh_min_velocity_pct")]
+    pub min_velocity_pct: f64,
+}
+
+impl Default for HotFreshOverrideConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_buyers: default_hot_fresh_min_buyers(),
+            min_buy_volume_sol: default_hot_fresh_min_buy_volume_sol(),
+            min_velocity_pct: default_hot_fresh_min_velocity_pct(),
+        }
+    }
+}
+
+fn default_hot_fresh_min_buyers() -> u64 {
+    25
+}
+fn default_hot_fresh_min_buy_volume_sol() -> f64 {
+    25.0
+}
+fn default_hot_fresh_min_velocity_pct() -> f64 {
+    100.0
+}
+
 impl Default for TierBGateConfig {
     fn default() -> Self {
         Self {
@@ -212,6 +249,7 @@ impl Default for TierBGateConfig {
             min_buy_volume_sol: default_tier_b_min_buy_volume_sol(),
             min_velocity_pct: default_tier_b_min_velocity_pct(),
             fresh_watchlist: FreshWatchlistConfig::default(),
+            hot_fresh_override: HotFreshOverrideConfig::default(),
         }
     }
 }

@@ -964,28 +964,106 @@ pub fn tier_b_dev_eligible(
 }
 
 /// Tier B entry gates (in addition to all live protections).
+pub fn tier_b_base_gates_ok(
+    cfg: &crate::scoring::config::TierBGateConfig,
+    f: &TokenFeatures,
+) -> bool {
+    cfg.enabled
+        && f.smart_wallet_count >= cfg.min_smart_wallets
+        && f.buyer_count() >= cfg.min_buyers
+        && f.buy_volume_sol >= cfg.min_buy_volume_sol
+}
+
+pub fn has_momentum_good(items: &[(&'static str, i32)]) -> bool {
+    items.iter().any(|(name, _)| *name == "momentum_good")
+}
+
+pub fn has_momentum_overheated(items: &[(&'static str, i32)]) -> bool {
+    items.iter().any(|(name, _)| *name == "momentum_overheated")
+}
+
+pub fn tier_b_velocity_ok(
+    cfg: &crate::scoring::config::TierBGateConfig,
+    f: &TokenFeatures,
+) -> bool {
+    fresh_b_velocity_pct(f) >= cfg.min_velocity_pct
+}
+
+/// Peak mcap % vs scoring-window start (same as score engine momentum).
+pub fn fresh_b_velocity_pct(f: &TokenFeatures) -> f64 {
+    let peak = f.peak_mcap_sol.max(f.current_mcap_sol);
+    momentum_peak_pct(f.initial_mcap_sol, peak)
+}
+
+/// Standard B gates pass except `momentum_good` (overheated or above band).
+pub fn is_momentum_only_tier_b_fail(
+    cfg: &crate::scoring::config::TierBGateConfig,
+    f: &TokenFeatures,
+    items: &[(&'static str, i32)],
+) -> bool {
+    tier_b_dev_eligible(f, cfg)
+        && tier_b_base_gates_ok(cfg, f)
+        && tier_b_velocity_ok(cfg, f)
+        && !has_momentum_good(items)
+}
+
+/// Hot-fresh override: exceptional fresh impulse when only momentum gate fails.
+pub fn fresh_b_hot_override_ok(
+    cfg: &crate::scoring::config::TierBGateConfig,
+    f: &TokenFeatures,
+    items: &[(&'static str, i32)],
+) -> bool {
+    let ho = &cfg.hot_fresh_override;
+    if !ho.enabled || !is_momentum_only_tier_b_fail(cfg, f, items) {
+        return false;
+    }
+    let vel = fresh_b_velocity_pct(f);
+    f.buyer_count() >= ho.min_buyers
+        && f.buy_volume_sol >= ho.min_buy_volume_sol
+        && vel >= ho.min_velocity_pct
+}
+
+/// Result of a tier-B poll (watchlist or scoring).
+#[derive(Clone, Debug)]
+pub struct TierBGatePoll {
+    pub entry_ok: bool,
+    pub hot_override: bool,
+    pub momentum_only_fail: bool,
+    pub velocity_pct: f64,
+    pub buyers: u64,
+    pub buy_volume_sol: f64,
+    pub momentum_overheated: bool,
+}
+
+pub fn evaluate_tier_b_poll(
+    cfg: &crate::scoring::config::TierBGateConfig,
+    f: &TokenFeatures,
+    items: &[(&'static str, i32)],
+) -> TierBGatePoll {
+    let entry_ok = tier_b_entry_ok(cfg, f, items);
+    let hot_override = !entry_ok && fresh_b_hot_override_ok(cfg, f, items);
+    TierBGatePoll {
+        entry_ok,
+        hot_override,
+        momentum_only_fail: is_momentum_only_tier_b_fail(cfg, f, items),
+        velocity_pct: fresh_b_velocity_pct(f),
+        buyers: f.buyer_count(),
+        buy_volume_sol: f.buy_volume_sol,
+        momentum_overheated: has_momentum_overheated(items),
+    }
+}
+
+pub fn tier_b_poll_passes(poll: &TierBGatePoll) -> bool {
+    poll.entry_ok || poll.hot_override
+}
+
+/// Tier B entry gates (in addition to all live protections).
 pub fn tier_b_entry_ok(
     cfg: &crate::scoring::config::TierBGateConfig,
     f: &TokenFeatures,
     items: &[(&'static str, i32)],
 ) -> bool {
-    if !cfg.enabled {
-        return false;
-    }
-    if f.smart_wallet_count < cfg.min_smart_wallets {
-        return false;
-    }
-    if f.buyer_count() < cfg.min_buyers {
-        return false;
-    }
-    if f.buy_volume_sol < cfg.min_buy_volume_sol {
-        return false;
-    }
-    if !items.iter().any(|(name, _)| *name == "momentum_good") {
-        return false;
-    }
-    let peak = f.peak_mcap_sol.max(f.current_mcap_sol);
-    momentum_peak_pct(f.initial_mcap_sol, peak) >= cfg.min_velocity_pct
+    tier_b_base_gates_ok(cfg, f) && has_momentum_good(items) && tier_b_velocity_ok(cfg, f)
 }
 
 /// Which tier-B gate failed for a fresh-dev cap lane (for skip logging).
@@ -997,20 +1075,22 @@ pub fn fresh_b_gate_fail_reason(
     if !cfg.enabled {
         return Some("fresh_b_disabled");
     }
-    if f.smart_wallet_count < cfg.min_smart_wallets {
-        return Some("fresh_b_no_smart");
+    if !tier_b_base_gates_ok(cfg, f) {
+        if f.smart_wallet_count < cfg.min_smart_wallets {
+            return Some("fresh_b_no_smart");
+        }
+        if f.buyer_count() < cfg.min_buyers {
+            return Some("fresh_b_low_buyers");
+        }
+        if f.buy_volume_sol < cfg.min_buy_volume_sol {
+            return Some("fresh_b_low_volume");
+        }
+        return None;
     }
-    if f.buyer_count() < cfg.min_buyers {
-        return Some("fresh_b_low_buyers");
-    }
-    if f.buy_volume_sol < cfg.min_buy_volume_sol {
-        return Some("fresh_b_low_volume");
-    }
-    if !items.iter().any(|(name, _)| *name == "momentum_good") {
+    if !has_momentum_good(items) {
         return Some("fresh_b_no_momentum");
     }
-    let peak = f.peak_mcap_sol.max(f.current_mcap_sol);
-    if momentum_peak_pct(f.initial_mcap_sol, peak) < cfg.min_velocity_pct {
+    if !tier_b_velocity_ok(cfg, f) {
         return Some("fresh_b_low_velocity");
     }
     None
@@ -1611,5 +1691,50 @@ mod strong_a_bypass_tests {
         f.buy_volume_sol = 5.0;
         let bd = engine.score(&f, &thr);
         assert_eq!(bd.tier, Tier::Skip, "fresh dev below B volume must skip");
+    }
+
+    #[test]
+    fn hot_fresh_override_assigns_tier_b_on_overheated_momentum_only() {
+        use crate::scoring::config::{
+            FeatureThresholds, HotFreshOverrideConfig, ScoringConfig, TierBGateConfig,
+        };
+        use crate::scoring::score_engine::{ScoreEngine, Tier};
+
+        let mut cfg = ScoringConfig::default();
+        cfg.tier_b = TierBGateConfig {
+            enabled: true,
+            min_smart_wallets: 0,
+            min_buyers: 10,
+            min_buy_volume_sol: 10.0,
+            min_velocity_pct: 5.0,
+            fresh_watchlist: Default::default(),
+            hot_fresh_override: HotFreshOverrideConfig {
+                enabled: true,
+                min_buyers: 25,
+                min_buy_volume_sol: 25.0,
+                min_velocity_pct: 100.0,
+            },
+        };
+        let thr = FeatureThresholds::default();
+        let engine = ScoreEngine::new(&cfg);
+
+        let mut f = strong_f();
+        f.dev_category = DevCategory::Fresh;
+        f.smart_wallet_count = 0;
+        f.regular_buyer_count = 30;
+        f.buy_volume_sol = 30.0;
+        f.initial_mcap_sol = 30.0;
+        f.peak_mcap_sol = 90.0;
+        f.current_mcap_sol = 85.0;
+
+        let bd = engine.score(&f, &thr);
+        assert_eq!(bd.tier, Tier::B);
+        assert!(bd.fresh_b_hot_override);
+        assert!(super::has_momentum_overheated(&bd.items));
+
+        f.regular_buyer_count = 20;
+        let bd = engine.score(&f, &thr);
+        assert_eq!(bd.tier, Tier::Skip);
+        assert!(!bd.fresh_b_hot_override);
     }
 }

@@ -1216,6 +1216,9 @@ mod tests {
             has_momentum_good,
             fresh_b_subtype: None,
             fresh_watchlist: None,
+            fresh_b_hot_override: None,
+            momentum_overheated: false,
+            hot_override_reason: None,
         }
     }
 

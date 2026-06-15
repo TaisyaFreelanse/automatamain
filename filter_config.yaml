@@ -373,6 +373,11 @@ scoring:
     min_buyers: 10
     min_buy_volume_sol: 10.0
     min_velocity_pct: 5.0
+    hot_fresh_override:
+      enabled: true
+      min_buyers: 25
+      min_buy_volume_sol: 25.0
+      min_velocity_pct: 100.0
     fresh_watchlist:
       enabled: true
       poll_interval_ms: 5000

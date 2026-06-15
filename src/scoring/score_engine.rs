@@ -5,7 +5,7 @@ use serde::Serialize;
 use crate::scoring::anti_rug::{cap_tier_for_low_mcap, rewards_buy_to_sell_ratio};
 use crate::scoring::config::{FeatureThresholds, ScoringConfig, ScoringWeights};
 use crate::scoring::dev_ranker::DevCategory;
-use crate::scoring::features::{momentum_peak_pct, tier_b_dev_eligible, tier_b_entry_ok, TokenFeatures};
+use crate::scoring::features::{momentum_peak_pct, tier_b_dev_eligible, tier_b_entry_ok, fresh_b_hot_override_ok, TokenFeatures};
 
 /// Momentum for scoring: peak mcap in the window vs first sample (not end-only).
 fn scoring_momentum_pct(f: &TokenFeatures) -> f64 {
@@ -27,6 +27,9 @@ pub struct ScoreBreakdown {
     pub items: Vec<(&'static str, i32)>,
     pub tier: Tier,
     pub recommended_size_sol: f64,
+    /// Tier B assigned via `hot_fresh_override` (momentum-only fail + strong tape).
+    #[serde(default)]
+    pub fresh_b_hot_override: bool,
 }
 
 pub struct ScoreEngine<'a> {
@@ -332,8 +335,10 @@ impl<'a> ScoreEngine<'a> {
         );
 
         // Fresh dev / zero-launch: never A or A+ — only tier B (if B gates pass) or Skip.
+        let tier_b_ok = tier_b_entry_ok(&self.cfg.tier_b, f, &items);
+        let hot_override = !tier_b_ok && fresh_b_hot_override_ok(&self.cfg.tier_b, f, &items);
         let tier = if tier_b_dev_eligible(f, &self.cfg.tier_b) {
-            if tier_b_entry_ok(&self.cfg.tier_b, f, &items) {
+            if tier_b_ok || hot_override {
                 Tier::B
             } else {
                 Tier::Skip
@@ -354,6 +359,7 @@ impl<'a> ScoreEngine<'a> {
             items,
             tier,
             recommended_size_sol,
+            fresh_b_hot_override: hot_override,
         }
     }
 

@@ -48,6 +48,13 @@ pub struct LearningTradeSnapshot {
     /// Fresh Watchlist path marker: `added` | `passed` (only when applicable).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fresh_watchlist: Option<String>,
+    /// Tier B hot-fresh override applied (`momentum_overheated_only`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_b_hot_override: Option<bool>,
+    #[serde(default)]
+    pub momentum_overheated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hot_override_reason: Option<String>,
 }
 
 impl LearningTradeSnapshot {
@@ -85,6 +92,19 @@ impl LearningTradeSnapshot {
                 .any(|(name, _)| *name == "momentum_good"),
             fresh_b_subtype: None,
             fresh_watchlist: None,
+            fresh_b_hot_override: None,
+            momentum_overheated: breakdown
+                .items
+                .iter()
+                .any(|(name, _)| *name == "momentum_overheated"),
+            hot_override_reason: None,
+        }
+    }
+
+    pub fn apply_hot_override_fields(&mut self, hot_override: bool) {
+        if hot_override {
+            self.fresh_b_hot_override = Some(true);
+            self.hot_override_reason = Some("momentum_overheated_only".to_string());
         }
     }
 
@@ -97,6 +117,7 @@ impl LearningTradeSnapshot {
         let mut snap = Self::from_scoring(f, breakdown);
         snap.fresh_b_subtype = subtype.map(|s| s.as_str().to_string());
         snap.fresh_watchlist = fresh_watchlist.map(str::to_string);
+        snap.apply_hot_override_fields(breakdown.fresh_b_hot_override);
         snap
     }
 }
