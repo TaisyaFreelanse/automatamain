@@ -1219,6 +1219,10 @@ mod tests {
             fresh_b_hot_override: None,
             momentum_overheated: false,
             hot_override_reason: None,
+            a_momentum_override: None,
+            a_plus_momentum_override: None,
+            first_seen_mcap_sol: None,
+            discovery_to_buy_ms: None,
         }
     }
 

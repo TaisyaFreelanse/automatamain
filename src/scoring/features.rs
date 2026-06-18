@@ -995,18 +995,6 @@ pub fn fresh_b_velocity_pct(f: &TokenFeatures) -> f64 {
     momentum_peak_pct(f.initial_mcap_sol, peak)
 }
 
-/// Standard B gates pass except `momentum_good` (overheated or above band).
-pub fn is_momentum_only_tier_b_fail(
-    cfg: &crate::scoring::config::TierBGateConfig,
-    f: &TokenFeatures,
-    items: &[(&'static str, i32)],
-) -> bool {
-    tier_b_dev_eligible(f, cfg)
-        && tier_b_base_gates_ok(cfg, f)
-        && tier_b_velocity_ok(cfg, f)
-        && !has_momentum_good(items)
-}
-
 /// Hot-fresh override: exceptional fresh impulse when only momentum gate fails.
 pub fn fresh_b_hot_override_ok(
     cfg: &crate::scoring::config::TierBGateConfig,
@@ -1021,6 +1009,40 @@ pub fn fresh_b_hot_override_ok(
     f.buyer_count() >= ho.min_buyers
         && f.buy_volume_sol >= ho.min_buy_volume_sol
         && vel >= ho.min_velocity_pct
+}
+
+/// Standard B gates pass except `momentum_good` (overheated or above band).
+pub fn is_momentum_only_tier_b_fail(
+    cfg: &crate::scoring::config::TierBGateConfig,
+    f: &TokenFeatures,
+    items: &[(&'static str, i32)],
+) -> bool {
+    tier_b_dev_eligible(f, cfg)
+        && tier_b_base_gates_ok(cfg, f)
+        && tier_b_velocity_ok(cfg, f)
+        && !has_momentum_good(items)
+}
+
+/// Tier A / A+: only `momentum_overheated` blocks the live `require_momentum_good` gate.
+pub fn is_momentum_only_aa_overheated(items: &[(&'static str, i32)]) -> bool {
+    has_momentum_overheated(items) && !has_momentum_good(items)
+}
+
+/// Whether tier A or A+ may bypass `require_momentum_good` for overheated momentum only.
+pub fn aa_momentum_override_for_tier(
+    cfg: &crate::scoring::config::AAMomentumOverrideConfig,
+    tier: crate::scoring::score_engine::Tier,
+    items: &[(&'static str, i32)],
+) -> bool {
+    use crate::scoring::score_engine::Tier;
+    if !cfg.enabled || !is_momentum_only_aa_overheated(items) {
+        return false;
+    }
+    match tier {
+        Tier::A => true,
+        Tier::APlus => true,
+        _ => false,
+    }
 }
 
 /// Result of a tier-B poll (watchlist or scoring).
@@ -1736,5 +1758,61 @@ mod strong_a_bypass_tests {
         let bd = engine.score(&f, &thr);
         assert_eq!(bd.tier, Tier::Skip);
         assert!(!bd.fresh_b_hot_override);
+    }
+
+    #[test]
+    fn aa_momentum_override_on_overheated_a_and_a_plus() {
+        use crate::scoring::config::{AAMomentumOverrideConfig, FeatureThresholds, ScoringConfig};
+        use crate::scoring::score_engine::{ScoreEngine, Tier};
+
+        let cfg_on = AAMomentumOverrideConfig { enabled: true };
+        let items = [("momentum_overheated", -3)];
+        assert!(super::aa_momentum_override_for_tier(&cfg_on, Tier::A, &items));
+        assert!(super::aa_momentum_override_for_tier(&cfg_on, Tier::APlus, &items));
+        assert!(!super::aa_momentum_override_for_tier(&cfg_on, Tier::Skip, &items));
+
+        let mut cfg = ScoringConfig::default();
+        cfg.tier_b.enabled = false;
+        cfg.aa_momentum_override = cfg_on;
+        let engine = ScoreEngine::new(&cfg);
+
+        let mut f = strong_f();
+        f.dev_has_history = true;
+        f.dev_total_coins = 3;
+        f.dev_pnl_avg = 5.0;
+        f.dev_category = DevCategory::A;
+        f.smart_wallet_count = 1;
+        f.regular_buyer_count = 20;
+        f.buy_volume_sol = 30.0;
+        f.sell_volume_window_sol = 2.5;
+        f.absorb_quality_score = 0.9;
+        f.initial_mcap_sol = 35.0;
+        f.peak_mcap_sol = 70.0;
+        f.current_mcap_sol = 68.0;
+
+        let bd = engine.score(&f, &FeatureThresholds::default());
+        assert_eq!(bd.tier, Tier::A, "score={} items={:?}", bd.total, bd.items);
+        assert!(bd.a_momentum_override);
+        assert!(!bd.a_plus_momentum_override);
+        assert!(super::is_momentum_only_aa_overheated(&bd.items));
+    }
+
+    #[test]
+    fn aa_momentum_override_disabled_leaves_gate_blocked() {
+        use crate::scoring::config::{AAMomentumOverrideConfig, FeatureThresholds, ScoringConfig};
+        use crate::scoring::score_engine::ScoreEngine;
+
+        let mut cfg = ScoringConfig::default();
+        cfg.tier_b.enabled = false;
+        cfg.aa_momentum_override = AAMomentumOverrideConfig { enabled: false };
+        let engine = ScoreEngine::new(&cfg);
+        let mut f = strong_f();
+        f.dev_category = DevCategory::Neutral;
+        f.initial_mcap_sol = 30.0;
+        f.peak_mcap_sol = 60.0;
+        f.current_mcap_sol = 58.0;
+        let bd = engine.score(&f, &FeatureThresholds::default());
+        assert!(!bd.a_momentum_override);
+        assert!(!bd.a_plus_momentum_override);
     }
 }

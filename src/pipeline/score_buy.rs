@@ -369,6 +369,8 @@ pub async fn run_scoring_and_buy(deps: &ScoringPipelineDeps, input: ScoringPipel
             || (smart_bypass > 0 && smart_count >= smart_bypass)
             || aplus_smart_ok
             || strong_a_ok
+            || breakdown.a_momentum_override
+            || breakdown.a_plus_momentum_override
             || (breakdown.tier == Tier::B && breakdown.fresh_b_hot_override);
 
         if breakdown.tier == Tier::B && breakdown.fresh_b_hot_override && !has_momentum_good {
@@ -377,6 +379,88 @@ pub async fn run_scoring_and_buy(deps: &ScoringPipelineDeps, input: ScoringPipel
                  (reason=momentum_overheated_only)",
                 mint,
             );
+        }
+
+        if breakdown.a_momentum_override && !has_momentum_good {
+            let velocity_pct = features::fresh_b_velocity_pct(&token_features);
+            eprintln!(
+                "A_MOMENTUM_OVERRIDE {} reason=momentum_overheated_only tier=A score={} \
+                 buyers={} vol={:.2} velocity_pct={:.1} mcap_discovery={:.2} mcap_now={:.2}",
+                mint,
+                breakdown.total,
+                token_features.buyer_count(),
+                token_features.buy_volume_sol,
+                velocity_pct,
+                token_features.initial_mcap_sol,
+                token_features.current_mcap_sol,
+            );
+            if let Some(ref log) = deps.learning_log {
+                let log = log.clone();
+                let mint_s = mint.to_string();
+                let dev_s = dev.to_string();
+                let mut snap = learning_snap(
+                    &token_features,
+                    &breakdown,
+                    dev_stats.as_ref(),
+                    from_fresh_watchlist,
+                );
+                snap.first_seen_mcap_sol = Some(token_features.initial_mcap_sol);
+                let payload = serde_json::to_value(&snap).unwrap_or_else(|_| serde_json::json!({}));
+                let ts = unix_now();
+                tokio::spawn(async move {
+                    let _ = log
+                        .log_skipped(
+                            &mint_s,
+                            Some(dev_s.as_str()),
+                            "aa_momentum_override",
+                            "A_MOMENTUM_OVERRIDE",
+                            payload,
+                            ts,
+                        )
+                        .await;
+                });
+            }
+        }
+
+        if breakdown.a_plus_momentum_override && !has_momentum_good {
+            let velocity_pct = features::fresh_b_velocity_pct(&token_features);
+            eprintln!(
+                "APLUS_MOMENTUM_OVERRIDE {} reason=momentum_overheated_only tier=APlus score={} \
+                 buyers={} vol={:.2} velocity_pct={:.1} mcap_discovery={:.2} mcap_now={:.2}",
+                mint,
+                breakdown.total,
+                token_features.buyer_count(),
+                token_features.buy_volume_sol,
+                velocity_pct,
+                token_features.initial_mcap_sol,
+                token_features.current_mcap_sol,
+            );
+            if let Some(ref log) = deps.learning_log {
+                let log = log.clone();
+                let mint_s = mint.to_string();
+                let dev_s = dev.to_string();
+                let mut snap = learning_snap(
+                    &token_features,
+                    &breakdown,
+                    dev_stats.as_ref(),
+                    from_fresh_watchlist,
+                );
+                snap.first_seen_mcap_sol = Some(token_features.initial_mcap_sol);
+                let payload = serde_json::to_value(&snap).unwrap_or_else(|_| serde_json::json!({}));
+                let ts = unix_now();
+                tokio::spawn(async move {
+                    let _ = log
+                        .log_skipped(
+                            &mint_s,
+                            Some(dev_s.as_str()),
+                            "aa_momentum_override",
+                            "APLUS_MOMENTUM_OVERRIDE",
+                            payload,
+                            ts,
+                        )
+                        .await;
+                });
+            }
         }
 
         if strong_a_ok && !has_momentum_good {
@@ -1134,12 +1218,39 @@ pub async fn run_scoring_and_buy(deps: &ScoringPipelineDeps, input: ScoringPipel
         }
     }
 
-    let learning_snapshot = learning_snap(
+    let mut learning_snapshot = learning_snap(
         &token_features,
         &breakdown,
         dev_stats.as_ref(),
         from_fresh_watchlist,
     );
+    learning_snapshot.first_seen_mcap_sol = Some(token_features.initial_mcap_sol);
+    let discovery_ms = pipeline_t0.elapsed().as_millis() as u64;
+    learning_snapshot.discovery_to_buy_ms = Some(discovery_ms);
+
+    if breakdown.a_momentum_override {
+        eprintln!(
+            "A_MOMENTUM_OVERRIDE BUY {} discovery_to_buy_ms={} mcap_discovery={:.2} \
+             mcap_buy={:.2} score={} tier=A",
+            mint,
+            discovery_ms,
+            token_features.initial_mcap_sol,
+            token_features.current_mcap_sol,
+            breakdown.total,
+        );
+    }
+    if breakdown.a_plus_momentum_override {
+        eprintln!(
+            "APLUS_MOMENTUM_OVERRIDE BUY {} discovery_to_buy_ms={} mcap_discovery={:.2} \
+             mcap_buy={:.2} score={} tier=APlus",
+            mint,
+            discovery_ms,
+            token_features.initial_mcap_sol,
+            token_features.current_mcap_sol,
+            breakdown.total,
+        );
+    }
+
     let open_reason = match dev_stats {
         Some(s) => OpenReason::DevStats(s),
         None => OpenReason::TraderStats,

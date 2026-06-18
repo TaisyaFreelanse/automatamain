@@ -5,7 +5,10 @@ use serde::Serialize;
 use crate::scoring::anti_rug::{cap_tier_for_low_mcap, rewards_buy_to_sell_ratio};
 use crate::scoring::config::{FeatureThresholds, ScoringConfig, ScoringWeights};
 use crate::scoring::dev_ranker::DevCategory;
-use crate::scoring::features::{momentum_peak_pct, tier_b_dev_eligible, tier_b_entry_ok, fresh_b_hot_override_ok, TokenFeatures};
+use crate::scoring::features::{
+    aa_momentum_override_for_tier, momentum_peak_pct, tier_b_dev_eligible, tier_b_entry_ok,
+    fresh_b_hot_override_ok, TokenFeatures,
+};
 
 /// Momentum for scoring: peak mcap in the window vs first sample (not end-only).
 fn scoring_momentum_pct(f: &TokenFeatures) -> f64 {
@@ -30,6 +33,12 @@ pub struct ScoreBreakdown {
     /// Tier B assigned via `hot_fresh_override` (momentum-only fail + strong tape).
     #[serde(default)]
     pub fresh_b_hot_override: bool,
+    /// Tier A: `require_momentum_good` bypass (`momentum_overheated` only).
+    #[serde(default)]
+    pub a_momentum_override: bool,
+    /// Tier A+: same bypass for A+ lane.
+    #[serde(default)]
+    pub a_plus_momentum_override: bool,
 }
 
 pub struct ScoreEngine<'a> {
@@ -354,12 +363,19 @@ impl<'a> ScoreEngine<'a> {
             Tier::Skip => 0.0,
         };
 
+        let a_momentum_override = tier == Tier::A
+            && aa_momentum_override_for_tier(&self.cfg.aa_momentum_override, tier, &items);
+        let a_plus_momentum_override = tier == Tier::APlus
+            && aa_momentum_override_for_tier(&self.cfg.aa_momentum_override, tier, &items);
+
         ScoreBreakdown {
             total,
             items,
             tier,
             recommended_size_sol,
             fresh_b_hot_override: hot_override,
+            a_momentum_override,
+            a_plus_momentum_override,
         }
     }
 

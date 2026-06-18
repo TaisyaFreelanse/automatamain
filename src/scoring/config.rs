@@ -121,6 +121,11 @@ pub struct ScoringConfig {
     /// creator history / launch_count=0. Does not relax continuation or anti-rug.
     #[serde(default)]
     pub tier_b: TierBGateConfig,
+
+    /// Tier A / A+: bypass `require_momentum_good` when momentum is the only fail
+    /// (`momentum_overheated` without `momentum_good`). Continuation / anti-rug unchanged.
+    #[serde(default)]
+    pub aa_momentum_override: AAMomentumOverrideConfig,
 }
 
 impl Default for ScoringConfig {
@@ -146,7 +151,21 @@ impl Default for ScoringConfig {
             anti_parabolic: AntiParabolicConfig::default(),
             weak_a_gate: WeakATierGateConfig::default(),
             tier_b: TierBGateConfig::default(),
+            aa_momentum_override: AAMomentumOverrideConfig::default(),
         }
+    }
+}
+
+/// Tier A / A+: let overheated momentum continue through the live pipeline.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AAMomentumOverrideConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for AAMomentumOverrideConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 

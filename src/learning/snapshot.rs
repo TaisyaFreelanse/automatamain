@@ -55,6 +55,17 @@ pub struct LearningTradeSnapshot {
     pub momentum_overheated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hot_override_reason: Option<String>,
+    /// Tier A momentum-overheated override applied at live gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a_momentum_override: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a_plus_momentum_override: Option<bool>,
+    /// Mcap at first observation in scoring window (discovery).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_seen_mcap_sol: Option<f64>,
+    /// Ms from pipeline start (mint create) to buy decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_to_buy_ms: Option<u64>,
 }
 
 impl LearningTradeSnapshot {
@@ -98,6 +109,21 @@ impl LearningTradeSnapshot {
                 .iter()
                 .any(|(name, _)| *name == "momentum_overheated"),
             hot_override_reason: None,
+            a_momentum_override: None,
+            a_plus_momentum_override: None,
+            first_seen_mcap_sol: None,
+            discovery_to_buy_ms: None,
+        }
+    }
+
+    pub fn apply_aa_momentum_override_fields(&mut self, breakdown: &ScoreBreakdown) {
+        if breakdown.a_momentum_override {
+            self.a_momentum_override = Some(true);
+            self.hot_override_reason = Some("momentum_overheated_only".to_string());
+        }
+        if breakdown.a_plus_momentum_override {
+            self.a_plus_momentum_override = Some(true);
+            self.hot_override_reason = Some("momentum_overheated_only".to_string());
         }
     }
 
@@ -118,6 +144,7 @@ impl LearningTradeSnapshot {
         snap.fresh_b_subtype = subtype.map(|s| s.as_str().to_string());
         snap.fresh_watchlist = fresh_watchlist.map(str::to_string);
         snap.apply_hot_override_fields(breakdown.fresh_b_hot_override);
+        snap.apply_aa_momentum_override_fields(breakdown);
         snap
     }
 }

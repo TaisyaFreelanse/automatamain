@@ -368,21 +368,25 @@ scoring:
   # Tier B — Fresh Dev Setup: experimental lane for devs with no creator history.
   # All continuation / anti-rug / bundle / late-entry protections stay active.
   tier_b:
-    enabled: true
+    enabled: false
     min_smart_wallets: 0
     min_buyers: 10
     min_buy_volume_sol: 10.0
     min_velocity_pct: 5.0
     hot_fresh_override:
-      enabled: true
+      enabled: false
       min_buyers: 25
       min_buy_volume_sol: 25.0
       min_velocity_pct: 100.0
     fresh_watchlist:
-      enabled: true
+      enabled: false
       poll_interval_ms: 5000
       max_wait_ms: 30000
       max_concurrent: 50
+
+  # Tier A / A+: continue pipeline when only momentum_overheated blocks require_momentum_good.
+  aa_momentum_override:
+    enabled: true
 
 # After our bot cliff exit (SL CRASH / deep SL / large tick drop), block this dev's
 # new mints until expires_at (stored in dev_blacklist table).
